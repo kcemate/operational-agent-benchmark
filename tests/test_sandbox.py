@@ -171,7 +171,18 @@ class SandboxSelectionTests(unittest.TestCase):
         )
         index = command.index("--seccomp")
         self.assertEqual("17", command[index + 1])
-        self.assertIn("--unshare-net", command)
+        self.assertIn("--share-net", command)
+        self.assertNotIn("--unshare-net", command)
+
+    def test_seccomp_denies_network_syscalls_when_network_is_disabled(self) -> None:
+        self.assertEqual(
+            (b"clone", b"clone3", b"fork", b"vfork", b"socket", b"connect", b"sendto", b"sendmsg"),
+            BubblewrapBackend._denied_syscalls(network=False),
+        )
+        self.assertEqual(
+            (b"clone", b"clone3", b"fork", b"vfork"),
+            BubblewrapBackend._denied_syscalls(network=True),
+        )
 
     def test_backend_selection_fails_closed_when_platform_backend_is_missing(self) -> None:
         with self.assertRaises(SandboxUnavailable):

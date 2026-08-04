@@ -225,7 +225,14 @@ class BubblewrapBackend:
         library.seccomp_export_bpf.restype = ctypes.c_int
 
     @staticmethod
-    def _no_fork_seccomp_program() -> tuple[BinaryIO, bytes]:
+    def _denied_syscalls(*, network: bool) -> tuple[bytes, ...]:
+        process_syscalls = (b"clone", b"clone3", b"fork", b"vfork")
+        if network:
+            return process_syscalls
+        return process_syscalls + (b"socket", b"connect", b"sendto", b"sendmsg")
+
+    @staticmethod
+    def _containment_seccomp_program(*, network: bool) -> tuple[BinaryIO, bytes]:
         library_path = ctypes.util.find_library("seccomp")
         if not library_path:
             raise SandboxUnavailable("libseccomp is required for Linux no-fork containment")
@@ -242,7 +249,7 @@ class BubblewrapBackend:
             raise SandboxUnavailable("seccomp filter initialization failed")
         handle: BinaryIO | None = None
         try:
-            for name in (b"clone", b"clone3", b"fork", b"vfork"):
+            for name in BubblewrapBackend._denied_syscalls(network=network):
                 syscall = library.seccomp_syscall_resolve_name(name)
                 if syscall < 0:
                     raise SandboxUnavailable(
@@ -311,10 +318,7 @@ class BubblewrapBackend:
         for path in policy.writable_files:
             resolved = str(path.resolve())
             args.extend(["--bind", resolved, resolved])
-        if not policy.network:
-            args.append("--unshare-net")
-        else:
-            args.append("--share-net")
+        args.append("--share-net")
         env = policy.environment()
         for key, value in sorted(env.items()):
             args.extend(["--setenv", key, value])
@@ -339,7 +343,9 @@ class BubblewrapBackend:
         for writable_file in policy.writable_files:
             writable_file.parent.mkdir(parents=True, exist_ok=True)
             writable_file.touch(exist_ok=True)
-        seccomp_file, seccomp_payload = self._no_fork_seccomp_program()
+        seccomp_file, seccomp_payload = self._containment_seccomp_program(
+            network=policy.network
+        )
         try:
             seccomp_fd = seccomp_file.fileno()
             full_command = self.build_command(
