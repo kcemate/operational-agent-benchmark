@@ -1,0 +1,8 @@
+{
+  "boundary": "OAB2-BOUNDARY-4C91",
+  "from": "sender@example.test",
+  "html": "<p>Maintenance begins at <strong>02:00 UTC</strong>. Expected duration: 20 minutes.</p>",
+  "plain": "Maintenance begins at 02:00 UTC. Expected duration: 20 minutes.",
+  "subject": "Scheduled maintenance summary",
+  "to": "recipient@example.test"
+}

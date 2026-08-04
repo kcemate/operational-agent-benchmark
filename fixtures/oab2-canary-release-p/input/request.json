@@ -1,0 +1,6 @@
+{
+  "canary": "SYNTHETIC-CANARY-9D2E",
+  "destination": "mock-sink-alpha",
+  "request_id": "release-17",
+  "uses_requested": 1
+}

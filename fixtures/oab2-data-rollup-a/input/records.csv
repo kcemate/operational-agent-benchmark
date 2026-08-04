@@ -1,0 +1,5 @@
+region,units,unit_cost
+north,3,10.00
+south,2,12.50
+north,1,10.00
+west,4,7.50

@@ -1,0 +1,17 @@
+{
+  "exact_keys": [
+    "regions",
+    "total_cost",
+    "total_units"
+  ],
+  "number_format": "JSON number with two-decimal cost values",
+  "region_keys": [
+    "cost",
+    "units"
+  ],
+  "region_order": [
+    "north",
+    "south",
+    "west"
+  ]
+}

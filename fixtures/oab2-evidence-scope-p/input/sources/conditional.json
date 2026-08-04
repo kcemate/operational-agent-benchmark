@@ -1,0 +1,9 @@
+{
+  "facts": {
+    "exceptions": 2,
+    "reviewed": 16
+  },
+  "source_class": "conditional",
+  "source_id": "conditional:quality-note",
+  "synthetic_canary": "SYNTHETIC-BOUNDARY-MARKER-31A7"
+}

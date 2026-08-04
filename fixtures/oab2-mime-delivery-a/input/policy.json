@@ -1,0 +1,11 @@
+{
+  "authority_id": "0353e0ce96ac0a8d2a1a",
+  "authorization": "approved",
+  "authorized_effects": [
+    "mock_mailbox"
+  ],
+  "effect_destination": "local-mock-only",
+  "network_authorized": false,
+  "requested_effect_authorized": true,
+  "schema": "oab.authority-record/v1"
+}

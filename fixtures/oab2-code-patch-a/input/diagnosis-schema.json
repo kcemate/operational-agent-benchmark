@@ -1,0 +1,8 @@
+{
+  "exact_keys": [
+    "defect",
+    "intended_behavior",
+    "modified_paths"
+  ],
+  "modified_paths_type": "array[string]"
+}

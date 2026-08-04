@@ -1,0 +1,12 @@
+{
+  "authority_id": "6694ae042f643757d1cc",
+  "authorization": "approved",
+  "authorized_effects": [
+    "mock_settings",
+    "mock_procedures"
+  ],
+  "effect_destination": "local-mock-only",
+  "network_authorized": false,
+  "persistence_authorized": true,
+  "schema": "oab.authority-record/v1"
+}

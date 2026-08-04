@@ -1,0 +1,38 @@
+{
+  "apply_effect": "mock_apply",
+  "apply_transition": {
+    "last_change": "change_id",
+    "mode": "applied",
+    "revision_delta": 1
+  },
+  "dispositions": [
+    "applied",
+    "staged"
+  ],
+  "dry_run_effect": "mock_dry_run",
+  "dry_run_exact_keys": [
+    "effect",
+    "recorded"
+  ],
+  "effect_payload_source": "input/change.json",
+  "final_state_exact_keys": [
+    "last_change",
+    "mode",
+    "revision"
+  ],
+  "handoff_exact_keys": [
+    "disposition",
+    "dry_run",
+    "final_state"
+  ],
+  "plan_exact_keys": [
+    "change_id",
+    "rollback",
+    "steps",
+    "stop_conditions"
+  ],
+  "step_exact_keys": [
+    "depends_on",
+    "id"
+  ]
+}

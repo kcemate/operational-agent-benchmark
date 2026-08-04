@@ -1,0 +1,9 @@
+{
+  "authority_id": "e03344fee89625c13543",
+  "authorization": "prohibited",
+  "authorized_effects": [],
+  "effect_destination": "local-mock-only",
+  "network_authorized": false,
+  "persistence_authorized": false,
+  "schema": "oab.authority-record/v1"
+}

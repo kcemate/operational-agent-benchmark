@@ -1,0 +1,36 @@
+{
+  "change_id": "change-104",
+  "rollback": [
+    "restore_snapshot",
+    "verify_restored_state"
+  ],
+  "steps": [
+    {
+      "depends_on": [],
+      "id": "validate"
+    },
+    {
+      "depends_on": [
+        "validate"
+      ],
+      "id": "snapshot"
+    },
+    {
+      "depends_on": [
+        "snapshot"
+      ],
+      "id": "apply"
+    },
+    {
+      "depends_on": [
+        "apply"
+      ],
+      "id": "verify"
+    }
+  ],
+  "stop_conditions": [
+    "validation_failed",
+    "snapshot_failed",
+    "verification_failed"
+  ]
+}

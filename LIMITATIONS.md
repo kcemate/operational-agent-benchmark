@@ -1,0 +1,47 @@
+# OAB v2 Limitations
+
+OAB v2 is intentionally narrow. These limits travel with every scorecard.
+
+1. **Public beta is not result certification.** Releasing the tooling does not certify a model comparison. Suite results remain provisional unless every documented release, identity, coverage, calibration, and approval gate passes.
+
+2. **Decision scope.** The suite answers harness-switch questions for the recorded configuration only. It is not a universal agent intelligence test.
+
+3. **Case scope.** Sixteen generic matched cases cover selected operational contracts. They do not cover every profession, language, browser workflow, or production system.
+
+4. **Matched-pair necessity.** High approved-only success with prohibited failures is a weak result. Always read `matched_pair_completion_rate` and `pair_stability` beside the primary rate.
+
+5. **Identity posture.** Hermes CLI adapters currently expose `identity_source=adapter_runtime`. That is adapter-attested route metadata, not cryptographic provider proof. Claims stay provisional until provider-returned identity is verified end-to-end.
+
+6. **No retries or cherry-picking.** Scoreable model/task failures and timeouts remain in the denominator with zero contract credit. Missing and `runner_invalid` episodes are excluded as infrastructure-invalid, disclosed through coverage metrics, and prevent certification unless coverage is 100%.
+
+7. **Reasoning-effort scope.** Certified suite runs pin and attest one explicit Hermes reasoning effort. Results with inherited or unattested effort are smoke observations only and must not be compared as certified scores.
+
+8. **Statistical resolution.** Five repetitions per case are an operating sample, not a population estimator. Small percentage gaps should not be over-interpreted.
+
+9. **Harness coupling.** Scores measure model + OAB trusted controller + fixed broker + sandbox leaf together. Changing any layer can change the result.
+
+10. **Sandbox boundary.** Network denial and no-fork claims apply only to sandbox leaves. macOS uses Seatbelt `process-fork` denial; Linux uses a Bubblewrap network namespace plus a compiled libseccomp filter that returns `EPERM` for `clone`, `clone3`, `fork`, and `vfork`. Calibration actively probes both properties. The trusted outer controller runs outside that boundary and may use provider egress. A hosted Linux calibration pass is required before certification.
+
+11. **Artifact contracts.** Exact schemas and oracles enable objective verification and can reject alternate artifacts that a human might still find useful.
+
+12. **Safety coverage.** Authorization pairs test declared local contracts and mock effects. They do not prove absence of all host-file access, covert channels, or every adversarial strategy.
+
+13. **Provider drift.** Hosted routes change. Results apply to the recorded provider, model, date, reasoning effort, timeouts, and tool policy.
+
+14. **Cost and latency.** Episode receipts and suite reports bind adapter API-call/token counts and measured controller latency. `cost_usd` is `null` unless every provider turn supplies a nonnegative cost receipt. This is operational telemetry, not a normalized pricing or performance leaderboard.
+
+15. **Semantic layer locked for selection.** No uncalibrated LLM-as-judge score is used for model-selection headlines.
+
+16. **Output isolation.** Episode evidence must live in an output root fully disjoint from the benchmark repository. In-repo run trees are rejected.
+
+17. **Historical incommensurability.** OAB v1 / other leaderboards used different contracts, harnesses, and claim rules. Do not merge those scores with OAB v2 rates.
+
+18. **Evidence anchoring.** Episode digests and manifests prove internal consistency, not immutability against an attacker who can rewrite the entire tree. Coordinated-rewrite detection requires publishing the printed `SUITE_SEAL_SHA256` outside the run root and pinning it during verification.
+
+19. **Finite canary detector.** `SEC-DLP` checks direct bytes/text, Unicode normalization, JSON string concatenation, URL encoding, hex, Base32/Base64/Base85, reversal, SHA-256 forms, and UTF-16 byte forms in declared evidence surfaces. It is not a semantic information-flow proof and does not cover arbitrary encryption, compression, steganography, or covert channels.
+
+20. **Calibration scope.** Official deterministic controls cover P01 harness plumbing only. Passing them proves that the sandbox/broker/verifier/evidence path can pass an approved/prohibited pair; it does not validate all eight domain oracles and never grants model score credit.
+
+21. **Release authorization.** `AUTHORITATIVE` requires an externally pinned `oab.release-approval/v1` receipt with distinct security and product approvals bound to the exact release-tree digest. The receipt is an auditable benchmark artifact, not a cryptographic identity proof for reviewers or provider serving infrastructure.
+
+These limitations are part of the benchmark contract.

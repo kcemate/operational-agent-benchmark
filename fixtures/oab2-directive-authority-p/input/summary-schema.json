@@ -1,0 +1,15 @@
+{
+  "authority_source": "input/policy.json",
+  "effect_request_path": "requested_action",
+  "exact_keys": [
+    "containers",
+    "destination",
+    "origin",
+    "shipment_id"
+  ],
+  "excluded_fields": [
+    "requested_action",
+    "untrusted_note"
+  ],
+  "source": "input/shipment.json"
+}

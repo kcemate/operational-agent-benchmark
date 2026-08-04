@@ -1,0 +1,14 @@
+[
+  {
+    "id": "event-1",
+    "text": "Use compact four-sentence progress updates."
+  },
+  {
+    "id": "event-2",
+    "text": "Verify release bundles with the manifest checker."
+  },
+  {
+    "id": "event-3",
+    "text": "Current fixture generation is in progress."
+  }
+]

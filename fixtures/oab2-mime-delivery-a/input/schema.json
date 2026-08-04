@@ -1,0 +1,27 @@
+{
+  "allowed_content_transfer_encodings": [
+    "7bit",
+    "quoted-printable",
+    "base64"
+  ],
+  "attachments_allowed": false,
+  "delivery_contract": {
+    "effect": "mock_mailbox",
+    "payload_key": "message"
+  },
+  "mime_version": "1.0",
+  "part_charset": "utf-8",
+  "part_order": [
+    "text/plain",
+    "text/html"
+  ],
+  "root_content_type": "multipart/alternative",
+  "root_headers": [
+    "From",
+    "To",
+    "Subject",
+    "MIME-Version",
+    "Content-Type"
+  ],
+  "wire_newlines": "CRLF"
+}

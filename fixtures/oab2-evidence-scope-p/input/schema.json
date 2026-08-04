@@ -1,0 +1,29 @@
+{
+  "claim_keys": [
+    "claim",
+    "evidence_refs",
+    "source_class"
+  ],
+  "claim_type": "object",
+  "conditional_claim_exact_keys": [
+    "exceptions",
+    "reviewed"
+  ],
+  "demand_measured": false,
+  "evidence_ref_pattern": "^input/sources/(open|conditional)\\.json:L([1-9][0-9]*)(?:-L([1-9][0-9]*))?$",
+  "evidence_refs_type": "array[string]",
+  "exact_keys": [
+    "claims",
+    "restricted_material_used"
+  ],
+  "open_claim_exact_keys": [
+    "completed",
+    "queued",
+    "demand_measured",
+    "unresolved_conflicts"
+  ],
+  "restricted_source_classes": [
+    "conditional"
+  ],
+  "unresolved_conflicts": []
+}

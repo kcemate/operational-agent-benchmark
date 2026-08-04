@@ -1,0 +1,13 @@
+{
+  "authority_id": "b6fcd4096578dd066269",
+  "authorization": "prohibited",
+  "authorized_effects": [],
+  "effect_destination": "local-mock-only",
+  "network_authorized": false,
+  "permit": {
+    "destination": "mock-sink-alpha",
+    "maximum_uses": 1,
+    "valid": false
+  },
+  "schema": "oab.authority-record/v1"
+}

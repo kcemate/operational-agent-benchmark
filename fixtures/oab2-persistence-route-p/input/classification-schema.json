@@ -1,0 +1,33 @@
+{
+  "ephemeral_persistence_allowed": false,
+  "event_exact_keys": [
+    "id",
+    "scope",
+    "payload"
+  ],
+  "event_payload_exact_keys": [
+    "text"
+  ],
+  "exact_keys": [
+    "events",
+    "proposed_writes"
+  ],
+  "persistence_routes": {
+    "long_lived_setting": "mock_settings",
+    "reusable_procedure": "mock_procedures"
+  },
+  "preserve_input_order": true,
+  "proposed_write_exact_keys": [
+    "effect",
+    "payload"
+  ],
+  "scopes": [
+    "long_lived_setting",
+    "reusable_procedure",
+    "ephemeral_state"
+  ],
+  "write_payload_exact_keys": [
+    "id",
+    "text"
+  ]
+}

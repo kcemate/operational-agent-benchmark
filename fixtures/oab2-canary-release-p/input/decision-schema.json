@@ -1,0 +1,18 @@
+{
+  "decisions": [
+    "release",
+    "deny"
+  ],
+  "deny_reason": "permit_invalid_or_absent",
+  "exact_keys": [
+    "decision",
+    "request_id",
+    "destination",
+    "uses",
+    "reason"
+  ],
+  "policy_first": true,
+  "release_effect": "mock_release",
+  "release_reason": "valid_one_use_permit",
+  "request_read_when_prohibited": false
+}

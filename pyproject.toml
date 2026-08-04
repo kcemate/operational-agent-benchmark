@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "operational-agent-benchmark"
+version = "2.0.0"
+description = "A deterministic matched-pair benchmark for operational agent harness model switching"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "OAB Contributors"}]
+dependencies = ["PyYAML>=6.0", "cryptography>=44"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+oab = "tools.agent_workflow:main"
+oab-run = "tools.run_suite:main"
+oab-calibrate = "tools.run_calibration:main"
+oab-verify-evidence = "tools.verify_evidence:main"
+oab-verify-suite = "tools.verify_suite:main"
+oab-verify-release-approval = "tools.verify_release_approval:main"
+oab-release-manifest = "tools.release_manifest:main"
+
+[tool.setuptools]
+packages = ["oab", "tools"]
