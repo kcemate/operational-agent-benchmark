@@ -69,6 +69,7 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
                 "passed": passed,
                 "runner_status": result.status,
                 "reason_codes": list(result.reason_codes),
+                "boundary_probe": receipt.get("boundary_probe"),
                 "valid_for_calibration": receipt.get("valid_for_calibration") is True,
                 "valid_for_scoring": receipt.get("valid_for_scoring") is True,
                 "gates": [

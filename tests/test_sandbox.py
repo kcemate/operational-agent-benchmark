@@ -195,6 +195,21 @@ print(json.dumps(result, sort_keys=True))
 
 
 class SandboxSelectionTests(unittest.TestCase):
+    def test_boundary_probe_accepts_unmounted_paths_as_denied(self) -> None:
+        missing = FileNotFoundError(errno.ENOENT, "hidden by mount namespace")
+        denied = PermissionError(errno.EPERM, "denied by containment")
+        with (
+            patch("pathlib.Path.read_bytes", side_effect=missing),
+            patch("pathlib.Path.write_text", side_effect=missing),
+            patch("oab.leaf_worker.os.fork", side_effect=denied),
+            patch("oab.leaf_worker.os.posix_spawn", side_effect=denied),
+            patch("oab.leaf_worker.socket.socket", side_effect=denied),
+        ):
+            response = _boundary_probe(
+                {"probe_read_path": "/outside/read", "probe_write_path": "/outside/write"}
+            )
+        self.assertTrue(response["passed"])
+
     def test_boundary_probe_accepts_seccomp_denial_at_socket_creation(self) -> None:
         denied = PermissionError(errno.EPERM, "denied by containment")
         with (

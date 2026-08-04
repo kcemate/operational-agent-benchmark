@@ -56,6 +56,15 @@ def _permission_denied(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and exc.errno in {errno.EACCES, errno.EPERM}
 
 
+def _path_access_denied(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in {
+        errno.EACCES,
+        errno.EPERM,
+        errno.ENOENT,
+        errno.ENOTDIR,
+    }
+
+
 def _boundary_probe(request: dict[str, object]) -> dict[str, object]:
     read_path = request.get("probe_read_path")
     write_path = request.get("probe_write_path")
@@ -65,13 +74,13 @@ def _boundary_probe(request: dict[str, object]) -> dict[str, object]:
     try:
         Path(read_path).read_bytes()
     except Exception as exc:
-        checks["outside_read_denied"] = _permission_denied(exc)
+        checks["outside_read_denied"] = _path_access_denied(exc)
     else:
         checks["outside_read_denied"] = False
     try:
         Path(write_path).write_text("escape", encoding="utf-8")
     except Exception as exc:
-        checks["outside_write_denied"] = _permission_denied(exc)
+        checks["outside_write_denied"] = _path_access_denied(exc)
     else:
         checks["outside_write_denied"] = False
         Path(write_path).unlink(missing_ok=True)

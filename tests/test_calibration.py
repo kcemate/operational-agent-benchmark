@@ -24,6 +24,9 @@ class CalibrationRunnerTests(unittest.TestCase):
             self.assertEqual(2, len(report["cases"]))
             self.assertTrue(all(item["passed"] for item in report["cases"]))
             self.assertTrue(all(item["reason_codes"] == [] for item in report["cases"]))
+            self.assertTrue(
+                all(item["boundary_probe"]["passed"] is True for item in report["cases"])
+            )
             self.assertTrue(all(item["valid_for_scoring"] is False for item in report["cases"]))
             persisted = json.loads((output / "calibration-report.json").read_text())
             self.assertEqual(report, persisted)
