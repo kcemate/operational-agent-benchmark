@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,6 +21,7 @@ from oab.sandbox import (
     macos_backend,
     select_backend,
 )
+from oab.leaf_worker import _boundary_probe
 
 
 @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(), "macOS sandbox required")
@@ -192,6 +195,23 @@ print(json.dumps(result, sort_keys=True))
 
 
 class SandboxSelectionTests(unittest.TestCase):
+    def test_boundary_probe_accepts_seccomp_denial_at_socket_creation(self) -> None:
+        denied = PermissionError(errno.EPERM, "denied by containment")
+        with (
+            patch("pathlib.Path.read_bytes", side_effect=denied),
+            patch("pathlib.Path.write_text", side_effect=denied),
+            patch("oab.leaf_worker.os.fork", side_effect=denied),
+            patch("oab.leaf_worker.os.posix_spawn", side_effect=denied),
+            patch("oab.leaf_worker.socket.socket", side_effect=denied),
+        ):
+            response = _boundary_probe(
+                {"probe_read_path": "/outside/read", "probe_write_path": "/outside/write"}
+            )
+        self.assertTrue(response["passed"])
+        checks = response.get("checks")
+        self.assertIsInstance(checks, dict)
+        self.assertTrue(isinstance(checks, dict) and checks["network_denied"])
+
     def test_seccomp_ctypes_signature_preserves_64_bit_filter_context(self) -> None:
         class CFunction:
             def __init__(self) -> None:

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import marshal
 import os
-import py_compile
 import stat
 import sys
-import tempfile
+import types
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 
@@ -15,12 +15,16 @@ _EXECUTABLE_PACKAGES = ("oab", "tools")
 _NATIVE_SUFFIXES = tuple(EXTENSION_SUFFIXES)
 
 
-def _read_regular_bytes(path: Path) -> bytes | None:
+def _read_regular_bytes(path: Path, *, max_bytes: int | None = None) -> bytes | None:
     try:
         info = path.lstat()
     except OSError:
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (max_bytes is not None and info.st_size > max_bytes)
+    ):
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -29,7 +33,11 @@ def _read_regular_bytes(path: Path) -> bytes | None:
         return None
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (max_bytes is not None and opened.st_size > max_bytes)
+        ):
             return None
         chunks: list[bytes] = []
         while True:
@@ -50,8 +58,8 @@ def _bytecode_matches_source(
             source = path.parent.parent / source_name
         else:
             source = path.with_suffix(".py")
-        bytecode = _read_regular_bytes(path)
-        source_bytes = _read_regular_bytes(source)
+        bytecode = _read_regular_bytes(path, max_bytes=16 * 1024 * 1024)
+        source_bytes = _read_regular_bytes(source, max_bytes=4 * 1024 * 1024)
         if bytecode is None or source_bytes is None or len(bytecode) < 16:
             return False
         if bytecode[:4] != importlib.util.MAGIC_NUMBER:
@@ -63,29 +71,35 @@ def _bytecode_matches_source(
         if filename_root is not None:
             filenames.append(str(filename_root / source.relative_to(root)))
         flags = int.from_bytes(bytecode[4:8], "little")
+        if flags & ~3:
+            return False
         if flags & 1:
-            invalidation_mode = (
-                py_compile.PycInvalidationMode.CHECKED_HASH
-                if flags & 2
-                else py_compile.PycInvalidationMode.UNCHECKED_HASH
-            )
+            if bytecode[8:16] != importlib.util.source_hash(source_bytes):
+                return False
         else:
-            invalidation_mode = py_compile.PycInvalidationMode.TIMESTAMP
-        with tempfile.TemporaryDirectory(prefix="oab-pyc-check-") as td:
-            expected = Path(td) / "expected.pyc"
-            for filename in dict.fromkeys(filenames):
-                py_compile.compile(
-                    str(source),
-                    cfile=str(expected),
-                    dfile=filename,
-                    doraise=True,
-                    optimize=optimization,
-                    invalidation_mode=invalidation_mode,
-                )
-                if _read_regular_bytes(expected) == bytecode:
-                    return True
+            source_stat = source.stat()
+            recorded_mtime = int.from_bytes(bytecode[8:12], "little")
+            recorded_size = int.from_bytes(bytecode[12:16], "little")
+            if recorded_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF:
+                return False
+            if recorded_size != len(source_bytes) & 0xFFFFFFFF:
+                return False
+        # Decode only the bounded pyc payload for structural comparison; never execute it.
+        observed_code = marshal.loads(bytecode[16:])
+        if not isinstance(observed_code, types.CodeType):
+            return False
+        for filename in dict.fromkeys(filenames):
+            expected_code = compile(
+                source_bytes,
+                filename,
+                "exec",
+                dont_inherit=True,
+                optimize=optimization,
+            )
+            if observed_code == expected_code:
+                return True
         return False
-    except (OSError, ValueError, TypeError, EOFError):
+    except (OSError, SyntaxError, ValueError, TypeError, EOFError):
         return False
 
 

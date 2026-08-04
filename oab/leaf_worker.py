@@ -91,16 +91,20 @@ def _boundary_probe(request: dict[str, object]) -> dict[str, object]:
     else:
         os.waitpid(process_id, 0)
         checks["unlisted_exec_denied"] = False
-    probe_socket = socket.socket()
-    probe_socket.settimeout(0.2)
     try:
-        probe_socket.connect(("127.0.0.1", 9))
+        probe_socket = socket.socket()
     except Exception as exc:
         checks["network_denied"] = _permission_denied(exc)
     else:
-        checks["network_denied"] = False
-    finally:
-        probe_socket.close()
+        probe_socket.settimeout(0.2)
+        try:
+            probe_socket.connect(("127.0.0.1", 9))
+        except Exception as exc:
+            checks["network_denied"] = _permission_denied(exc)
+        else:
+            checks["network_denied"] = False
+        finally:
+            probe_socket.close()
     return {"ok": True, "checks": checks, "passed": all(checks.values())}
 
 
