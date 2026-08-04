@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
 from oab.agent_workflow import (
+    _canonical_sha256,
+    _known_cost_from_report,
+    _plan_bound_routes,
+    _plan_reasoning_effort,
+    _unknown_cost_api_calls_from_report,
     build_approval_preview,
     build_conversational_stage_approval,
     build_evidence_posture,
@@ -145,7 +150,7 @@ def _production_suite_runner(
         provider = str(route.get("provider") or "")
         model = str(route.get("model") or "")
         requested_route = str(route.get("requested_route") or "")
-        scheduled = 2 if stage == "qualification" else 80
+        scheduled = 34 if stage == "qualification" else 80
         command = [
             sys.executable,
             "-m",
@@ -160,7 +165,23 @@ def _production_suite_runner(
             str(output),
         ]
         if stage == "qualification":
-            command.extend(["--pairs", "P01", "--repetitions", "1"])
+            command.extend(
+                [
+                    "--pairs",
+                    "P01",
+                    "--repetitions",
+                    "17",
+                    "--max-steps-per-episode",
+                    "1",
+                ]
+            )
+        route_call_budget = route.get("max_api_calls")
+        if (
+            isinstance(route_call_budget, int)
+            and not isinstance(route_call_budget, bool)
+            and route_call_budget >= 0
+        ):
+            command.extend(["--max-api-calls", str(route_call_budget)])
         if source_hermes_home is not None:
             command.extend(["--source-hermes-home", str(source_hermes_home)])
         max_observed_cost = route.get("max_observed_cost_usd")
@@ -368,6 +389,14 @@ def _verify_campaign(
     checked_approvals = 0
     plan = _load_json_object(root / "PLAN.json")
     errors.extend(verify_campaign_plan(plan))
+    try:
+        _plan_bound_routes(root, plan)
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        _plan_reasoning_effort(plan, state)
+    except ValueError as exc:
+        errors.append(str(exc))
     plan_sha256 = plan.get("plan_sha256")
     calibration_sha256 = state.get("calibration_sha256")
     try:
@@ -498,6 +527,15 @@ def _verify_campaign(
         unknown_cost_seen = False
         for result_path in sorted(results_root.glob("*.json")):
             result = _load_json_object(result_path)
+            unsigned_result = dict(result)
+            recorded_result_digest = unsigned_result.pop("receipt_sha256", None)
+            if recorded_result_digest != _canonical_sha256(unsigned_result):
+                errors.append(f"{stage}:{result_path.stem}:result_receipt_digest_mismatch")
+            embedded_report = result.get("suite_report")
+            if not isinstance(embedded_report, Mapping) or result.get(
+                "suite_report_sha256"
+            ) != _canonical_sha256(embedded_report):
+                errors.append(f"{stage}:{result_path.stem}:result_report_digest_mismatch")
             result_route_id = result.get("route_id")
             if not isinstance(result_route_id, str) or result_route_id != result_path.stem:
                 errors.append(f"{stage}:{result_path.stem}:result_route_id_invalid")
@@ -541,12 +579,20 @@ def _verify_campaign(
             if suite_report.get("requested_route") != result.get("requested_route"):
                 errors.append(f"{stage}:{result_path.stem}:suite_report_route_mismatch")
                 continue
+            if not isinstance(embedded_report, Mapping) or dict(embedded_report) != suite_report:
+                errors.append(f"{stage}:{result_path.stem}:result_report_mismatch")
             report_usage = suite_report.get("controller_usage")
             report_usage_map = report_usage if isinstance(report_usage, Mapping) else {}
             if usage_source.get("observed_api_calls") != report_usage_map.get("api_calls"):
                 errors.append(f"{stage}:{result_path.stem}:result_api_calls_mismatch")
             if usage_source.get("observed_cost_usd") != report_usage_map.get("cost_usd"):
                 errors.append(f"{stage}:{result_path.stem}:result_cost_mismatch")
+            expected_known_cost = _known_cost_from_report(suite_report)
+            if usage_source.get("observed_known_cost_usd") != expected_known_cost:
+                errors.append(f"{stage}:{result_path.stem}:result_known_cost_mismatch")
+            expected_unknown_calls = _unknown_cost_api_calls_from_report(suite_report)
+            if usage_source.get("unknown_cost_api_calls") != expected_unknown_calls:
+                errors.append(f"{stage}:{result_path.stem}:result_unknown_cost_calls_mismatch")
             if stage == "full":
                 full_reports.append(suite_report)
 

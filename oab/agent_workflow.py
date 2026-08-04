@@ -24,7 +24,10 @@ from typing import Any, Mapping, Sequence
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _COST_CONTROL_MODE = "post_provider_call_observed_known_cost_stop"
 _MAX_COST_OVERSHOOT_API_CALLS = 1
-_MAX_API_CALLS_PER_EPISODE = 17
+_QUALIFICATION_REPETITIONS = 17
+_QUALIFICATION_EPISODES_PER_ROUTE = 34
+_QUALIFICATION_MAX_API_CALLS_PER_EPISODE = 1
+_FULL_MAX_API_CALLS_PER_EPISODE = 17
 _PROVIDER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MODEL_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,256}$")
 _AUTH_REASON_CODES = {
@@ -149,13 +152,33 @@ def _read_regular_json(path: Path) -> dict[str, Any]:
     return value
 
 
+class _RejectInventoryRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _open_inventory_request(
+    request: urllib.request.Request, *, timeout: float
+) -> Any:
+    opener = urllib.request.build_opener(_RejectInventoryRedirects())
+    return opener.open(request, timeout=timeout)
+
+
 def load_hermes_inventory(
     *,
     context_loader: Any | None = None,
     payload_builder: Any | None = None,
     api_base_url: str | None = None,
     api_key: str | None = None,
-    urlopen: Any = urllib.request.urlopen,
+    urlopen: Any | None = None,
 ) -> dict[str, object]:
     """Load authenticated Hermes inventory with explicit probes and pricing disabled.
 
@@ -166,6 +189,7 @@ def load_hermes_inventory(
     """
 
     if api_base_url is not None:
+        open_request = urlopen or _open_inventory_request
         parsed = urllib.parse.urlsplit(api_base_url.strip())
         if (
             parsed.scheme not in {"http", "https"}
@@ -196,7 +220,7 @@ def load_hermes_inventory(
                 method="GET",
             )
             try:
-                with urlopen(request, timeout=5.0) as response:
+                with open_request(request, timeout=5.0) as response:
                     body = response.read(1_000_001)
             except Exception as exc:
                 raise RuntimeError("hermes_inventory_api_unavailable") from exc
@@ -443,7 +467,7 @@ def build_campaign_plan(
     if repetitions < 1:
         raise ValueError("repetitions_invalid")
     route_count = len(routes)
-    qualification_per_route = 2
+    qualification_per_route = _QUALIFICATION_EPISODES_PER_ROUTE
     full_per_route = len(pair_ids) * 2 * repetitions
     plan: dict[str, object] = {
         "schema": "oab.campaign-plan/v1",
@@ -456,7 +480,7 @@ def build_campaign_plan(
         "routes": [str(route.get("requested_route")) for route in routes if isinstance(route, Mapping)],
         "qualification": {
             "pair_ids": ["P01"],
-            "repetitions": 1,
+            "repetitions": _QUALIFICATION_REPETITIONS,
             "episodes_per_route": qualification_per_route,
             "scheduled_episodes": route_count * qualification_per_route,
         },
@@ -691,9 +715,14 @@ def classify_qualification(
     scheduled = report.get("scheduled_episodes")
     valid = report.get("infrastructure_valid_episodes")
     invalid = report.get("infrastructure_invalid_episodes")
-    if not isinstance(scheduled, int) or scheduled < 1:
-        return base
-    if valid != scheduled or invalid != 0:
+    observed_api_calls = usage_map.get("api_calls")
+    if (
+        scheduled != _QUALIFICATION_EPISODES_PER_ROUTE
+        or valid != _QUALIFICATION_EPISODES_PER_ROUTE
+        or invalid != 0
+        or observed_api_calls != _QUALIFICATION_EPISODES_PER_ROUTE
+    ):
+        base["status"] = "qualification_contract_invalid"
         return base
     if report.get("identity_source") not in {"provider_response", "adapter_runtime"}:
         base["status"] = "identity_unattested"
@@ -815,6 +844,54 @@ def _campaign_routes(root: Path) -> list[dict[str, object]]:
     return routes
 
 
+def _plan_bound_routes(root: Path, plan: Mapping[str, object]) -> list[dict[str, object]]:
+    planned_value = plan.get("routes")
+    if not isinstance(planned_value, list) or not planned_value or any(
+        not isinstance(route, str) or not route for route in planned_value
+    ):
+        raise ValueError("campaign_plan_routes_invalid")
+    planned_routes = [str(route) for route in planned_value]
+    if len(set(planned_routes)) != len(planned_routes):
+        raise ValueError("campaign_plan_routes_invalid")
+    routes = _campaign_routes(root)
+    observed: list[str] = []
+    observed_ids: set[str] = set()
+    for route in routes:
+        provider = route.get("provider")
+        model = route.get("model")
+        requested_route = route.get("requested_route")
+        route_id = route.get("route_id")
+        if (
+            not isinstance(provider, str)
+            or not isinstance(model, str)
+            or not isinstance(requested_route, str)
+            or not isinstance(route_id, str)
+            or requested_route != f"{provider}/{model}"
+            or route_id != _route_id(provider, model)
+            or route_id in observed_ids
+        ):
+            raise ValueError("campaign_discovery_plan_mismatch")
+        observed.append(requested_route)
+        observed_ids.add(route_id)
+    if observed != planned_routes:
+        raise ValueError("campaign_discovery_plan_mismatch")
+    baseline = plan.get("baseline_route")
+    if not isinstance(baseline, str) or baseline not in observed:
+        raise ValueError("campaign_plan_baseline_invalid")
+    return routes
+
+
+def _plan_reasoning_effort(
+    plan: Mapping[str, object], state: Mapping[str, object]
+) -> str:
+    effort = plan.get("reasoning_effort")
+    if not isinstance(effort, str) or effort not in _ALLOWED_EFFORTS:
+        raise ValueError("campaign_plan_reasoning_effort_invalid")
+    if state.get("reasoning_effort") != effort:
+        raise ValueError("campaign_reasoning_effort_mismatch")
+    return effort
+
+
 def _select_routes(
     routes: Sequence[Mapping[str, object]],
     *,
@@ -833,7 +910,24 @@ def _result_path(root: Path, stage: str, route_id: str) -> Path:
     return root / stage / "results" / f"{route_id}.json"
 
 
-def _load_stage_results(root: Path, stage: str, routes: Sequence[Mapping[str, object]]) -> dict[str, dict[str, Any]]:
+def _stage_result_receipt(
+    body: Mapping[str, object], report: Mapping[str, object]
+) -> dict[str, object]:
+    receipt = dict(body)
+    suite_report = dict(report)
+    receipt["suite_report"] = suite_report
+    receipt["suite_report_sha256"] = _canonical_sha256(suite_report)
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    return receipt
+
+
+def _load_stage_results(
+    root: Path,
+    stage: str,
+    routes: Sequence[Mapping[str, object]],
+    *,
+    reasoning_effort: str,
+) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for route in routes:
         route_id = str(route.get("route_id") or "")
@@ -842,6 +936,43 @@ def _load_stage_results(root: Path, stage: str, routes: Sequence[Mapping[str, ob
             result = _read_regular_json(path)
             if result.get("route_id") != route_id or result.get("requested_route") != route.get("requested_route"):
                 raise ValueError("campaign_stage_result_route_mismatch")
+            receipt_sha256 = result.get("receipt_sha256")
+            unsigned = dict(result)
+            unsigned.pop("receipt_sha256", None)
+            if receipt_sha256 != _canonical_sha256(unsigned):
+                raise ValueError("campaign_stage_result_receipt_digest_mismatch")
+            suite_report = result.get("suite_report")
+            if not isinstance(suite_report, Mapping) or result.get(
+                "suite_report_sha256"
+            ) != _canonical_sha256(suite_report):
+                raise ValueError("campaign_stage_result_report_digest_mismatch")
+            expected_suite_output = str(root / stage / "suites" / route_id)
+            if result.get("suite_output") != expected_suite_output:
+                raise ValueError("campaign_stage_result_output_mismatch")
+            if stage == "qualification":
+                expected_classification = classify_qualification(
+                    suite_report,
+                    requested_route=str(route.get("requested_route") or ""),
+                    reasoning_effort=reasoning_effort,
+                )
+                expected_classification["observed_api_calls"] = _api_calls_from_report(
+                    suite_report
+                )
+                if result.get("classification") != expected_classification:
+                    raise ValueError("campaign_stage_result_recomputation_mismatch")
+            elif stage == "full":
+                expected_fields = {
+                    "observed_cost_usd": _cost_from_report(suite_report),
+                    "observed_known_cost_usd": _known_cost_from_report(suite_report),
+                    "unknown_cost_api_calls": _unknown_cost_api_calls_from_report(
+                        suite_report
+                    ),
+                    "observed_api_calls": _api_calls_from_report(suite_report),
+                }
+                if any(result.get(key) != value for key, value in expected_fields.items()):
+                    raise ValueError("campaign_stage_result_recomputation_mismatch")
+            else:
+                raise ValueError("campaign_stage_invalid")
             results[route_id] = result
     return results
 
@@ -908,7 +1039,8 @@ def _planned_stage_routes(
     baseline_route = plan.get("baseline_route")
     if not isinstance(baseline_route, str) or not baseline_route:
         raise ValueError("campaign_plan_baseline_invalid")
-    all_routes = _campaign_routes(root)
+    _plan_reasoning_effort(plan, state)
+    all_routes = _plan_bound_routes(root, plan)
     if stage == "qualification":
         route_candidates = all_routes
     elif stage == "full":
@@ -964,7 +1096,12 @@ def build_approval_preview(
     ):
         raise ValueError("campaign_plan_stage_invalid")
     scheduled_episodes = episodes_per_route * len(routes)
-    minimum_calls = scheduled_episodes * _MAX_API_CALLS_PER_EPISODE
+    calls_per_episode = (
+        _QUALIFICATION_MAX_API_CALLS_PER_EPISODE
+        if stage == "qualification"
+        else _FULL_MAX_API_CALLS_PER_EPISODE
+    )
+    minimum_calls = scheduled_episodes * calls_per_episode
     return {
         "schema": "oab.approval-preview/v1",
         "stage": stage,
@@ -985,6 +1122,7 @@ def build_approval_preview(
         "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
         "max_api_calls": call_budget,
         "minimum_required_api_calls": minimum_calls,
+        "max_api_calls_per_episode": calls_per_episode,
         "call_ceiling_sufficient": call_budget >= minimum_calls,
         "max_routes": route_cap,
         "allow_unknown_costs": bool(allow_unknown_costs),
@@ -1322,20 +1460,13 @@ def run_qualification_stage(
     budget = _validate_budget(max_cost_usd)
     call_budget = _validate_positive_int(max_api_calls, "qualification_api_call_budget_required")
     route_cap = _validate_positive_int(max_routes, "qualification_route_cap_required")
-    plan = _read_regular_json(root / "PLAN.json")
-    if verify_campaign_plan(plan):
-        raise ValueError("campaign_plan_invalid")
-    baseline_route = plan.get("baseline_route")
-    if not isinstance(baseline_route, str) or not baseline_route:
-        raise ValueError("campaign_plan_baseline_invalid")
-    all_routes = _campaign_routes(root)
-    routes = _select_routes(
-        all_routes,
-        current_route=baseline_route,
-        max_routes=route_cap,
+    plan, routes = _planned_stage_routes(
+        root, state, stage="qualification", route_cap=route_cap
     )
-    results = _load_stage_results(root, "qualification", routes)
-    effort = str(state.get("reasoning_effort") or "")
+    effort = _plan_reasoning_effort(plan, state)
+    results = _load_stage_results(
+        root, "qualification", routes, reasoning_effort=effort
+    )
     approval = _accept_stage_approval(
         root,
         approval_path=approval_path,
@@ -1397,6 +1528,7 @@ def run_qualification_stage(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
+        execution_route["max_api_calls"] = min(34, call_budget - observed_calls)
         try:
             report = runner(execution_route, "qualification", suite_output, effort)
         except Exception:
@@ -1416,16 +1548,28 @@ def run_qualification_stage(
             reasoning_effort=effort,
         )
         classification["observed_api_calls"] = _api_calls_from_report(report)
-        receipt: dict[str, object] = {
-            "schema": "oab.qualification-result/v1",
-            "created_at": _utc_now(),
-            "route_id": route_id,
-            "requested_route": requested_route,
-            "suite_output": str(suite_output),
-            "classification": classification,
-        }
+        if (
+            isinstance(classification["observed_api_calls"], int)
+            and classification["observed_api_calls"] > execution_route["max_api_calls"]
+        ):
+            classification["status"] = "api_call_budget_exceeded"
+            state["status"] = "qualification_call_budget_exceeded"
+        receipt = _stage_result_receipt(
+            {
+                "schema": "oab.qualification-result/v2",
+                "created_at": _utc_now(),
+                "route_id": route_id,
+                "requested_route": requested_route,
+                "suite_output": str(suite_output),
+                "classification": classification,
+            },
+            report,
+        )
         _atomic_json(_result_path(root, "qualification", route_id), receipt)
         results[route_id] = receipt
+
+        if state.get("status") == "qualification_call_budget_exceeded":
+            break
 
         known_costs = [
             item.get("classification", {}).get("observed_known_cost_usd")
@@ -1456,6 +1600,15 @@ def run_qualification_stage(
     durations_known = True
     projected = 0.0
     projected_duration = 0.0
+    full_plan_for_projection = plan.get("full_run")
+    if not isinstance(full_plan_for_projection, Mapping) or not isinstance(
+        full_plan_for_projection.get("episodes_per_route"), int
+    ):
+        raise ValueError("campaign_plan_projection_invalid")
+    projection_factor = (
+        int(full_plan_for_projection["episodes_per_route"])
+        / _QUALIFICATION_EPISODES_PER_ROUTE
+    )
     for route in routes:
         receipt_result = results.get(str(route.get("route_id") or ""))
         if receipt_result is None:
@@ -1472,12 +1625,12 @@ def run_qualification_stage(
             qualified.append(summary)
             cost = classification.get("observed_cost_usd")
             if isinstance(cost, (int, float)):
-                projected += float(cost) * 40.0
+                projected += float(cost) * projection_factor
             else:
                 costs_known = False
             duration = classification.get("observed_duration_seconds")
             if isinstance(duration, (int, float)):
-                projected_duration += float(duration) * 40.0
+                projected_duration += float(duration) * projection_factor
             else:
                 durations_known = False
         else:
@@ -1512,16 +1665,16 @@ def run_qualification_stage(
         "created_at": _utc_now(),
         "status": state["status"],
         "route_count": len(routes),
-        "discovered_route_count": len(all_routes),
+        "discovered_route_count": int(plan["route_count"]),
         "completed_routes": len(results),
         "qualified_routes": qualified,
         "excluded_routes": excluded,
         "projected_full_run_cost_usd": round(projected, 12) if costs_known else None,
-        "cost_projection_basis": "qualification observed cost multiplied by 40 (80/2 episodes)",
+        "cost_projection_basis": "qualification observed cost multiplied by 80/34 episodes",
         "projected_full_run_duration_seconds": (
             round(projected_duration, 3) if durations_known else None
         ),
-        "duration_projection_basis": "qualification elapsed time multiplied by 40 (80/2 episodes)",
+        "duration_projection_basis": "qualification elapsed time multiplied by 80/34 episodes",
     }
     _atomic_json(root / "QUALIFICATION.json", qualification_report)
     _atomic_json(root / "CAMPAIGN.json", state)
@@ -1576,21 +1729,11 @@ def run_full_stage(
     budget = _validate_budget(max_cost_usd)
     call_budget = _validate_positive_int(max_api_calls, "full_api_call_budget_required")
     route_cap = _validate_positive_int(max_routes, "full_route_cap_required")
-    all_routes = _campaign_routes(root)
-    qualified_ids = {
-        str(item.get("route_id") or "")
-        for item in state.get("qualified_routes", [])
-        if isinstance(item, Mapping)
-    }
-    routes = _select_routes(
-        [route for route in all_routes if str(route.get("route_id") or "") in qualified_ids],
-        current_route=baseline_route,
-        max_routes=route_cap,
-    )
+    plan, routes = _planned_stage_routes(root, state, stage="full", route_cap=route_cap)
     if len(routes) < 2:
         raise ValueError("campaign_comparison_not_supportable")
-    results = _load_stage_results(root, "full", routes)
-    effort = str(state.get("reasoning_effort") or "")
+    effort = _plan_reasoning_effort(plan, state)
+    results = _load_stage_results(root, "full", routes, reasoning_effort=effort)
     approval = _accept_stage_approval(
         root,
         approval_path=approval_path,
@@ -1648,6 +1791,7 @@ def run_full_stage(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
+        execution_route["max_api_calls"] = min(1360, call_budget - observed_calls)
         try:
             report = runner(execution_route, "full", suite_output, effort)
         except Exception:
@@ -1660,20 +1804,29 @@ def run_full_stage(
             state["updated_at"] = _utc_now()
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
-        receipt = {
-            "schema": "oab.full-run-result/v1",
-            "created_at": _utc_now(),
-            "route_id": route_id,
-            "requested_route": route.get("requested_route"),
-            "suite_output": str(suite_output),
-            "observed_cost_usd": _cost_from_report(report),
-            "observed_known_cost_usd": _known_cost_from_report(report),
-            "unknown_cost_api_calls": _unknown_cost_api_calls_from_report(report),
-            "observed_api_calls": _api_calls_from_report(report),
-            "suite_report": dict(report),
-        }
+        receipt = _stage_result_receipt(
+            {
+                "schema": "oab.full-run-result/v2",
+                "created_at": _utc_now(),
+                "route_id": route_id,
+                "requested_route": route.get("requested_route"),
+                "suite_output": str(suite_output),
+                "observed_cost_usd": _cost_from_report(report),
+                "observed_known_cost_usd": _known_cost_from_report(report),
+                "unknown_cost_api_calls": _unknown_cost_api_calls_from_report(report),
+                "observed_api_calls": _api_calls_from_report(report),
+            },
+            report,
+        )
         _atomic_json(_result_path(root, "full", route_id), receipt)
         results[route_id] = receipt
+        observed_route_calls = receipt.get("observed_api_calls")
+        if (
+            isinstance(observed_route_calls, int)
+            and observed_route_calls > execution_route["max_api_calls"]
+        ):
+            state["status"] = "full_call_budget_exceeded"
+            break
         known_costs = [item.get("observed_known_cost_usd") for item in results.values()]
         observed_known = sum(
             float(value) for value in known_costs if isinstance(value, (int, float))

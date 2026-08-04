@@ -124,6 +124,25 @@ class HermesCliControllerTests(unittest.TestCase):
             self.assertEqual(0.5, usage["known_cost_usd"])
             self.assertEqual(0, usage["unknown_cost_api_calls"])
 
+    def test_api_call_ceiling_stops_before_second_provider_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            executable = self.make_executable(Path(td))
+            controller = HermesCliController(
+                model="test-model",
+                provider="test-provider",
+                executable=executable,
+                timeout_seconds=10,
+                max_api_calls=1,
+            )
+            controller.begin({"schema": "oab.controller-context/v1", "episode_id": "opaque"})
+            first = controller.next(None)
+            self.assertIsInstance(first, ToolRequest)
+            with self.assertRaisesRegex(
+                ControllerInfrastructureError, "controller_api_call_limit_exhausted"
+            ):
+                controller.next(ToolResult("r1", True, {"text": "hello"}))
+            self.assertEqual(1, controller.usage_snapshot()["api_calls"])
+
     def test_mixed_known_unknown_cost_preserves_known_lower_bound(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             executable = self.make_executable(Path(td))
@@ -300,7 +319,7 @@ class HermesCliControllerTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json,pathlib,sys\n"
                 "a=sys.argv[1:]; pathlib.Path(a[a.index('--usage-file')+1]).write_text(json.dumps({'model':'test-model','provider':'test-provider','api_calls':1,'completed':True,'failed':False,'session_id':'s'}))\n"
-                "print('[' * 1200 + '0' + ']' * 1200)\n"
+                "print('[' * 300 + '0' + ']' * 300)\n"
             )
             executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             controller = HermesCliController(

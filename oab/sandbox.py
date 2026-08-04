@@ -282,6 +282,20 @@ class BubblewrapBackend:
         finally:
             library.seccomp_release(context)
 
+    @staticmethod
+    def _runtime_bind_roots(policy: SandboxPolicy) -> tuple[Path, ...]:
+        system_roots = (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
+        roots: set[Path] = set()
+        for executable in policy.allowed_executables:
+            resolved = executable.resolve()
+            if any(resolved == root or resolved.is_relative_to(root) for root in system_roots):
+                continue
+            candidate = resolved.parent.parent if resolved.parent.name in {"bin", "sbin"} else resolved.parent
+            if candidate == Path("/"):
+                raise SandboxUnavailable("non-system executable runtime root is too broad")
+            roots.add(candidate)
+        return tuple(sorted(roots, key=lambda item: str(item)))
+
     def build_command(
         self,
         policy: SandboxPolicy,
@@ -306,9 +320,19 @@ class BubblewrapBackend:
             "--ro-bind",
             "/bin",
             "/bin",
-            "--seccomp",
-            str(seccomp_fd),
         ]
+        for system_root in (Path("/lib"), Path("/lib64")):
+            if system_root.exists():
+                args.extend(["--ro-bind", str(system_root), str(system_root)])
+        created_directories: set[Path] = set()
+        for runtime_root in self._runtime_bind_roots(policy):
+            for parent in reversed(runtime_root.parents):
+                if parent == Path("/") or parent in created_directories:
+                    continue
+                args.extend(["--dir", str(parent)])
+                created_directories.add(parent)
+            args.extend(["--ro-bind", str(runtime_root), str(runtime_root)])
+        args.extend(["--seccomp", str(seccomp_fd)])
         for path in policy.read_only:
             resolved = str(path.resolve())
             args.extend(["--ro-bind", resolved, resolved])
@@ -318,7 +342,7 @@ class BubblewrapBackend:
         for path in policy.writable_files:
             resolved = str(path.resolve())
             args.extend(["--bind", resolved, resolved])
-        args.append("--share-net")
+        args.append("--share-net" if policy.network else "--unshare-net")
         env = policy.environment()
         for key, value in sorted(env.items()):
             args.extend(["--setenv", key, value])

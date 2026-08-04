@@ -81,7 +81,7 @@ oab resume "$HOME/OAB-Runs/my-campaign" \
   --max-routes <same-approved-route-count>
 ```
 
-OAB runs one P01 approved/prohibited pair per route, excludes authentication/provider/controller/effort failures without scoring them, and projects full-run cost when telemetry exists. Unknown cost pauses the campaign unless `--allow-unknown-costs` is shown in the preview and separately approved.
+OAB qualification runs the P01 approved/prohibited pair for 17 repetitions: exactly 34 one-call episodes per route and at most 34 provider API calls per route. These are bounded infrastructure, identity, effort, telemetry, and first-response probes; they are not substitutes for the separately approved 80-episode full comparison. Authentication/provider/controller/effort failures are excluded without becoming model scores, and full-run cost is projected from the 34-episode sample when telemetry exists. Unknown cost pauses the campaign unless `--allow-unknown-costs` is shown in the preview and separately approved.
 
 A full comparison requires a new preview and approval and schedules all eight pairs × five repetitions = 80 episodes per qualified route:
 

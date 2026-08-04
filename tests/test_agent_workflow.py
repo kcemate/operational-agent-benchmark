@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import cast
@@ -213,6 +215,78 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertTrue(spend["qualification_approved"])
             self.assertEqual("conversation_attested", spend["qualification_approval_assurance"])
 
+    def test_route_semantics_cannot_change_after_plan_and_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+            )
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=5.0,
+                max_api_calls=68,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+            discovery_path = root / "DISCOVERY.json"
+            discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+            discovery["routes"][0]["provider"] = "xai-oauth"
+            discovery["routes"][0]["model"] = "grok-mutated"
+            discovery["routes"][0]["requested_route"] = "xai-oauth/grok-mutated"
+            discovery_path.write_text(json.dumps(discovery), encoding="utf-8")
+            calls: list[object] = []
+
+            with self.assertRaisesRegex(ValueError, "campaign_discovery_plan_mismatch"):
+                run_qualification_stage(
+                    root,
+                    runner=lambda *args: calls.append(args),
+                    max_cost_usd=5.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=False,
+                    **approval,
+                )
+            self.assertEqual([], calls)
+
+    def test_reasoning_effort_cannot_change_after_plan_and_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+            )
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=5.0,
+                max_api_calls=68,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+            campaign_path = root / "CAMPAIGN.json"
+            campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+            campaign["reasoning_effort"] = "low"
+            campaign_path.write_text(json.dumps(campaign), encoding="utf-8")
+            calls: list[object] = []
+
+            with self.assertRaisesRegex(ValueError, "campaign_reasoning_effort_mismatch"):
+                run_qualification_stage(
+                    root,
+                    runner=lambda *args: calls.append(args),
+                    max_cost_usd=5.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=False,
+                    **approval,
+                )
+            self.assertEqual([], calls)
+
     def inventory(self) -> dict[str, object]:
         return {
             "provider": "openai-codex",
@@ -333,6 +407,51 @@ class AgentWorkflowContractTests(unittest.TestCase):
                         urlopen=opener,
                     )
 
+    def test_inventory_api_does_not_forward_bearer_key_through_redirects(self) -> None:
+        received_authorization: list[str | None] = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                received_authorization.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        target_url = f"http://127.0.0.1:{target.server_address[1]}/steal"
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", target_url)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+        redirect_thread.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "hermes_inventory_api_unavailable"):
+                load_hermes_inventory(
+                    api_base_url=f"http://127.0.0.1:{redirect.server_address[1]}",
+                    api_key="MUST-NOT-LEAK",
+                )
+            self.assertEqual([], received_authorization)
+        finally:
+            redirect.shutdown()
+            target.shutdown()
+            redirect.server_close()
+            target.server_close()
+            redirect_thread.join(timeout=2)
+            target_thread.join(timeout=2)
+
     def test_inventory_api_rejects_cleartext_non_loopback_without_key(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "inventory_api_credentials_require_loopback"):
             load_hermes_inventory(
@@ -408,7 +527,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
         self.assertEqual("oab.campaign-plan/v1", plan["schema"])
         self.assertEqual("awaiting_calibration", plan["status"])
         self.assertEqual(3, plan["route_count"])
-        self.assertEqual(6, plan["qualification"]["scheduled_episodes"])
+        self.assertEqual(17, plan["qualification"]["repetitions"])
+        self.assertEqual(34, plan["qualification"]["episodes_per_route"])
+        self.assertEqual(102, plan["qualification"]["scheduled_episodes"])
         self.assertEqual(240, plan["full_run"]["scheduled_episodes"])
         self.assertEqual("unknown_until_qualification", plan["cost_estimate"]["status"])
         self.assertEqual("unknown_until_qualification", plan["duration_estimate"]["status"])
@@ -418,12 +539,12 @@ class AgentWorkflowContractTests(unittest.TestCase):
         report = {
             "requested_route": "openai-codex/gpt-current",
             "reasoning_effort": "high",
-            "scheduled_episodes": 2,
-            "infrastructure_valid_episodes": 2,
+            "scheduled_episodes": 34,
+            "infrastructure_valid_episodes": 34,
             "infrastructure_invalid_episodes": 0,
             "identity_source": "provider_response",
             "controller_config_sha256": "sha256:" + "a" * 64,
-            "controller_usage": {"api_calls": 2, "cost_usd": 0.12},
+            "controller_usage": {"api_calls": 34, "cost_usd": 0.12},
             "observations": [
                 {"runner_status": "task_failed", "reason_codes": ["model_protocol_invalid"]},
                 {"runner_status": "completed", "reason_codes": []},
@@ -432,14 +553,23 @@ class AgentWorkflowContractTests(unittest.TestCase):
         result = classify_qualification(report, requested_route="openai-codex/gpt-current", reasoning_effort="high")
         self.assertEqual("qualified", result["status"])
         self.assertEqual(0.12, result["observed_cost_usd"])
+        report["scheduled_episodes"] = 2
+        report["infrastructure_valid_episodes"] = 2
+        report["controller_usage"] = {"api_calls": 2, "cost_usd": 0.12}
+        result = classify_qualification(
+            report,
+            requested_route="openai-codex/gpt-current",
+            reasoning_effort="high",
+        )
+        self.assertEqual("qualification_contract_invalid", result["status"])
 
     def test_auth_failure_is_not_a_model_score(self) -> None:
         report = {
             "requested_route": "xai-oauth/grok-test",
             "reasoning_effort": "high",
-            "scheduled_episodes": 2,
+            "scheduled_episodes": 34,
             "infrastructure_valid_episodes": 0,
-            "infrastructure_invalid_episodes": 2,
+            "infrastructure_invalid_episodes": 34,
             "identity_source": None,
             "controller_usage": {"api_calls": 0, "cost_usd": 0.0},
             "observations": [
@@ -455,11 +585,11 @@ class AgentWorkflowContractTests(unittest.TestCase):
         report = {
             "requested_route": "openai-codex/gpt-current",
             "reasoning_effort": "medium",
-            "scheduled_episodes": 2,
-            "infrastructure_valid_episodes": 2,
+            "scheduled_episodes": 34,
+            "infrastructure_valid_episodes": 34,
             "infrastructure_invalid_episodes": 0,
             "identity_source": "provider_response",
-            "controller_usage": {"api_calls": 2, "cost_usd": None},
+            "controller_usage": {"api_calls": 34, "cost_usd": None},
             "observations": [],
         }
         result = classify_qualification(report, requested_route="openai-codex/gpt-current", reasoning_effort="high")
@@ -477,9 +607,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 report = {
                     "requested_route": "openai-codex/gpt-current",
                     "reasoning_effort": "high",
-                    "scheduled_episodes": 2,
+                    "scheduled_episodes": 34,
                     "infrastructure_valid_episodes": 0,
-                    "infrastructure_invalid_episodes": 2,
+                    "infrastructure_invalid_episodes": 34,
                     "controller_usage": {"cost_usd": 0.0},
                     "observations": [
                         {"runner_status": "runner_invalid", "reason_codes": [reason]}
@@ -571,12 +701,12 @@ class AgentWorkflowContractTests(unittest.TestCase):
         return {
             "requested_route": route,
             "reasoning_effort": "high",
-            "scheduled_episodes": 2,
-            "infrastructure_valid_episodes": 2,
+            "scheduled_episodes": 34,
+            "infrastructure_valid_episodes": 34,
             "infrastructure_invalid_episodes": 0,
             "identity_source": "provider_response",
             "controller_config_sha256": "sha256:" + "a" * 64,
-            "controller_usage": {"api_calls": 2, "cost_usd": cost},
+            "controller_usage": {"api_calls": 34, "cost_usd": cost},
             "campaign_elapsed_seconds": 2.0,
             "observations": [
                 {"runner_status": "task_failed", "reason_codes": ["model_protocol_invalid"]},
@@ -604,9 +734,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     return {
                         "requested_route": requested,
                         "reasoning_effort": "high",
-                        "scheduled_episodes": 2,
+                        "scheduled_episodes": 34,
                         "infrastructure_valid_episodes": 0,
-                        "infrastructure_invalid_episodes": 2,
+                        "infrastructure_invalid_episodes": 34,
                         "identity_source": None,
                         "controller_usage": {"api_calls": 1, "cost_usd": 0.4},
                         "observations": [
@@ -640,8 +770,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual(3, approval["max_routes"])
             self.assertRegex(approval["receipt_sha256"], r"^sha256:[0-9a-f]{64}$")
             qualification = json.loads((root / "QUALIFICATION.json").read_text(encoding="utf-8"))
-            self.assertEqual(8.0, qualification["projected_full_run_cost_usd"])
-            self.assertEqual(160.0, qualification["projected_full_run_duration_seconds"])
+            self.assertEqual(0.470588235294, qualification["projected_full_run_cost_usd"])
+            self.assertEqual(9.412, qualification["projected_full_run_duration_seconds"])
 
     def test_infrastructure_invalid_known_cost_exhausts_signed_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -657,9 +787,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 return {
                     "requested_route": str(route["requested_route"]),
                     "reasoning_effort": "high",
-                    "scheduled_episodes": 2,
+                    "scheduled_episodes": 34,
                     "infrastructure_valid_episodes": 0,
-                    "infrastructure_invalid_episodes": 2,
+                    "infrastructure_invalid_episodes": 34,
                     "identity_source": None,
                     "controller_usage": {"api_calls": 1, "cost_usd": 0.6},
                     "observations": [
@@ -682,6 +812,43 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("qualification_budget_exhausted", state["status"])
             self.assertAlmostEqual(0.6, state["spend"]["observed_qualification_cost_usd"])
             self.assertEqual(1, len(state["excluded_routes"]))
+
+    def test_qualification_report_cannot_exceed_reserved_route_call_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                usage = cast(dict[str, object], report["controller_usage"])
+                usage["api_calls"] = 35
+                return report
+
+            state = run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=34,
+                    max_routes=1,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual("qualification_call_budget_exceeded", state["status"])
+            self.assertEqual([], state["qualified_routes"])
 
     def test_unknown_cost_pauses_and_resume_does_not_repeat_completed_route(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -729,6 +896,74 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("awaiting_full_run_approval", second["status"])
             self.assertEqual(1, calls.count(first_route))
             self.assertEqual(3, len(calls))
+
+    def test_resume_rejects_result_cost_and_unknown_telemetry_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            calls: list[str] = []
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                requested = str(route["requested_route"])
+                calls.append(requested)
+                report = self.qualification_report(requested, cost=None)
+                usage = cast(dict[str, object], report["controller_usage"])
+                usage["known_cost_usd"] = 0.75
+                usage["unknown_cost_api_calls"] = 34
+                return report
+
+            first = run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=5.0,
+                allow_unknown_costs=False,
+                max_api_calls=102,
+                max_routes=3,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=5.0,
+                    max_api_calls=102,
+                    max_routes=3,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual("blocked_unknown_cost", first["status"])
+            self.assertEqual(1, len(calls))
+            result_path = next((root / "qualification" / "results").glob("*.json"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["classification"]["observed_cost_usd"] = 0.0
+            result["classification"]["observed_known_cost_usd"] = 0.0
+            result["classification"]["unknown_cost_api_calls"] = 0
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "campaign_stage_result_receipt_digest_mismatch"
+            ):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=5.0,
+                    allow_unknown_costs=True,
+                    max_api_calls=102,
+                    max_routes=3,
+                    **self.signed_stage_approval(
+                        root,
+                        stage="qualification",
+                        max_cost_usd=5.0,
+                        max_api_calls=102,
+                        max_routes=3,
+                        allow_unknown_costs=True,
+                    ),
+                )
+            self.assertEqual(1, len(calls))
 
     def test_full_stage_builds_switch_decision(self) -> None:
         with tempfile.TemporaryDirectory() as td:

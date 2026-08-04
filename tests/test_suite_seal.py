@@ -209,6 +209,20 @@ class SuiteSealTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "suite_report_recomputation_mismatch"):
                 write_suite_seal(output)
 
+    def test_aggregate_known_and_unknown_cost_telemetry_is_recomputed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = self._suite(Path(td))
+            report_path = output / "suite-report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            usage = report["controller_usage"]
+            usage["known_cost_usd"] = 999.0
+            usage["unknown_cost_api_calls"] = 0
+            report_path.write_bytes(_canonical_bytes(report) + b"\n")
+            with self.assertRaisesRegex(
+                ValueError, "suite_report_recomputation_mismatch:controller_usage"
+            ):
+                write_suite_seal(output)
+
     def test_incomplete_observation_grid_cannot_be_sealed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             output = self._suite(Path(td))

@@ -27,6 +27,7 @@ class PinnedHermesRuntimeTests(unittest.TestCase):
                 self.assertRegex(runtime.config_sha256, r"^sha256:[0-9a-f]{64}$")
                 config = yaml.safe_load((runtime.home / "config.yaml").read_text())
                 self.assertEqual(config["agent"]["reasoning_effort"], "medium")
+                self.assertEqual(config["agent"]["max_iterations"], 1)
                 self.assertTrue((runtime.home / "auth.json").is_symlink())
                 self.assertEqual((runtime.home / "auth.json").resolve(), auth.resolve())
                 self.assertEqual(os.stat(runtime.home).st_mode & 0o777, 0o700)

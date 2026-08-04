@@ -69,6 +69,8 @@ class ControllerInfrastructureError(RuntimeError):
             "provider_rate_limited",
             "provider_unavailable",
             "controller_usage_invalid",
+            "controller_api_call_limit_exhausted",
+            "controller_api_call_limit_exceeded",
             "controller_observed_cost_threshold_exhausted",
             "controller_observed_cost_threshold_exceeded",
             "controller_cost_telemetry_unknown",

@@ -57,6 +57,9 @@ def pinned_hermes_runtime(
     if not isinstance(agent, dict):
         raise ValueError("source_hermes_config_invalid")
     agent["reasoning_effort"] = effort
+    # One OAB controller decision is exactly one provider call. Prevent the
+    # Hermes agent loop from issuing tool-followup or retry turns internally.
+    agent["max_iterations"] = 1
     config_bytes = yaml.safe_dump(
         config,
         sort_keys=True,

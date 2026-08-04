@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,62 @@ print(json.dumps(result, sort_keys=True))
             self.assertTrue(result.profile_sha256)
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and shutil.which("bwrap"),
+    "Linux Bubblewrap integration test",
+)
+class LinuxBubblewrapBoundaryTests(unittest.TestCase):
+    def test_real_bubblewrap_denies_fork_and_socket_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td).resolve() / "episode"
+            for relative in ("work", "home", "tmp"):
+                (workspace / relative).mkdir(parents=True)
+            script = workspace / "work/probe.py"
+            script.write_text(
+                """
+import json, os, socket
+result = {}
+try:
+    child = os.fork()
+except OSError:
+    result['fork_denied'] = True
+else:
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    result['fork_denied'] = False
+try:
+    candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError:
+    result['network_denied'] = True
+else:
+    candidate.close()
+    result['network_denied'] = False
+print(json.dumps(result, sort_keys=True))
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            executable = Path(sys.executable).resolve()
+            policy = SandboxPolicy(
+                workspace=workspace,
+                read_only=(script,),
+                writable=(workspace / "work", workspace / "home", workspace / "tmp"),
+                allowed_executables=(executable,),
+                network=False,
+            )
+            backend = BubblewrapBackend(Path(shutil.which("bwrap") or "/usr/bin/bwrap"))
+            result = backend.run(
+                policy,
+                [str(executable), str(script)],
+                timeout_seconds=10,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["fork_denied"])
+            self.assertTrue(payload["network_denied"])
+
+
 class SandboxSelectionTests(unittest.TestCase):
     def test_seccomp_ctypes_signature_preserves_64_bit_filter_context(self) -> None:
         class CFunction:
@@ -171,8 +228,28 @@ class SandboxSelectionTests(unittest.TestCase):
         )
         index = command.index("--seccomp")
         self.assertEqual("17", command[index + 1])
-        self.assertIn("--share-net", command)
-        self.assertNotIn("--unshare-net", command)
+        self.assertIn("--unshare-net", command)
+        self.assertNotIn("--share-net", command)
+
+    def test_bubblewrap_mounts_non_system_executable_runtime_prefix(self) -> None:
+        runtime = Path("/opt/hostedtoolcache/Python/3.13.14/x64")
+        executable = runtime / "bin/python3.13"
+        policy = SandboxPolicy(
+            workspace=Path("/tmp/episode"),
+            read_only=(),
+            writable=(Path("/tmp/episode/home"), Path("/tmp/episode/tmp")),
+            allowed_executables=(executable,),
+            network=False,
+        )
+        command = BubblewrapBackend(Path("/usr/bin/bwrap")).build_command(
+            policy,
+            [str(executable), "leaf.py"],
+            seccomp_fd=17,
+        )
+        runtime_index = command.index(str(runtime))
+        self.assertEqual("--ro-bind", command[runtime_index - 1])
+        self.assertEqual(str(runtime), command[runtime_index + 1])
+        self.assertIn("/opt/hostedtoolcache/Python/3.13.14", command)
 
     def test_seccomp_denies_network_syscalls_when_network_is_disabled(self) -> None:
         self.assertEqual(

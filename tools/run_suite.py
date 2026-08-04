@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,12 +19,23 @@ from oab.registry import load_registry
 from oab.release_approval import verify_release_approval
 from oab.runner import StrictEpisodeSpec
 from oab.runtime_profile import pinned_hermes_runtime
-from oab.strict_runner import run_strict_episode
+from oab.strict_runner import ToolPolicy, run_strict_episode
 from oab.suite_seal import write_suite_seal
 from oab.paths import benchmark_root
 from tools.release_manifest import verify_release_manifest
 
 ROOT = benchmark_root()
+
+
+def _bounded_tool_policy(policy: ToolPolicy, max_steps: int | None) -> ToolPolicy:
+    if max_steps is None:
+        return policy
+    if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
+        raise ValueError("max_steps_per_episode_invalid")
+    current = getattr(policy, "max_steps", None)
+    if not isinstance(current, int) or isinstance(current, bool) or current < 1:
+        raise ValueError("tool_policy_max_steps_invalid")
+    return replace(policy, max_steps=min(current, max_steps))
 
 
 def _parse_pairs(raw: str | None, available: list[str]) -> list[str]:
@@ -75,6 +87,7 @@ def _run_observations(
 ) -> list[dict[str, object]]:
     observations: list[dict[str, object]] = []
     observed_known_cost_usd = 0.0
+    observed_api_calls = 0
     for repetition in range(1, args.repetitions + 1):
         for case in selected_cases:
             case_id = str(case["case_id"])
@@ -97,7 +110,15 @@ def _run_observations(
                 hermes_home=runtime_home,
                 reasoning_effort=args.reasoning_effort,
                 max_observed_cost_usd=remaining_observed_cost_usd,
+                max_api_calls=(
+                    max(0, args.max_api_calls - observed_api_calls)
+                    if args.max_api_calls is not None
+                    else None
+                ),
                 allow_unknown_costs=args.allow_unknown_costs,
+            )
+            tool_policy = _bounded_tool_policy(
+                tool_policy_from_case(case, fixture), args.max_steps_per_episode
             )
             result = run_strict_episode(
                 StrictEpisodeSpec(
@@ -110,7 +131,7 @@ def _run_observations(
                 repository_root=ROOT,
                 run_root=run_root,
                 evidence_dir=evidence,
-                tool_policy=tool_policy_from_case(case, fixture),
+                tool_policy=tool_policy,
                 controller=controller,
             )
             gates = verify_case(case, fixture, evidence)
@@ -149,11 +170,24 @@ def _run_observations(
             known_cost = usage.get("known_cost_usd") if isinstance(usage, dict) else None
             if isinstance(known_cost, (int, float)) and not isinstance(known_cost, bool):
                 observed_known_cost_usd += float(known_cost)
+            api_calls = usage.get("api_calls") if isinstance(usage, dict) else None
+            if isinstance(api_calls, int) and not isinstance(api_calls, bool):
+                observed_api_calls += api_calls
+            unknown_cost_api_calls = (
+                usage.get("unknown_cost_api_calls") if isinstance(usage, dict) else None
+            )
             print(
                 f"finished {case_id} rep={repetition}: status={result.status} "
                 f"gates={sum(gate.passed for gate in gates)}/{len(gates)}",
                 flush=True,
             )
+            if (
+                not args.allow_unknown_costs
+                and isinstance(unknown_cost_api_calls, int)
+                and not isinstance(unknown_cost_api_calls, bool)
+                and unknown_cost_api_calls > 0
+            ):
+                return observations
     return observations
 
 
@@ -217,6 +251,18 @@ def main() -> int:
     )
     parser.add_argument("--timeout-seconds", type=float, default=240.0)
     parser.add_argument("--episode-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--max-steps-per-episode",
+        type=int,
+        default=None,
+        help="Never allow more than this many broker/controller steps in one episode",
+    )
+    parser.add_argument(
+        "--max-api-calls",
+        type=int,
+        default=None,
+        help="Hard ceiling on provider calls across this suite",
+    )
     args = parser.parse_args()
 
     release_manifest_path = ROOT / "RELEASE_MANIFEST.json"
