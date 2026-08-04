@@ -23,7 +23,9 @@ When the Hermes adapter records `identity_source=adapter_runtime`, every score i
 
 ### Agent-native all-accessible workflow
 
-Install only an externally pinned wheel into the Python environment next to the active Hermes executable. Obtain both digests from a channel independent of the repository or wheel, and stop on any mismatch:
+Install only an externally pinned wheel into the Python environment next to the active Hermes executable. Obtain both digests from a channel independent of the repository or wheel, and stop on any mismatch.
+
+On Linux, install Bubblewrap and libseccomp and ensure the host permits unprivileged user namespaces. Ubuntu/AppArmor hosts may otherwise fail with `setting up uid map: Permission denied`. The hosted CI relaxes `kernel.apparmor_restrict_unprivileged_userns` only on its disposable runner and verifies `unshare --user --map-root-user true`; do not weaken that control on a shared host without administrator review.
 
 ```bash
 HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"

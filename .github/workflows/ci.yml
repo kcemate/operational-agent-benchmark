@@ -26,6 +26,12 @@ jobs:
           python -m pip install -e .
           sudo apt-get update
           sudo apt-get install -y bubblewrap libseccomp2
+      - name: Enable Bubblewrap user namespaces on the ephemeral runner
+        run: |
+          if sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true
       - name: Regenerate frozen fixtures
         run: |
           python tools/generate_fixtures.py
