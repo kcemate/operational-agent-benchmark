@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sys
@@ -134,6 +135,27 @@ print(json.dumps(result, sort_keys=True))
 
 
 class SandboxSelectionTests(unittest.TestCase):
+    def test_seccomp_ctypes_signature_preserves_64_bit_filter_context(self) -> None:
+        class CFunction:
+            def __init__(self) -> None:
+                self.argtypes: list[object] = []
+                self.restype: object | None = None
+
+        class Library:
+            seccomp_init = CFunction()
+            seccomp_release = CFunction()
+            seccomp_syscall_resolve_name = CFunction()
+            seccomp_rule_add = CFunction()
+            seccomp_export_bpf = CFunction()
+
+        library = Library()
+        BubblewrapBackend._configure_seccomp_library(library)
+        self.assertEqual(
+            [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint],
+            library.seccomp_rule_add.argtypes,
+        )
+        self.assertIs(ctypes.c_int, library.seccomp_rule_add.restype)
+
     def test_bubblewrap_command_installs_seccomp_filter_fd(self) -> None:
         policy = SandboxPolicy(
             workspace=Path("/tmp/episode"),

@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Mapping, Sequence
 
 
 class SandboxUnavailable(RuntimeError):
@@ -208,6 +208,23 @@ class BubblewrapBackend:
         self.executable = executable
 
     @staticmethod
+    def _configure_seccomp_library(library: Any) -> None:
+        library.seccomp_init.argtypes = [ctypes.c_uint32]
+        library.seccomp_init.restype = ctypes.c_void_p
+        library.seccomp_release.argtypes = [ctypes.c_void_p]
+        library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+        library.seccomp_syscall_resolve_name.restype = ctypes.c_int
+        library.seccomp_rule_add.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        library.seccomp_rule_add.restype = ctypes.c_int
+        library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        library.seccomp_export_bpf.restype = ctypes.c_int
+
+    @staticmethod
     def _no_fork_seccomp_program() -> tuple[BinaryIO, bytes]:
         library_path = ctypes.util.find_library("seccomp")
         if not library_path:
@@ -216,14 +233,7 @@ class BubblewrapBackend:
             library = ctypes.CDLL(library_path)
         except OSError as exc:
             raise SandboxUnavailable("libseccomp could not be loaded") from exc
-        library.seccomp_init.argtypes = [ctypes.c_uint32]
-        library.seccomp_init.restype = ctypes.c_void_p
-        library.seccomp_release.argtypes = [ctypes.c_void_p]
-        library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
-        library.seccomp_syscall_resolve_name.restype = ctypes.c_int
-        library.seccomp_rule_add.restype = ctypes.c_int
-        library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        library.seccomp_export_bpf.restype = ctypes.c_int
+        BubblewrapBackend._configure_seccomp_library(library)
 
         allow = 0x7FFF0000
         deny = 0x00050000 | errno.EPERM
