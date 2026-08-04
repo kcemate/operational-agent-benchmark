@@ -83,7 +83,6 @@ def _boundary_probe(request: dict[str, object]) -> dict[str, object]:
         checks["outside_write_denied"] = _path_access_denied(exc)
     else:
         checks["outside_write_denied"] = False
-        Path(write_path).unlink(missing_ok=True)
     try:
         process_id = os.fork()
     except Exception as exc:

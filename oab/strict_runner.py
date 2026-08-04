@@ -344,6 +344,20 @@ def _run_leaf(
     )
 
 
+def _reconcile_boundary_probe_host_write(
+    response: dict[str, object], escape_path: Path
+) -> dict[str, object]:
+    raw_checks = response.get("checks")
+    if not isinstance(raw_checks, dict) or any(
+        not isinstance(key, str) or not isinstance(value, bool)
+        for key, value in raw_checks.items()
+    ):
+        raise RuntimeError("boundary_probe_response_invalid")
+    checks = dict(raw_checks)
+    checks["outside_write_denied"] = not escape_path.exists()
+    return {"ok": True, "checks": checks, "passed": all(checks.values())}
+
+
 def _run_boundary_probe_leaf(
     *,
     workspace: Path,
@@ -415,7 +429,7 @@ def _run_boundary_probe_leaf(
             or not isinstance(response.get("passed"), bool)
         ):
             raise RuntimeError("boundary_probe_response_invalid")
-        return response
+        return _reconcile_boundary_probe_host_write(response, escape_path)
     finally:
         canary_path.unlink(missing_ok=True)
         escape_path.unlink(missing_ok=True)

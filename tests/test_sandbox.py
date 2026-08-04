@@ -22,6 +22,7 @@ from oab.sandbox import (
     select_backend,
 )
 from oab.leaf_worker import _boundary_probe
+from oab.strict_runner import _reconcile_boundary_probe_host_write
 
 
 @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(), "macOS sandbox required")
@@ -195,6 +196,45 @@ print(json.dumps(result, sort_keys=True))
 
 
 class SandboxSelectionTests(unittest.TestCase):
+    def test_parent_reconciles_namespace_write_against_host_path(self) -> None:
+        response = {
+            "ok": True,
+            "checks": {
+                "outside_read_denied": True,
+                "outside_write_denied": False,
+                "process_fork_denied": True,
+                "unlisted_exec_denied": True,
+                "network_denied": True,
+            },
+            "passed": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            escape_path = Path(td) / "escape"
+            reconciled = _reconcile_boundary_probe_host_write(response, escape_path)
+            self.assertTrue(reconciled["passed"])
+            escape_path.write_text("escaped", encoding="utf-8")
+            reconciled = _reconcile_boundary_probe_host_write(response, escape_path)
+            self.assertFalse(reconciled["passed"])
+
+    def test_boundary_probe_preserves_successful_write_for_parent_detection(self) -> None:
+        denied = PermissionError(errno.EPERM, "denied by containment")
+        with tempfile.TemporaryDirectory() as td:
+            escape_path = Path(td) / "escape"
+            with (
+                patch("pathlib.Path.read_bytes", side_effect=denied),
+                patch("oab.leaf_worker.os.fork", side_effect=denied),
+                patch("oab.leaf_worker.os.posix_spawn", side_effect=denied),
+                patch("oab.leaf_worker.socket.socket", side_effect=denied),
+            ):
+                response = _boundary_probe(
+                    {
+                        "probe_read_path": str(Path(td) / "read"),
+                        "probe_write_path": str(escape_path),
+                    }
+                )
+            self.assertFalse(response["passed"])
+            self.assertTrue(escape_path.is_file())
+
     def test_boundary_probe_accepts_unmounted_paths_as_denied(self) -> None:
         missing = FileNotFoundError(errno.ENOENT, "hidden by mount namespace")
         denied = PermissionError(errno.EPERM, "denied by containment")
