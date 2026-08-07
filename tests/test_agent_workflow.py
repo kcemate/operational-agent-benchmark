@@ -1159,6 +1159,54 @@ class AgentWorkflowContractTests(unittest.TestCase):
         self.assertEqual("not_supportable", report["recommendation"])
         self.assertIn("fewer_than_two_authoritative_routes", report["reasons"])
 
+    def test_decision_is_invariant_to_diagnostic_gate_pass_rate(self) -> None:
+        """diagnostic_gate_pass_rate must never influence a switch decision.
+
+        It exists to break 0%-vs-0% ties for a human reader. If it ever reached
+        the decision path, a route could be recommended on partial gate credit
+        without completing a single contract.
+        """
+        baseline = {
+            "requested_route": "openai-codex/gpt-current",
+            "authoritative": True,
+            "reasoning_effort": "high",
+            "controller_config_sha256": "sha256:" + "b" * 64,
+            "release_tree_sha256": "sha256:" + "c" * 64,
+            "execution_environment": {"platform": "darwin", "sandbox_backend": "sandbox-exec"},
+            "scheduled_episodes": 80,
+            "infrastructure_valid_episodes": 80,
+            "pair_ids": FULL_PAIR_IDS,
+            "repetitions": 5,
+            "deterministic_contract_completion_rate": 0.70,
+            "matched_pair_completion_rate": 0.60,
+            "pair_stability": {"min": 0.40},
+        }
+        candidate = {
+            **baseline,
+            "requested_route": "openai-codex/gpt-next",
+            "deterministic_contract_completion_rate": 0.90,
+            "matched_pair_completion_rate": 0.80,
+            "pair_stability": {"min": 0.60},
+        }
+        kwargs = {
+            "current_route": "openai-codex/gpt-current",
+            "expected_pair_ids": FULL_PAIR_IDS,
+            "expected_repetitions": 5,
+            "expected_release_tree_sha256": "sha256:" + "c" * 64,
+        }
+        without = build_decision_report(suite_reports=[baseline, candidate], **kwargs)
+
+        # Invert the diagnostic signal: the losing route gets a perfect gate
+        # pass rate, the winning route gets zero.
+        baseline_with = {**baseline, "diagnostic_gate_pass_rate": 1.0}
+        candidate_with = {**candidate, "diagnostic_gate_pass_rate": 0.0}
+        with_diagnostic = build_decision_report(
+            suite_reports=[baseline_with, candidate_with], **kwargs
+        )
+
+        for key in ("recommendation", "recommended_route", "reasons", "comparable_routes"):
+            self.assertEqual(without[key], with_diagnostic[key], key)
+
     def test_decision_recommends_only_strict_dominance(self) -> None:
         baseline = {
             "requested_route": "openai-codex/gpt-current",

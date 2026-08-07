@@ -148,6 +148,67 @@ def _aggregate_controller_usage(
     return result
 
 
+def _normalized_turn_count(value: object) -> int:
+    """Coerce a receipt's protocol-normalization count to a canonical int.
+
+    Receipts written before this field existed, or by controllers that do not
+    track normalization, must normalize to 0 so that report emission and seal
+    recomputation produce byte-identical observations.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _gate_rows(record: Mapping[str, object]) -> list[Mapping[str, object]]:
+    gates = record.get("gates")
+    if not isinstance(gates, list):
+        return []
+    return [gate for gate in gates if isinstance(gate, Mapping)]
+
+
+def _aggregate_gate_outcomes(
+    records: Iterable[Mapping[str, object]],
+) -> tuple[dict[str, Any], dict[str, int], int, int]:
+    """Summarize declared-gate outcomes across already-filtered episodes.
+
+    Returns `(gate_failures, first_failing_gate, passed_evaluations,
+    total_evaluations)`. Episodes that never reached gate evaluation (for
+    example a protocol failure before the first tool call) carry no gate rows
+    and therefore contribute nothing here; they remain visible through
+    coverage and reason codes.
+    """
+    gate_failures: dict[str, dict[str, Any]] = {}
+    first_failing: dict[str, int] = {}
+    passed_evaluations = 0
+    total_evaluations = 0
+    for record in records:
+        first_failed_id: str | None = None
+        for gate in _gate_rows(record):
+            gate_id = gate.get("id")
+            if not isinstance(gate_id, str) or not gate_id:
+                continue
+            entry = gate_failures.setdefault(
+                gate_id, {"evaluated": 0, "failed": 0, "codes": {}}
+            )
+            entry["evaluated"] = int(entry["evaluated"]) + 1
+            total_evaluations += 1
+            if gate.get("passed") is True:
+                passed_evaluations += 1
+                continue
+            entry["failed"] = int(entry["failed"]) + 1
+            code = gate.get("code")
+            code_key = code if isinstance(code, str) and code else "unspecified"
+            codes = entry["codes"]
+            if isinstance(codes, dict):
+                codes[code_key] = int(codes.get(code_key, 0)) + 1
+            if first_failed_id is None:
+                first_failed_id = gate_id
+        if first_failed_id is not None:
+            first_failing[first_failed_id] = first_failing.get(first_failed_id, 0) + 1
+    return gate_failures, first_failing, passed_evaluations, total_evaluations
+
+
 def aggregate_suite_observations(
     observations: Iterable[Mapping[str, object]],
     *,
@@ -253,6 +314,7 @@ def aggregate_suite_observations(
         pair_invalid_slots = 0
         pair_matched = 0
         rep_details: list[dict[str, object]] = []
+        pair_scoreable_records: list[Mapping[str, object]] = []
         for repetition in range(1, repetitions + 1):
             approved = indexed.get((pair_id, "approved", repetition))
             prohibited = indexed.get((pair_id, "prohibited", repetition))
@@ -306,7 +368,12 @@ def aggregate_suite_observations(
                     item["present"] = True
                     item["infrastructure_valid"] = infra_ok
                     item["contract_complete"] = ok
+                    item["protocol_normalized_turns"] = _normalized_turn_count(
+                        record.get("protocol_normalized_turns")
+                    )
                     normalized_observations.append(item)
+                    if infra_ok:
+                        pair_scoreable_records.append(record)
             rep_details.append(
                 {
                     "repetition": repetition,
@@ -323,6 +390,12 @@ def aggregate_suite_observations(
             if pair_scoreable_slots > 0
             else None
         )
+        (
+            pair_gate_failures,
+            pair_first_failing,
+            pair_gate_passed,
+            pair_gate_total,
+        ) = _aggregate_gate_outcomes(pair_scoreable_records)
         pair_rows.append(
             {
                 "pair_id": pair_id,
@@ -344,6 +417,13 @@ def aggregate_suite_observations(
                 "matched_pair_successes": pair_matched,
                 "matched_pair_completion_rate": stability,
                 "stability": stability,
+                "gate_failures": pair_gate_failures,
+                "first_failing_gate": pair_first_failing,
+                "diagnostic_gate_pass_rate": (
+                    _as_rate(pair_gate_passed, pair_gate_total)
+                    if pair_gate_total > 0
+                    else None
+                ),
                 "repetitions": rep_details,
             }
         )
@@ -411,6 +491,25 @@ def aggregate_suite_observations(
     )
 
     integrity_flags = sorted(set(integrity_flags))
+    scoreable_records = [
+        record
+        for record in indexed.values()
+        if observation_infrastructure_valid(record)
+    ]
+    (
+        suite_gate_failures,
+        suite_first_failing,
+        suite_gate_passed,
+        suite_gate_total,
+    ) = _aggregate_gate_outcomes(scoreable_records)
+    normalized_turn_values = [
+        _normalized_turn_count(record.get("protocol_normalized_turns"))
+        for record in scoreable_records
+    ]
+    protocol_normalized_turn_total = sum(normalized_turn_values)
+    protocol_normalized_episodes = sum(
+        1 for value in normalized_turn_values if value > 0
+    )
     report: dict[str, Any] = {
         "schema": SUITE_REPORT_SCHEMA,
         "benchmark": {
@@ -465,6 +564,15 @@ def aggregate_suite_observations(
             "min_pair_id": min_pair_id,
         },
         "pairs": pair_rows,
+        "gate_failures": suite_gate_failures,
+        "first_failing_gate": suite_first_failing,
+        "diagnostic_gate_pass_rate": (
+            _as_rate(suite_gate_passed, suite_gate_total)
+            if suite_gate_total > 0
+            else None
+        ),
+        "protocol_normalized_turn_total": protocol_normalized_turn_total,
+        "protocol_normalized_episodes": protocol_normalized_episodes,
         "integrity_flags": integrity_flags,
         "observations": normalized_observations,
         "headline": "",
@@ -521,6 +629,25 @@ def format_headline(report: Mapping[str, object]) -> str:
             if report.get("authoritative") is not True
             else "Authoritative only for this exact suite/route/runtime."
         )
+    top_gate_text = ""
+    if completed < infrastructure_valid:
+        gate_failures = report.get("gate_failures")
+        if isinstance(gate_failures, Mapping) and gate_failures:
+            ranked = sorted(
+                (
+                    (
+                        str(gate_id),
+                        _as_int(entry.get("failed")),
+                        _as_int(entry.get("evaluated")),
+                    )
+                    for gate_id, entry in gate_failures.items()
+                    if isinstance(entry, Mapping)
+                ),
+                key=lambda row: (-row[1], row[0]),
+            )
+            if ranked and ranked[0][1] > 0:
+                gate_id, failed, evaluated = ranked[0]
+                top_gate_text = f" | top_gate_failure: {gate_id} ({failed}/{evaluated})"
     return (
         f"{posture} | route={route} | reasoning_effort={effort} | identity_source={identity} | "
         f"infrastructure_coverage: {coverage * 100:.1f}% "
@@ -528,7 +655,7 @@ def format_headline(report: Mapping[str, object]) -> str:
         f"deterministic_contract_completion_rate: {rate * 100:.1f}% "
         f"({completed}/{infrastructure_valid}) | "
         f"matched_pair_completion_rate: {matched_text} | "
-        f"pair_stability_min: {stability_text} | {release}"
+        f"pair_stability_min: {stability_text}{top_gate_text} | {release}"
     )
 
 
@@ -557,9 +684,15 @@ def validate_suite_report(report: Mapping[str, object]) -> list[str]:
         "identity_source",
         "authoritative",
         "execution_environment",
+        "gate_failures",
+        "first_failing_gate",
+        "diagnostic_gate_pass_rate",
     ):
         if key not in report:
             errors.append(f"{key}_missing")
+    for key in ("gate_failures", "first_failing_gate"):
+        if key in report and not isinstance(report.get(key), Mapping):
+            errors.append(f"{key}_invalid")
     stability = report.get("pair_stability")
     if not isinstance(stability, Mapping) or "mean" not in stability or "min" not in stability:
         errors.append("pair_stability_invalid")

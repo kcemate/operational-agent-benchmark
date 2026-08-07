@@ -34,10 +34,10 @@ You approve a number. It does the rest. `AGENTS.md` is the runbook it follows.
 Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin.
 
 ```bash
-gh release download v2.0.2 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+gh release download v2.1.0 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
 
 HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-OAB_WHEEL=operational_agent_benchmark-2.0.2-py3-none-any.whl
+OAB_WHEEL=operational_agent_benchmark-2.1.0-py3-none-any.whl
 OAB_WHEEL_SHA256=sha256:<from-the-release-notes>
 OAB_TREE_SHA256=sha256:<from-the-release-notes>
 
@@ -120,6 +120,38 @@ How to act on it:
 5. If `identity_source` is `adapter_runtime`, call the result provisional in writing.
 
 `NO SCORE` means nothing reached a scoreable outcome. `INCOMPLETE` means episodes were excluded — not a certified score.
+
+### When the score is 0%, find out why
+
+A completion rate alone cannot tell you whether a model misunderstood the task or missed it by one key. Two things make that legible.
+
+The suite report carries `gate_failures` and `first_failing_gate`, so you can see which specific gate ends most episodes, and the headline names the dominant one:
+
+```text
+... | pair_stability_min: 0.0% (P01) | top_gate_failure: DAT-SCHEMA (10/10) | Do not treat as release-ready.
+```
+
+Then read a single episode end to end:
+
+```bash
+oab explain ~/OAB-Runs/my-campaign/full/suites/<route-id>/evidence/rep-01/oab2-data-rollup-a
+```
+
+It prints the task, live-recomputed gate results, the model's final response, the files it produced, and — for schema gates — the keys the schema declared beside the keys the model actually wrote:
+
+```text
+--- SCHEMA EXPECTATION ---
+  expected exact_keys : ['regions', 'total_cost', 'total_units']
+  actual top-level    : ['regions', 'total']
+  missing keys        : ['total_cost', 'total_units']
+  unexpected keys     : ['total']
+```
+
+That is a real result: the model computed every number correctly and nested the totals under one key instead of two. A bare 0% would have looked like total incompetence.
+
+Add `--json` for machine-readable output. The command is read-only and never modifies an evidence tree.
+
+`diagnostic_gate_pass_rate` reports the share of individual gate evaluations passed. It is deliberately **not** in the headline and **never** used to recommend a switch — it exists to separate routes that both sit at 0% completion.
 
 ---
 

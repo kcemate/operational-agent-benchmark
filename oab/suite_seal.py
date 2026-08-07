@@ -168,6 +168,7 @@ def _episode_observation(
             for gate in gates
         ],
         "controller_usage": receipt.get("controller_usage"),
+        "protocol_normalized_turns": receipt.get("protocol_normalized_turns"),
         "runtime": (
             dict(receipt["runtime"]) if isinstance(receipt.get("runtime"), Mapping) else {}
         ),

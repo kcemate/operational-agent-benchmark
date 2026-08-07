@@ -37,6 +37,7 @@ from oab.agent_workflow import (
     verify_conversational_stage_approval,
     verify_stage_approval,
 )
+from oab.explain import explain_episode, format_explanation
 from oab.paths import benchmark_root
 from oab.suite_seal import verify_suite_seal
 from tools.run_calibration import run_calibration
@@ -356,6 +357,12 @@ def _parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="Verify every completed campaign suite")
     verify.add_argument("output_root", type=Path)
+
+    explain = subparsers.add_parser(
+        "explain", help="Explain why one episode passed or failed"
+    )
+    explain.add_argument("evidence_dir", type=Path)
+    explain.add_argument("--json", action="store_true", dest="as_json")
 
     return parser
 
@@ -863,6 +870,15 @@ def main(
             result = _verify_campaign(args.output_root.resolve(), suite_verifier=suite_verifier)
             _json_print(result)
             return 0 if result["valid"] is True else 2
+
+        if args.command == "explain":
+            explanation = explain_episode(args.evidence_dir)
+            if args.as_json:
+                _json_print(explanation)
+            else:
+                sys.stdout.write(format_explanation(explanation))
+            # A failed episode is a valid explanation, not a command error.
+            return 0
 
     except (RuntimeError, ValueError, OSError) as exc:
         _json_print({"error": str(exc)})

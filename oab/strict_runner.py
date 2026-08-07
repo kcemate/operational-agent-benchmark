@@ -152,6 +152,18 @@ def _controller_usage_snapshot(
     return {key: value.get(key) for key in empty}
 
 
+def _controller_protocol_normalized_turns(controller: TrustedController) -> int:
+    """Count model turns accepted only after protocol normalization.
+
+    Disclosed per episode and aggregated per suite so a route's score can be
+    read alongside how often its output needed unwrapping.
+    """
+    value = getattr(controller, "protocol_normalized_turns", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _controller_identity_snapshot(
     controller: TrustedController,
 ) -> ControllerIdentity | None:
@@ -883,6 +895,7 @@ def run_strict_episode(
         ),
         "controller_identity": identity_payload,
         "controller_usage": _controller_usage_snapshot(controller),
+        "protocol_normalized_turns": _controller_protocol_normalized_turns(controller),
         "boundary_probe": boundary_probe,
         "mock_effect_count": mock_effect_count,
         "runtime": {

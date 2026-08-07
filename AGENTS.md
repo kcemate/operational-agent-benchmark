@@ -11,7 +11,7 @@ This repository provides an agent-native workflow for answering a bounded questi
 
    ```bash
    HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-   OAB_WHEEL=/path/to/operational_agent_benchmark-2.0.2-py3-none-any.whl
+   OAB_WHEEL=/path/to/operational_agent_benchmark-2.1.0-py3-none-any.whl
    OAB_WHEEL_SHA256=<independently-published-wheel-sha256>
    OAB_TREE_SHA256=sha256:<independently-published-release-tree-sha256>
    test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1
@@ -111,6 +111,7 @@ Qualification schedules exactly 34 one-call episodes and reserves up to 34 calls
 - Never delete or overwrite a completed suite to make a campaign pass. Start a new campaign when the benchmark release, reasoning effort, controller configuration, or route selection changes.
 - Run `oab verify /path/to/campaign` to verify every completed episode and suite tree referenced by the campaign.
 - Run `oab report /path/to/campaign` for the current status or final `DECISION_REPORT.json`.
+- Run `oab explain /path/to/evidence/rep-NN/<case-id>` to diagnose one episode: task text, live-recomputed gate results, the model's final response, produced artifacts, and declared-versus-actual schema keys. Add `--json` for machine-readable output. It is read-only, exits 0 even when the episode failed, and is the fastest way to distinguish "the model cannot do this" from "the model missed one key." Start from the suite report's `first_failing_gate` and `gate_failures` to pick which episode to open.
 - Publish and externally pin suite-seal digests for coordinated-rewrite detection; internal verification alone cannot detect replacement of an entire evidence tree and its seal.
 
 ## Decision and claim boundaries

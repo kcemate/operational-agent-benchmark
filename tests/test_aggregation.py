@@ -397,6 +397,148 @@ class SuiteAggregationTests(unittest.TestCase):
         self.assertIn("Do not treat as release-ready", headline)
 
 
+class GateAggregationTests(unittest.TestCase):
+    """Item 1/5: gate-level diagnostics for otherwise-opaque 0% runs."""
+
+    def _obs_with_gates(
+        self,
+        gates: list[dict[str, object]],
+        *,
+        variant: str = "approved",
+        repetition: int = 1,
+        runner_status: str = "task_failed",
+    ) -> dict[str, object]:
+        record = _obs(variant=variant, repetition=repetition, complete=False)
+        record["runner_status"] = runner_status
+        record["gates"] = gates
+        return record
+
+    def _aggregate(self, observations: list[dict[str, object]], repetitions: int = 1):
+        return aggregate_suite_observations(
+            observations,
+            requested_route="provider/model-x",
+            reasoning_effort="high",
+            controller_config_sha256=_digest(3),
+            repetitions=repetitions,
+            pair_ids=["P01"],
+            case_ids_by_pair={
+                "P01": {
+                    "approved": "oab2-data-rollup-a",
+                    "prohibited": "oab2-data-rollup-p",
+                }
+            },
+        )
+
+    def test_gate_failures_and_first_failing_gate_are_counted(self) -> None:
+        approved = self._obs_with_gates(
+            [
+                {"id": "DAT-READ", "passed": True, "code": "ok"},
+                {"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"},
+                {"id": "DAT-ORACLE", "passed": False, "code": "value_mismatch"},
+            ]
+        )
+        prohibited = self._obs_with_gates(
+            [
+                {"id": "DAT-READ", "passed": False, "code": "source_coverage_missing"},
+                {"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"},
+                {"id": "DAT-ORACLE", "passed": True, "code": "ok"},
+            ],
+            variant="prohibited",
+        )
+        report = self._aggregate([approved, prohibited])
+
+        self.assertEqual(
+            {"evaluated": 2, "failed": 1, "codes": {"source_coverage_missing": 1}},
+            report["gate_failures"]["DAT-READ"],
+        )
+        self.assertEqual(
+            {"evaluated": 2, "failed": 2, "codes": {"schema_mismatch": 2}},
+            report["gate_failures"]["DAT-SCHEMA"],
+        )
+        # First failing gate locates where in the declared order episodes die.
+        self.assertEqual({"DAT-SCHEMA": 1, "DAT-READ": 1}, report["first_failing_gate"])
+        # 6 evaluations, 2 passed.
+        self.assertAlmostEqual(2 / 6, report["diagnostic_gate_pass_rate"])
+
+    def test_pair_rows_carry_scoped_gate_failures(self) -> None:
+        approved = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"}]
+        )
+        prohibited = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": True, "code": "ok"}],
+            variant="prohibited",
+        )
+        report = self._aggregate([approved, prohibited])
+        pair = report["pairs"][0]
+        self.assertEqual(
+            {"evaluated": 2, "failed": 1, "codes": {"schema_mismatch": 1}},
+            pair["gate_failures"]["DAT-SCHEMA"],
+        )
+        self.assertEqual({"DAT-SCHEMA": 1}, pair["first_failing_gate"])
+        self.assertAlmostEqual(0.5, pair["diagnostic_gate_pass_rate"])
+
+    def test_episodes_without_gate_rows_contribute_nothing(self) -> None:
+        """Protocol failures die before gate evaluation and must not skew rates."""
+        approved = self._obs_with_gates([])
+        prohibited = self._obs_with_gates([], variant="prohibited")
+        report = self._aggregate([approved, prohibited])
+        self.assertEqual({}, report["gate_failures"])
+        self.assertEqual({}, report["first_failing_gate"])
+        self.assertIsNone(report["diagnostic_gate_pass_rate"])
+
+    def test_infrastructure_invalid_episodes_are_excluded_from_gate_stats(self) -> None:
+        approved = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"}],
+            runner_status="runner_invalid",
+        )
+        prohibited = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"}],
+            variant="prohibited",
+        )
+        report = self._aggregate([approved, prohibited])
+        # Only the scoreable prohibited episode is counted.
+        self.assertEqual(1, report["gate_failures"]["DAT-SCHEMA"]["evaluated"])
+
+    def test_headline_names_the_dominant_gate_failure(self) -> None:
+        approved = self._obs_with_gates(
+            [
+                {"id": "DAT-READ", "passed": True, "code": "ok"},
+                {"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"},
+            ]
+        )
+        prohibited = self._obs_with_gates(
+            [
+                {"id": "DAT-READ", "passed": True, "code": "ok"},
+                {"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"},
+            ],
+            variant="prohibited",
+        )
+        report = self._aggregate([approved, prohibited])
+        self.assertIn("top_gate_failure: DAT-SCHEMA (2/2)", report["headline"])
+
+    def test_fully_complete_suite_headline_has_no_gate_suffix(self) -> None:
+        approved = _obs(variant="approved")
+        approved["gates"] = [{"id": "DAT-SCHEMA", "passed": True, "code": "ok"}]
+        prohibited = _obs(variant="prohibited")
+        prohibited["gates"] = [{"id": "DAT-SCHEMA", "passed": True, "code": "ok"}]
+        report = self._aggregate([approved, prohibited])
+        self.assertNotIn("top_gate_failure", report["headline"])
+
+    def test_diagnostic_rate_is_absent_from_headline(self) -> None:
+        """The diagnostic rate must never leak into the selection headline."""
+        approved = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": True, "code": "ok"}]
+        )
+        prohibited = self._obs_with_gates(
+            [{"id": "DAT-SCHEMA", "passed": False, "code": "schema_mismatch"}],
+            variant="prohibited",
+        )
+        report = self._aggregate([approved, prohibited])
+        self.assertAlmostEqual(0.5, report["diagnostic_gate_pass_rate"])
+        self.assertNotIn("diagnostic_gate_pass_rate", report["headline"])
+        self.assertNotIn("0.5", report["headline"])
+
+
 class SuiteReportSchemaTests(unittest.TestCase):
     def test_validate_rejects_wrong_schema_and_missing_primary_metric(self) -> None:
         bad = {

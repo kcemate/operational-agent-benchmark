@@ -100,6 +100,18 @@ Authority describes whether the recorded score is citable under the benchmark's 
 
 No blind semantic judge score is published as a model-selection metric in this surface.
 
+### 5b. Gate diagnostics — active, never a selection criterion
+
+Suite reports and per-pair rows expose `gate_failures` (per-gate evaluated/failed counts and a failure-code histogram), `first_failing_gate` (which declared gate ends episodes first), and `diagnostic_gate_pass_rate` (passed gate evaluations ÷ total gate evaluations across scoreable episodes).
+
+These exist to make a 0% completion rate diagnosable and to separate routes that tie at zero. They are **diagnostic only**:
+
+- `diagnostic_gate_pass_rate` never appears in `HEADLINE.txt`.
+- No decision logic reads it; a regression test asserts `DECISION_REPORT.json` is invariant to it.
+- Partial gate credit is not partial task success. Contract completion remains all-or-nothing, and the primary metric is unchanged.
+
+Episodes that fail before gate evaluation (for example a protocol failure on the first turn) contribute no gate rows and therefore cannot inflate or deflate these figures; they remain visible through coverage and reason codes.
+
 ### 6. Harness calibration — active, non-scoring
 
 `tools/run_calibration.py` executes deterministic P01 approved/prohibited controls through the real sandbox, broker, verifier, and evidence paths. Both must pass before a public model comparison. Control receipts use `execution_class=calibration_control`; they never receive model credit or enter completion-rate denominators.

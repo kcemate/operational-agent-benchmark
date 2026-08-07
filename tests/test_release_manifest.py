@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
+from tools.release_guard import check_manifest, check_version
 from tools.release_manifest import build_release_manifest, verify_release_manifest
+from tools.release_notes import build_notes, changelog_section
 
 
 class ReleaseManifestTests(unittest.TestCase):
@@ -67,6 +70,92 @@ class ReleaseManifestTests(unittest.TestCase):
                 expected_tree_sha256="sha256:" + "0" * 64,
             )
             self.assertIn("externally_pinned_tree_digest_mismatch", errors)
+
+
+class CommittedManifestFreshnessTests(unittest.TestCase):
+    """The committed manifest must always describe the current working tree.
+
+    Catches a stale RELEASE_MANIFEST.json on every push instead of at tag time,
+    so a release can never publish a digest that does not match the tree.
+    """
+
+    def test_committed_manifest_matches_working_tree(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest_path = root / "RELEASE_MANIFEST.json"
+        errors = verify_release_manifest(root, manifest_path)
+        self.assertEqual(
+            [],
+            errors,
+            "RELEASE_MANIFEST.json is stale; regenerate it with "
+            "tools/release_manifest.py before committing.",
+        )
+
+
+class ReleaseGuardTests(unittest.TestCase):
+    def test_stale_manifest_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exported = root / "exported.json"
+            committed = root / "committed.json"
+            exported.write_text(
+                json.dumps({"tree_sha256": "sha256:" + "a" * 64, "file_count": 1}),
+                encoding="utf-8",
+            )
+            committed.write_text(
+                json.dumps({"tree_sha256": "sha256:" + "b" * 64, "file_count": 1}),
+                encoding="utf-8",
+            )
+            errors = check_manifest(exported, committed)
+            self.assertTrue(errors)
+            self.assertIn("release_manifest_stale", errors[0])
+
+    def test_matching_manifest_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            payload = json.dumps(
+                {"tree_sha256": "sha256:" + "c" * 64, "file_count": 1}
+            )
+            exported = root / "exported.json"
+            committed = root / "committed.json"
+            exported.write_text(payload, encoding="utf-8")
+            committed.write_text(payload, encoding="utf-8")
+            self.assertEqual([], check_manifest(exported, committed))
+
+    def test_version_must_match_tag(self) -> None:
+        self.assertEqual([], check_version("v2.1.0", "2.1.0"))
+        self.assertTrue(check_version("v2.1.0", "2.0.2"))
+
+
+class ReleaseNotesTests(unittest.TestCase):
+    def test_changelog_section_is_extracted_for_the_tagged_version(self) -> None:
+        changelog = (
+            "# Changelog\n\n"
+            "## 2.1.0 - 2026-08-07\n\n- new thing\n\n"
+            "## 2.0.2 - 2026-08-07\n\n- older thing\n"
+        )
+        section = changelog_section(changelog, "2.1.0")
+        self.assertIn("new thing", section)
+        self.assertNotIn("older thing", section)
+
+    def test_missing_changelog_section_is_reported_not_fabricated(self) -> None:
+        section = changelog_section("# Changelog\n\n## 2.0.2\n\n- old\n", "9.9.9")
+        self.assertIn("no CHANGELOG entry found", section)
+
+    def test_notes_carry_computed_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            wheel = Path(td) / "pkg-2.1.0-py3-none-any.whl"
+            wheel.write_bytes(b"wheel-bytes")
+            expected = hashlib.sha256(b"wheel-bytes").hexdigest()
+            notes = build_notes(
+                tag="v2.1.0",
+                wheel_path=wheel,
+                manifest={"tree_sha256": "sha256:" + "d" * 64, "file_count": 160},
+                changelog="## 2.1.0\n\n- entry\n",
+                commit="abc123",
+            )
+            self.assertIn(expected, notes)
+            self.assertIn("sha256:" + "d" * 64, notes)
+            self.assertIn("160", notes)
 
 
 if __name__ == "__main__":

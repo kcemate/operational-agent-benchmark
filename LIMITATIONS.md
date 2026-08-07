@@ -44,4 +44,8 @@ OAB v2 is intentionally narrow. These limits travel with every scorecard.
 
 21. **Release authorization.** `AUTHORITATIVE` requires an externally pinned `oab.release-approval/v1` receipt with distinct security and product approvals bound to the exact release-tree digest. The receipt is an auditable benchmark artifact, not a cryptographic identity proof for reviewers or provider serving infrastructure.
 
+22. **Protocol normalization.** A single markdown code fence enclosing an otherwise-valid protocol turn is unwrapped and counted as a normalized turn rather than failing the episode; production harnesses strip fences, so scoring the fence itself measures chat-template habit rather than operational competence. Nothing looser is accepted: prose around a fence, trailing commentary, multiple fences, and invalid inner JSON remain `controller_protocol_invalid`, and normalization never repairs a payload. Normalization is disclosed as `protocol_normalized_turns` per episode and `protocol_normalized_turn_total` / `protocol_normalized_episodes` per suite. Rates from 2.1.0 onward are **not comparable** with 2.0.x, which failed every fenced turn.
+
+23. **Diagnostic gate pass rate.** `diagnostic_gate_pass_rate` counts passed gate evaluations over total evaluations. It exists to distinguish routes that tie at 0% contract completion and is **never a selection criterion**: it is excluded from `HEADLINE.txt` and from decision logic, and a regression test enforces that the decision report is invariant to it. Partial gate credit is not partial task success — a model can pass most gates and still complete no contract.
+
 These limitations are part of the benchmark contract.

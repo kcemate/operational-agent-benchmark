@@ -2,6 +2,29 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.1.0 — 2026-08-07
+
+**Benchmark-affecting.** Protocol normalization changes which episodes are scoreable, so rates are not comparable with 2.0.x. The suite-report schema gained diagnostic fields.
+
+### Diagnosability
+
+The first real full campaign produced 0.0% completion on both routes with 100% infrastructure coverage, and the report could not say why. Reconstructing the cause required manually decoding evidence payloads. That is now first-class output.
+
+- Suite reports and per-pair rows carry `gate_failures` (per-gate evaluated/failed counts with a failure-code histogram) and `first_failing_gate` (which gate ends episodes first). `HEADLINE.txt` appends `top_gate_failure` when completion is below 100%.
+- New `oab explain <evidence-dir>` prints a per-episode post-mortem: task text, live-recomputed gate results, the model's final response, produced artifacts, and — for schema gates — the declared keys beside the keys actually produced. This surfaces the "right values, wrong shape" failure directly.
+- Added `diagnostic_gate_pass_rate` (passed gate evaluations ÷ total evaluations). It is **diagnostic only**: excluded from `HEADLINE.txt` and never consulted by decision logic, enforced by test. It distinguishes routes that tie at 0% completion.
+
+### Protocol normalization
+
+- A single markdown code fence wrapping an otherwise-valid protocol turn is now unwrapped and counted rather than failing the episode. In the first campaign, 90 of 160 episodes failed protocol parsing, largely because small models emit fenced JSON; production harnesses strip fences, so failing them measured chat-template habit rather than operational competence.
+- Only one fence enclosing the entire response is accepted. Prose around a fence, trailing commentary, multiple fences, and invalid inner JSON all remain `controller_protocol_invalid`. Normalization never repairs a payload.
+- Disclosed as `protocol_normalized_turns` per episode receipt and `protocol_normalized_turn_total` / `protocol_normalized_episodes` per suite.
+
+### Release integrity
+
+- New tag-driven release workflow rebuilds from a clean `git archive` export, verifies the committed `RELEASE_MANIFEST.json` matches that export and that the package version equals the tag, runs the suite, builds the wheel, and opens a **draft** release whose digest block is computed by CI. It never publishes automatically.
+- New test asserts the committed manifest matches the working tree on every push, so manifest staleness is caught before a tag exists. This is the defect class that forced the 2.0.2 release.
+
 ## 2.0.2 — 2026-08-07
 
 Documentation and packaging only. No harness, verifier, or scoring behavior changed from 2.0.1.

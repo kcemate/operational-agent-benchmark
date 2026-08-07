@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from oab.hermes_controller import HermesCliController
+from oab.hermes_controller import HermesCliController, _strip_single_json_fence
 from oab.strict_runner import (
     ControllerInfrastructureError,
     FinalResponse,
@@ -391,6 +391,56 @@ class HermesCliControllerTests(unittest.TestCase):
             self.assertEqual(1, usage["api_calls"])
             self.assertEqual(7, usage["input_tokens"])
             self.assertEqual(0.4, usage["cost_usd"])
+
+
+class ProtocolFenceNormalizationTests(unittest.TestCase):
+    """Item 4: accept exactly one fenced JSON block, nothing looser."""
+
+    def test_bare_json_is_unchanged_and_not_counted(self) -> None:
+        raw = '{"kind":"final","text":"done"}'
+        payload, normalized = _strip_single_json_fence(raw)
+        self.assertEqual(raw, payload)
+        self.assertFalse(normalized)
+
+    def test_json_fence_is_unwrapped_and_counted(self) -> None:
+        payload, normalized = _strip_single_json_fence(
+            '```json\n{"kind":"final","text":"done"}\n```'
+        )
+        self.assertEqual('{"kind":"final","text":"done"}', payload)
+        self.assertTrue(normalized)
+
+    def test_bare_fence_without_language_is_unwrapped(self) -> None:
+        payload, normalized = _strip_single_json_fence(
+            '```\n{"kind":"final","text":"done"}\n```'
+        )
+        self.assertEqual('{"kind":"final","text":"done"}', payload)
+        self.assertTrue(normalized)
+
+    def test_prose_around_a_fence_is_rejected(self) -> None:
+        raw = 'Here you go:\n```json\n{"kind":"final","text":"done"}\n```'
+        payload, normalized = _strip_single_json_fence(raw)
+        self.assertEqual(raw, payload)
+        self.assertFalse(normalized)
+
+    def test_trailing_commentary_after_a_fence_is_rejected(self) -> None:
+        raw = '```json\n{"kind":"final","text":"done"}\n```\nHope that helps!'
+        payload, normalized = _strip_single_json_fence(raw)
+        self.assertEqual(raw, payload)
+        self.assertFalse(normalized)
+
+    def test_multiple_fences_are_rejected(self) -> None:
+        raw = '```json\n{"kind":"final","text":"a"}\n```\n```json\n{"kind":"final","text":"b"}\n```'
+        payload, normalized = _strip_single_json_fence(raw)
+        self.assertEqual(raw, payload)
+        self.assertFalse(normalized)
+
+    def test_unwrapped_content_still_has_to_be_valid_json(self) -> None:
+        """Normalization only strips the fence; it never repairs the payload."""
+        payload, normalized = _strip_single_json_fence("```json\nnot json at all\n```")
+        self.assertTrue(normalized)
+        self.assertEqual("not json at all", payload)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(payload)
 
 
 if __name__ == "__main__":
