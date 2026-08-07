@@ -218,6 +218,9 @@ class HermesCliController:
             "unknown_cost_api_calls": self.unknown_cost_api_calls,
         }
 
+    def identity_snapshot(self) -> ControllerIdentity | None:
+        return self._identity
+
     def begin(self, context: dict[str, object]) -> ControllerIdentity:
         if self._context is not None:
             raise RuntimeError("controller_already_started")

@@ -13,6 +13,7 @@ from typing import Any
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 
+from oab import __version__
 from oab.paths import benchmark_root
 
 _SCHEMA = "oab.release-manifest/v1"
@@ -89,7 +90,7 @@ def build_release_manifest(root: Path) -> dict[str, Any]:
     tree_sha256 = "sha256:" + hashlib.sha256(_canonical_bytes(entries)).hexdigest()
     return {
         "schema": _SCHEMA,
-        "benchmark_version": "2.0.0",
+        "benchmark_version": __version__,
         "file_count": len(entries),
         "tree_sha256": tree_sha256,
         "files": entries,

@@ -137,6 +137,8 @@ def _controller_usage_snapshot(
         "output_tokens": None,
         "latency_ms": None,
         "cost_usd": None,
+        "known_cost_usd": None,
+        "unknown_cost_api_calls": None,
     }
     method = getattr(controller, "usage_snapshot", None)
     if not callable(method):
@@ -148,6 +150,19 @@ def _controller_usage_snapshot(
     if not isinstance(value, Mapping):
         return empty
     return {key: value.get(key) for key in empty}
+
+
+def _controller_identity_snapshot(
+    controller: TrustedController,
+) -> ControllerIdentity | None:
+    method = getattr(controller, "identity_snapshot", None)
+    if not callable(method):
+        return None
+    try:
+        value = method()
+    except Exception:
+        return None
+    return value if isinstance(value, ControllerIdentity) else None
 
 
 def _validate_identity(identity: ControllerIdentity) -> tuple[str, ...]:
@@ -584,11 +599,19 @@ def run_strict_episode(
                 controller_active = False
                 reasons.append("controller_protocol_invalid")
                 status = "task_failed"
+                identity = _controller_identity_snapshot(controller)
                 trace.append(
                     "controller_failure",
                     "controller",
                     details={"reason": "controller_protocol_invalid", "step": 0},
                 )
+                if identity is not None:
+                    reasons.extend(_validate_identity(identity))
+                    trace.append(
+                        "controller_identity",
+                        "controller",
+                        details=asdict(identity),
+                    )
             except ControllerInfrastructureError as exc:
                 controller_active = False
                 reasons.append(exc.reason_code)

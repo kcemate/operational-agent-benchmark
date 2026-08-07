@@ -21,6 +21,48 @@ When the Hermes adapter records `identity_source=adapter_runtime`, every score i
 
 ## Quick start (Hermes users)
 
+### 60-second install from a published release
+
+Each release publishes its wheel digest and release-tree digest **in the GitHub release notes**. Those digests are deliberately not restated here: the README is itself part of the hashed release tree, so an inline copy could never match the digest it claims to pin. Read both values from the release notes (ideally confirmed through a channel independent of the repository) and export them:
+
+```bash
+VERSION=v2.0.1
+gh release download "$VERSION" --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+
+HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
+OAB_WHEEL=operational_agent_benchmark-2.0.1-py3-none-any.whl
+OAB_WHEEL_SHA256=sha256:<wheel-digest-from-the-release-notes>
+OAB_TREE_SHA256=sha256:<release-tree-digest-from-the-release-notes>
+
+test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1
+"$HERMES_PYTHON" -m pip install "$OAB_WHEEL"
+oab doctor --json --expected-release-tree-sha256 "$OAB_TREE_SHA256"
+```
+
+Stop on any mismatch. `oab doctor` must pass every check before you initialize a campaign.
+
+### Route naming: use the route your harness attests, not the one you assume
+
+OAB binds every episode to the route the controller **reports back**, and rejects the episode when the returned route differs from the requested route. Some harness configurations rewrite the provider slug — for example a locally served OpenAI-compatible endpoint may be requested as `ollama-launch/<model>` but attested as `custom/<model>`.
+
+Check what your harness actually reports before building an inventory:
+
+```bash
+hermes -z 'Reply with exactly: PING' -m <model> --provider <provider> --usage-file /tmp/probe.json
+python3 -c "import json;d=json.load(open('/tmp/probe.json'));print(d['provider'], d['model'])"
+```
+
+Declare routes in the inventory using the attested `provider/model` pair. A mismatch surfaces as `runner_invalid` with `controller_infrastructure_invalid`, which OAB deliberately scores as an infrastructure failure rather than a model failure.
+
+### Context window requirement
+
+Hermes requires a controller model with at least a 64K context window. Local models served with a smaller default window are rejected before any episode runs. With Ollama, publish a larger window explicitly:
+
+```bash
+printf 'FROM %s\nPARAMETER num_ctx 65536\n' "qwen3:8b" > /tmp/Modelfile.64k
+ollama create qwen3-64k:8b -f /tmp/Modelfile.64k
+```
+
 ### Agent-native all-accessible workflow
 
 Install only an externally pinned wheel into the Python environment next to the active Hermes executable. Obtain both digests from a channel independent of the repository or wheel, and stop on any mismatch.
@@ -29,7 +71,7 @@ On Linux, install Bubblewrap and libseccomp and ensure the host permits unprivil
 
 ```bash
 HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-OAB_WHEEL=/path/to/operational_agent_benchmark-2.0.0-py3-none-any.whl
+OAB_WHEEL=/path/to/operational_agent_benchmark-2.0.1-py3-none-any.whl
 OAB_WHEEL_SHA256=<independently-published-wheel-sha256>
 OAB_TREE_SHA256=sha256:<independently-published-release-tree-sha256>
 
@@ -38,6 +80,7 @@ test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha25
 #   --artifact "$OAB_WHEEL" --expected-sha256 "$OAB_WHEEL_SHA256"
 "$HERMES_PYTHON" -m pip install "$OAB_WHEEL"
 oab doctor --json --expected-release-tree-sha256 "$OAB_TREE_SHA256"
+
 oab benchmark \
   --all-accessible \
   --reasoning-effort high \

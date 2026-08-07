@@ -22,6 +22,7 @@ from oab.strict_runner import (
     ToolPolicy,
     ToolRequest,
     ToolResult,
+    _controller_usage_snapshot,
     _run_boundary_probe_leaf,
     run_strict_episode,
 )
@@ -137,6 +138,30 @@ class MalformedOutputController(ReadWriteController):
 
 
 class MalformedFirstTurnController(ReadWriteController):
+    def begin(self, context: dict[str, object]) -> ControllerIdentity:
+        raise ValueError("model_protocol_json_invalid")
+
+
+class AttestedMalformedFirstTurnController(ReadWriteController):
+    """Mirrors the real adapter: route identity is attested from the provider
+    usage receipt *before* the model's first payload is parsed, so a malformed
+    first turn is a model failure that must not erase route attestation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._identity = ControllerIdentity(
+            adapter_name="test-controller",
+            adapter_version="1.0",
+            adapter_sha256="sha256:" + "1" * 64,
+            requested_route="sample/requested",
+            returned_route="sample/requested",
+            response_id="response-001",
+            identity_source="provider_response",
+        )
+
+    def identity_snapshot(self) -> ControllerIdentity | None:
+        return self._identity
+
     def begin(self, context: dict[str, object]) -> ControllerIdentity:
         raise ValueError("model_protocol_json_invalid")
 
@@ -440,6 +465,38 @@ class StrictRunnerTests(unittest.TestCase):
             verified = verify_sealed_evidence(evidence)
             self.assertTrue(verified["valid"], verified)
 
+    def test_malformed_first_turn_preserves_attested_route_identity(self) -> None:
+        """A model that emits invalid JSON on its first turn is a model failure.
+
+        Route identity attested from the provider usage receipt must survive so
+        the suite is not poisoned with requested_route_mismatch /
+        provider_returned_route_mismatch / provider_response_id_missing.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            evidence = base / "evidence"
+            repository, spec, policy = self.make_spec(base)
+            result = run_strict_episode(
+                spec,
+                controller=AttestedMalformedFirstTurnController(),
+                tool_policy=policy,
+                repository_root=repository,
+                run_root=base / "episodes",
+                evidence_dir=evidence,
+            )
+            self.assertEqual("task_failed", result.status)
+            self.assertIn("controller_protocol_invalid", result.reason_codes)
+
+            receipt = json.loads((evidence / "result.json").read_text())
+            identity = receipt["controller_identity"]
+            self.assertIsNotNone(identity)
+            self.assertEqual("sample/requested", identity["requested_route"])
+            self.assertEqual("sample/requested", identity["returned_route"])
+            self.assertEqual("response-001", identity["response_id"])
+
+            verified = verify_sealed_evidence(evidence)
+            self.assertTrue(verified["valid"], verified)
+
     def test_controller_infrastructure_failure_is_finalized_as_sealed_runner_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td).resolve()
@@ -608,6 +665,52 @@ class StrictRunnerTests(unittest.TestCase):
             self.assertEqual("task_failed", result.status)
             self.assertIn("tool_request_denied", result.reason_codes)
             self.assertFalse((base / "evidence/mock-effects.jsonl").exists())
+
+
+class ControllerUsageSnapshotTests(unittest.TestCase):
+    """Episode usage must carry every field the suite aggregator recomputes.
+
+    Regression: the snapshot allowlist previously dropped known_cost_usd and
+    unknown_cost_api_calls, so suite reseal raised
+    suite_report_recomputation_mismatch:controller_usage for any completed run.
+    """
+
+    def test_snapshot_preserves_cost_telemetry_fields(self) -> None:
+        class UsageController:
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                raise NotImplementedError
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                raise NotImplementedError
+
+            def usage_snapshot(self) -> dict[str, int | float | None]:
+                return {
+                    "api_calls": 4,
+                    "input_tokens": 7354,
+                    "output_tokens": 2352,
+                    "latency_ms": 383111.525,
+                    "cost_usd": 0.0,
+                    "known_cost_usd": 0.0,
+                    "unknown_cost_api_calls": 0,
+                }
+
+        snapshot = _controller_usage_snapshot(UsageController())
+        self.assertIn("known_cost_usd", snapshot)
+        self.assertIn("unknown_cost_api_calls", snapshot)
+        self.assertEqual(0.0, snapshot["known_cost_usd"])
+        self.assertEqual(0, snapshot["unknown_cost_api_calls"])
+
+    def test_snapshot_reports_none_when_controller_has_no_usage(self) -> None:
+        class BareController:
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                raise NotImplementedError
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                raise NotImplementedError
+
+        snapshot = _controller_usage_snapshot(BareController())
+        self.assertIsNone(snapshot["known_cost_usd"])
+        self.assertIsNone(snapshot["unknown_cost_api_calls"])
 
 
 if __name__ == "__main__":
