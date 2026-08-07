@@ -160,6 +160,9 @@ def _run_observations(
                     for gate in gates
                 ],
                 "controller_usage": controller.usage_snapshot(),
+                "protocol_normalized_turns": getattr(
+                    controller, "protocol_normalized_turns", 0
+                ),
                 "runtime": runtime,
                 "trace_sha256": result.trace_sha256,
                 "output_tree_sha256": result.output_tree_sha256,

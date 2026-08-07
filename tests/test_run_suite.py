@@ -102,6 +102,78 @@ class RunSuiteQualificationBoundsTests(unittest.TestCase):
             self.assertEqual(1, len(observations))
             self.assertEqual(1, len(created_controllers))
 
+    def test_observations_carry_protocol_normalization_count(self) -> None:
+        """The suite runner builds observations by hand.
+
+        Any receipt field the seal recomputes must be copied here too, or
+        `write_suite_seal` fails with suite_report_recomputation_mismatch on
+        every real run while unit tests that construct observations directly
+        stay green. Caught live on a granite3.3 run.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "fixture").mkdir()
+            (root / "task.txt").write_text("opaque", encoding="utf-8")
+
+            class FenceUsingController:
+                controller_config_sha256 = "sha256:" + "a" * 64
+                protocol_normalized_turns = 3
+
+                def __init__(self, **kwargs: object) -> None:
+                    pass
+
+                def usage_snapshot(self) -> dict[str, object]:
+                    return {
+                        "api_calls": 1,
+                        "cost_usd": 0.0,
+                        "known_cost_usd": 0.0,
+                        "unknown_cost_api_calls": 0,
+                    }
+
+            args = argparse.Namespace(
+                repetitions=1,
+                max_observed_cost_usd=None,
+                model="model",
+                provider="provider",
+                timeout_seconds=1.0,
+                reasoning_effort="high",
+                allow_unknown_costs=True,
+                max_api_calls=None,
+                max_steps_per_episode=1,
+                episode_timeout_seconds=1.0,
+            )
+            case: dict[str, object] = {
+                "case_id": "case",
+                "pair_id": "P01",
+                "variant": "approved",
+                "fixture_path": "fixture",
+                "task_path": "task.txt",
+            }
+            result = SimpleNamespace(
+                status="completed",
+                valid_for_scoring=True,
+                reason_codes=(),
+                trace_sha256="sha256:" + "b" * 64,
+                output_tree_sha256="sha256:" + "c" * 64,
+            )
+            with (
+                patch("tools.run_suite.ROOT", root),
+                patch("tools.run_suite.HermesCliController", FenceUsingController),
+                patch("tools.run_suite.tool_policy_from_case", return_value=ToolPolicy((), (), (), 1, 1)),
+                patch("tools.run_suite.run_strict_episode", return_value=result),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("tools.run_suite._identity_from_result", return_value=None),
+                patch("tools.run_suite._runtime_from_result", return_value=None),
+            ):
+                observations = _run_observations(
+                    args=args,
+                    selected_cases=[case],
+                    output_root=root / "output",
+                    runtime_home=root,
+                )
+
+            self.assertEqual(3, observations[0]["protocol_normalized_turns"])
+
 
 if __name__ == "__main__":
     unittest.main()
