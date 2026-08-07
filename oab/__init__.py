@@ -11,4 +11,4 @@ if sys.version_info < (3, 11):  # pragma: no cover - guard runs before any test
     )
 
 __all__ = ["__version__"]
-__version__ = "2.0.1"
+__version__ = "2.0.2"

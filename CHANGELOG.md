@@ -2,6 +2,13 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.0.2 — 2026-08-07
+
+Documentation and packaging only. No harness, verifier, or scoring behavior changed from 2.0.1.
+
+- Rewrote `README.md` around the decision a Hermes user is actually making, led with the agent-native workflow, and documented the free local-route on-ramp.
+- Because `README.md` is part of the hashed release tree, this changes the release-tree digest. 2.0.2 exists so the published digest matches `main` exactly; a clone of `main` verified against the 2.0.1 digest would otherwise mismatch.
+
 ## 2.0.1 — 2026-08-07
 
 - **Fixed macOS framework-interpreter execution, which broke every episode on stock python.org installs.** The sandbox allowlists `process-exec` by literal path, but a framework CPython ships `<prefix>/bin/python3.x` as a stub that `posix_spawn`s `<prefix>/Resources/Python.app/Contents/MacOS/Python`. That target was never allowlisted, so every leaf failed with `boundary_probe_execution_failed` and no episode could complete. The re-exec target is now allowlisted in both the grant and the deny filter, only when the framework layout is present on disk. Development machines using a standalone CPython (whose `python3` is the real binary) never hit this, which is why it survived to release.
