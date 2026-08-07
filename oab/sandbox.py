@@ -72,6 +72,28 @@ def _kill_process_group(pid: int) -> None:
         pass
 
 
+def _macos_exec_aliases(executable: Path) -> tuple[Path, ...]:
+    """Return re-exec targets a macOS framework interpreter spawns for itself.
+
+    A python.org / framework CPython install ships ``<prefix>/bin/python3.x`` as
+    a thin stub that immediately ``posix_spawn``s the real Mach-O binary inside
+    ``<prefix>/Resources/Python.app/Contents/MacOS/Python``. The sandbox
+    allowlists ``process-exec`` by literal path, so without the alias the leaf
+    dies with ``boundary_probe_execution_failed`` on every episode.
+
+    Only the exact framework-layout sibling is returned, and only when it exists
+    on disk, so this does not widen exec permission to the interpreter tree.
+    """
+    resolved = executable.resolve()
+    candidate = resolved.parent.parent / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    if not candidate.is_file():
+        return ()
+    real_candidate = candidate.resolve()
+    if real_candidate == resolved:
+        return ()
+    return (real_candidate,)
+
+
 class MacOSSandboxBackend:
     executable = Path("/usr/bin/sandbox-exec")
     name = "macos-sandbox-exec"
@@ -122,13 +144,18 @@ class MacOSSandboxBackend:
             resolved = path.resolve()
             lines.append(f"(allow file-read* (literal {_quote_profile(str(resolved))}))")
             lines.append(f"(allow file-write* (literal {_quote_profile(str(resolved))}))")
+        exec_targets: set[Path] = set()
+        for executable in policy.allowed_executables:
+            resolved_executable = executable.resolve()
+            exec_targets.add(resolved_executable)
+            exec_targets.update(_macos_exec_aliases(resolved_executable))
         executable_filters = " ".join(
-            f"(literal {_quote_profile(str(executable.resolve()))})"
-            for executable in sorted(policy.allowed_executables, key=str)
+            f"(literal {_quote_profile(str(executable))})"
+            for executable in sorted(exec_targets, key=str)
         )
-        for executable in sorted(policy.allowed_executables, key=str):
+        for executable in sorted(exec_targets, key=str):
             lines.append(
-                f"(allow process-exec (literal {_quote_profile(str(executable.resolve()))}))"
+                f"(allow process-exec (literal {_quote_profile(str(executable))}))"
             )
         lines.append(
             f"(deny process-exec (require-not (require-any {executable_filters})))"

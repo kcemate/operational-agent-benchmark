@@ -45,6 +45,78 @@ class MacOSSandboxTests(unittest.TestCase):
             self.assertNotIn("\n(allow file-read-metadata)\n", profile)
             self.assertIn("(deny process-fork)", profile)
 
+    def test_framework_interpreter_reexec_target_is_allowlisted(self) -> None:
+        """A python.org framework interpreter re-execs its own Mach-O binary.
+
+        ``<prefix>/bin/python3.x`` posix_spawns
+        ``<prefix>/Resources/Python.app/Contents/MacOS/Python``. If that target
+        is not allowlisted the sandbox denies the exec and every leaf fails with
+        boundary_probe_execution_failed, which is how OAB behaved on any stock
+        python.org macOS install.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir).resolve()
+            prefix = base / "Python.framework" / "Versions" / "3.11"
+            (prefix / "bin").mkdir(parents=True)
+            real_binary = prefix / "Resources/Python.app/Contents/MacOS/Python"
+            real_binary.parent.mkdir(parents=True)
+            real_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            real_binary.chmod(0o755)
+            stub = prefix / "bin" / "python3.11"
+            stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+
+            workspace = base / "episode"
+            for relative in ("input", "work", "home", "tmp"):
+                (workspace / relative).mkdir(parents=True)
+            policy = SandboxPolicy(
+                workspace=workspace,
+                read_only=(workspace / "input",),
+                writable=(workspace / "work", workspace / "home", workspace / "tmp"),
+                allowed_executables=(stub,),
+            )
+            profile = macos_backend().build_profile(policy)
+
+            self.assertIn(
+                f'(allow process-exec (literal "{real_binary}"))',
+                profile,
+            )
+            # The deny filter must also name the alias, otherwise the explicit
+            # deny rule immediately revokes the grant above.
+            deny_line = next(
+                line for line in profile.splitlines() if line.startswith("(deny process-exec")
+            )
+            self.assertIn(str(real_binary), deny_line)
+            self.assertIn(str(stub), deny_line)
+
+    def test_non_framework_interpreter_gains_no_extra_exec_grant(self) -> None:
+        """The alias must not widen exec permission for normal interpreters."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir).resolve()
+            bindir = base / "usr" / "bin"
+            bindir.mkdir(parents=True)
+            interpreter = bindir / "python3"
+            interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            interpreter.chmod(0o755)
+
+            workspace = base / "episode"
+            for relative in ("input", "work", "home", "tmp"):
+                (workspace / relative).mkdir(parents=True)
+            policy = SandboxPolicy(
+                workspace=workspace,
+                read_only=(workspace / "input",),
+                writable=(workspace / "work", workspace / "home", workspace / "tmp"),
+                allowed_executables=(interpreter,),
+            )
+            profile = macos_backend().build_profile(policy)
+            exec_grants = [
+                line for line in profile.splitlines() if line.startswith("(allow process-exec")
+            ]
+            self.assertEqual(
+                [f'(allow process-exec (literal "{interpreter}"))'],
+                exec_grants,
+            )
+
     def test_policy_allows_case_paths_and_denies_outside_paths_and_executables(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir).resolve()
