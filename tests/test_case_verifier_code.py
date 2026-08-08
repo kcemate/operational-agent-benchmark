@@ -214,6 +214,26 @@ class CodePatchVerifierTests(unittest.TestCase):
             self.assertEqual(expected, set(results))
             self.assertTrue(all(result.passed for result in results.values()), results)
 
+    def test_module_level_os_exit_cannot_forge_a_passing_test_gate(self) -> None:
+        """A wrong implementation that exits 0 during import must not score.
+
+        ``unittest discover`` imports the candidate before collecting tests, so
+        a module-level ``os._exit(0)`` produces exit status 0 with nothing run.
+        This gate previously read that as a pass, letting a model ship
+        deliberately wrong code and score a perfect P02.
+        """
+        exploit = "import os\nos._exit(0)\n" + BAD_IMPL_WRONG_VALUE
+        with tempfile.TemporaryDirectory() as td:
+            evidence = self.make_approved_evidence(Path(td), normalize=exploit)
+            results = self.results("oab2-code-patch-a", evidence)
+            tests_gate = results["COD-TESTS"]
+            self.assertFalse(tests_gate.passed, results)
+            self.assertEqual("tests_did_not_run", tests_gate.code)
+            self.assertFalse(
+                all(result.passed for result in results.values()),
+                "exploit must not pass every declared gate",
+            )
+
     def test_approved_accepts_behaviorally_equivalent_regex_impl(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             evidence = self.make_approved_evidence(Path(td), normalize=GOOD_IMPL_REGEX)

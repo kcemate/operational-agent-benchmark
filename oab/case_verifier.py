@@ -17,7 +17,13 @@ from typing import Any
 from .manifest import ManifestError, build_tree_manifest
 from .sandbox import SandboxPolicy, SandboxUnavailable, select_backend
 from .trace import validate_trace
-from .verifier import GateResult
+from .verifier import (
+    GateResult,
+    build_attested_test_command,
+    count_declared_tests,
+    evaluate_test_attestation_text,
+    new_attestation_nonce,
+)
 from .case_verifier_p04_p05 import verify_change_apply, verify_mime_delivery
 
 _TARGET_NORMALIZE = "work/project/normalize.py"
@@ -420,7 +426,15 @@ def _run_sandboxed(
     command: list[str],
     *,
     timeout_seconds: float = 30.0,
-) -> tuple[int | None, bool, str]:
+    attestation_name: str | None = None,
+) -> tuple[int | None, bool, str, str | None]:
+    """Run a command in the fail-closed sandbox over a copy of ``work``.
+
+    Returns ``(returncode, timed_out, sandbox_error, attestation_text)``. When
+    ``attestation_name`` is given, the sandbox's writable tmp is searched for
+    that file after the run and its contents are returned; the workspace is
+    destroyed on exit, so the document must be read before cleanup.
+    """
     workspace = Path(tempfile.mkdtemp(prefix="oab-p02-run-"))
     try:
         shutil.copytree(candidate_root / "work", workspace / "work")
@@ -442,11 +456,17 @@ def _run_sandboxed(
             [str(executable), *command],
             timeout_seconds=timeout_seconds,
         )
-        return run.returncode, run.timed_out, ""
+        attestation_text: str | None = None
+        if attestation_name is not None:
+            try:
+                attestation_text = (tmp / attestation_name).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                attestation_text = None
+        return run.returncode, run.timed_out, "", attestation_text
     except SandboxUnavailable:
-        return None, False, "sandbox_unavailable"
+        return None, False, "sandbox_unavailable", None
     except OSError:
-        return None, False, "sandbox_unavailable"
+        return None, False, "sandbox_unavailable", None
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -577,7 +597,7 @@ def _verify_code_patch(case: dict[str, Any], fixture: Path, evidence: Path) -> l
             import_result = GateResult("COD-COMPILE-IMPORT", False, "not_evaluated")
             tests_result = GateResult("COD-TESTS", False, "not_evaluated")
         else:
-            rc, timed_out, sandbox_err = _run_sandboxed(
+            rc, timed_out, sandbox_err, _ = _run_sandboxed(
                 candidate_root,
                 ["-I", "-B", "-c", _IMPORT_CMD],
                 timeout_seconds=15.0,
@@ -596,32 +616,38 @@ def _verify_code_patch(case: dict[str, Any], fixture: Path, evidence: Path) -> l
             if not import_result.passed:
                 tests_result = GateResult("COD-TESTS", False, "not_evaluated")
             else:
-                rc, timed_out, sandbox_err = _run_sandboxed(
+                expected_tests = count_declared_tests(
+                    (candidate_root / "work/project/tests").glob("test_*.py")
+                )
+                nonce = new_attestation_nonce()
+                attestation_name = f"oab-test-attestation-{nonce}.json"
+                rc, timed_out, sandbox_err, attestation_text = _run_sandboxed(
                     candidate_root,
-                    [
-                        "-I",
-                        "-B",
-                        "-m",
-                        "unittest",
-                        "discover",
-                        "-s",
-                        "work/project/tests",
-                        "-t",
-                        "work",
-                        "-p",
-                        "test_*.py",
-                        "-v",
-                    ],
+                    build_attested_test_command(
+                        tests_dir="work/project/tests",
+                        pattern="test_*.py",
+                        top_level_dir="work",
+                        start_dir="work",
+                        output_path=f"tmp/{attestation_name}",
+                        nonce=nonce,
+                    ),
                     timeout_seconds=30.0,
+                    attestation_name=attestation_name,
                 )
                 if sandbox_err:
                     tests_result = GateResult("COD-TESTS", False, "tests_failed", sandbox_err)
                 elif timed_out:
                     tests_result = GateResult("COD-TESTS", False, "tests_timed_out")
-                elif rc == 0:
-                    tests_result = GateResult("COD-TESTS", True, "ok")
                 else:
-                    tests_result = GateResult("COD-TESTS", False, "tests_failed")
+                    # The exit status is deliberately not consulted: it is the
+                    # signal a module-level ``os._exit(0)`` forges. Only the
+                    # attestation the runner wrote decides this gate.
+                    passed, code, detail = evaluate_test_attestation_text(
+                        attestation_text,
+                        nonce=nonce,
+                        expected_tests=expected_tests,
+                    )
+                    tests_result = GateResult("COD-TESTS", passed, code, detail)
 
         trace_ok, trace_code = _cod_test_trace_ok(evidence)
         trace_result = GateResult("COD-TEST-TRACE", trace_ok, "ok" if trace_ok else trace_code)

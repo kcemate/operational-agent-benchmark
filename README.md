@@ -42,10 +42,10 @@ You approve a number. It does the rest. `AGENTS.md` is the runbook it follows.
 Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin.
 
 ```bash
-gh release download v2.1.0 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+gh release download v2.1.1 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
 
 HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-OAB_WHEEL=operational_agent_benchmark-2.1.0-py3-none-any.whl
+OAB_WHEEL=operational_agent_benchmark-2.1.1-py3-none-any.whl
 OAB_WHEEL_SHA256=sha256:<from-the-release-notes>
 OAB_TREE_SHA256=sha256:<from-the-release-notes>
 

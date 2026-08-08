@@ -2,6 +2,30 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.1.1 — 2026-08-08
+
+**Benchmark-affecting. Scoring-integrity fix.** A candidate could forge a passing test gate, so completion rates from 2.1.0 and earlier are not comparable for pair P02.
+
+### Test gates no longer trust an exit code
+
+`COD-TESTS` and `preserved_tests` decided success from the child process return code. `unittest discover` imports a candidate module before it collects tests, so two lines at module scope —
+
+```python
+import os
+os._exit(0)
+```
+
+— exited with status 0 before a single test ran and were scored as a clean pass. A deliberately wrong implementation could pass every declared gate on P02. The hash gate on the test files did not help: the tests were untouched, they simply never executed.
+
+- The sandboxed runner now writes a nonce-bound JSON attestation reporting `testsRun`, failures, errors, and loader errors. The gate requires that document to exist, to carry the expected nonce, and to report **exactly** the number of tests declared by the hash-pinned test files, with zero failures and zero errors.
+- Expected test count is derived by static AST parse of the pinned test files — no import, so candidate code cannot influence it. An unparseable file fails closed as `tests_not_countable`.
+- The exit status is no longer consulted at all. Any early exit produces no attestation, which is `tests_did_not_run` — a hard failure.
+- New failure codes: `tests_did_not_run`, `tests_not_countable`.
+- Failure detail now carries assertion text from the attestation rather than scraped stdout, so `oab explain` output is unchanged in substance.
+- Adversarial regression tests cover `os._exit(0)` at import, `atexit`-registered `os._exit`, import-time raise, silent test skipping, nonce mismatch, and a fabricated/malformed document. `tests/test_verifier_test_attestation.py` plus a case-level exploit test against the real P02 registry entry.
+
+**Disclosed residual risk** (`LIMITATIONS.md` #25): the runner shares an interpreter with candidate code and the nonce is therefore readable in-process. A model that deliberately fabricates an attestation can still defeat the gate. That is overt fabrication rather than an innocuous early exit, but it is not closed; closing it requires observing execution from outside the sandboxed interpreter.
+
 ## 2.1.0 — 2026-08-07
 
 **Benchmark-affecting.** Protocol normalization changes which episodes are scoreable, so rates are not comparable with 2.0.x. The suite-report schema gained diagnostic fields.
