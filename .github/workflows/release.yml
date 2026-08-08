@@ -25,10 +25,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install runtime
+      - name: Install runtime and Bubblewrap
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp2
+
+      # The suite is fail-closed: without a supported sandbox backend the
+      # verifier gates return sandbox_unavailable and the release suite fails.
+      # This mirrors ci.yml so the release gate tests the same thing CI does.
+      - name: Enable Bubblewrap user namespaces on the ephemeral runner
+        run: |
+          if sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true
 
       - name: Export the tagged tree
         run: |
