@@ -803,7 +803,10 @@ def load_campaign(output_root: Path, *, expected_reasoning_effort: str | None = 
 def record_calibration(output_root: Path, report: Mapping[str, object]) -> dict[str, Any]:
     root = output_root.expanduser().resolve(strict=True)
     state = load_campaign(root)
-    if report.get("schema") != "oab.calibration-report/v1":
+    if report.get("schema") not in {
+        "oab.calibration-report/v1",
+        "oab.calibration-report/v2",
+    }:
         raise ValueError("calibration_schema_invalid")
     passed = report.get("passed") is True
     receipt = dict(report)
@@ -825,7 +828,10 @@ def _require_passed_calibration(root: Path, state: Mapping[str, object]) -> None
         receipt = _read_regular_json(root / "CALIBRATION.json")
     except (OSError, ValueError) as exc:
         raise ValueError("campaign_calibration_receipt_invalid") from exc
-    if receipt.get("schema") != "oab.calibration-report/v1" or receipt.get("passed") is not True:
+    if receipt.get("schema") not in {
+        "oab.calibration-report/v1",
+        "oab.calibration-report/v2",
+    } or receipt.get("passed") is not True:
         raise ValueError("campaign_calibration_receipt_invalid")
     if state.get("calibration_sha256") != _canonical_sha256(receipt):
         raise ValueError("campaign_calibration_digest_mismatch")

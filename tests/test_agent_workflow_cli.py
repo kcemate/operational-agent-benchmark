@@ -194,7 +194,13 @@ class AgentWorkflowCliTests(unittest.TestCase):
     @staticmethod
     def calibration(output: Path) -> dict[str, object]:
         output.mkdir(parents=True, exist_ok=False)
-        report = {"schema": "oab.calibration-report/v1", "passed": True, "cases": []}
+        report = {
+            "schema": "oab.calibration-report/v2",
+            "passed": True,
+            "pair_count": 8,
+            "case_count": 16,
+            "cases": [],
+        }
         (output / "calibration-report.json").write_text(json.dumps(report), encoding="utf-8")
         return report
 

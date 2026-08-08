@@ -411,7 +411,10 @@ def _verify_campaign(
     except ValueError:
         errors.append("calibration_receipt_missing_or_invalid")
     else:
-        if calibration.get("schema") != "oab.calibration-report/v1" or calibration.get("passed") is not True:
+        if calibration.get("schema") not in {
+            "oab.calibration-report/v1",
+            "oab.calibration-report/v2",
+        } or calibration.get("passed") is not True:
             errors.append("calibration_receipt_failed_or_invalid")
         observed_calibration_sha256 = "sha256:" + hashlib.sha256(
             json.dumps(

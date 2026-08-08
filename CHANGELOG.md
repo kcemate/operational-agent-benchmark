@@ -2,6 +2,10 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.2.1 — 2026-08-08
+
+**Workflow bug fix. Not scoring-affecting.** The 2.2.0 all-pairs calibrator correctly emitted `oab.calibration-report/v2`, but campaign initialization still accepted only the retired v1 schema and stopped with `calibration_schema_invalid` before any model call. Campaign recording and verification now accept both v1 historical receipts and current v2 receipts. CLI integration tests execute the v2 path.
+
 ## 2.2.0 — 2026-08-08
 
 **Validity milestone. Not scoring-affecting** — no gate, oracle, or metric changed, so 2.1.1 rates remain comparable.

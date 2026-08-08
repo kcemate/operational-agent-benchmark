@@ -145,6 +145,29 @@ class AgentWorkflowContractTests(unittest.TestCase):
             signature_path.write_bytes(b"")
             self.assertIn("stage_approval_signature_invalid", verify_stage_approval(receipt_path, **kwargs))
 
+    def test_record_calibration_accepts_current_all_pairs_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+            )
+            record_calibration(
+                root,
+                {
+                    "schema": "oab.calibration-report/v2",
+                    "passed": True,
+                    "pair_count": 8,
+                    "case_count": 16,
+                    "cases": [],
+                },
+            )
+            receipt = json.loads((root / "CALIBRATION.json").read_text(encoding="utf-8"))
+            self.assertEqual("oab.calibration-report/v2", receipt["schema"])
+            self.assertTrue(load_campaign(root)["calibration_passed"])
+
     def test_conversational_approval_binds_exact_controls_without_key_ceremony(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
