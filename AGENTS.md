@@ -11,7 +11,7 @@ This repository provides an agent-native workflow for answering a bounded questi
 
    ```bash
    HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-   OAB_WHEEL=/path/to/operational_agent_benchmark-2.1.1-py3-none-any.whl
+   OAB_WHEEL=/path/to/operational_agent_benchmark-2.2.0-py3-none-any.whl
    OAB_WHEEL_SHA256=<independently-published-wheel-sha256>
    OAB_TREE_SHA256=sha256:<independently-published-release-tree-sha256>
    test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1

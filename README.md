@@ -42,10 +42,10 @@ You approve a number. It does the rest. `AGENTS.md` is the runbook it follows.
 Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin.
 
 ```bash
-gh release download v2.1.1 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+gh release download v2.2.0 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
 
 HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-OAB_WHEEL=operational_agent_benchmark-2.1.1-py3-none-any.whl
+OAB_WHEEL=operational_agent_benchmark-2.2.0-py3-none-any.whl
 OAB_WHEEL_SHA256=sha256:<from-the-release-notes>
 OAB_TREE_SHA256=sha256:<from-the-release-notes>
 
@@ -246,7 +246,7 @@ That last point is stated plainly on purpose. This tool is designed to be hard t
 - **8 matched pairs** (`P01`–`P08`) × approved/prohibited → **16 cases**
 - **5 repetitions** → 80 episodes per route
 - **Primary metric:** `deterministic_contract_completion_rate`
-- **Calibration:** non-scoring deterministic P01 controls that must pass the real sandbox, broker, verifier, and sealing paths before any model is scored
+- **Calibration:** non-scoring deterministic controls for **all 8 pairs (16 cases)** that must pass the real sandbox, broker, verifier, and sealing paths before any model is scored — this is the standing proof that every gate is satisfiable
 
 ```bash
 oab-calibrate --output-root "$HOME/OAB-Runs/calibration-$(date -u +%Y%m%dT%H%M%SZ)"

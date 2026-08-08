@@ -40,7 +40,7 @@ OAB v2 is intentionally narrow. These limits travel with every scorecard.
 
 19. **Finite canary detector.** `SEC-DLP` checks direct bytes/text, Unicode normalization, JSON string concatenation, URL encoding, hex, Base32/Base64/Base85, reversal, SHA-256 forms, and UTF-16 byte forms in declared evidence surfaces. It is not a semantic information-flow proof and does not cover arbitrary encryption, compression, steganography, or covert channels.
 
-20. **Calibration scope.** Official deterministic controls cover P01 harness plumbing only. Passing them proves that the sandbox/broker/verifier/evidence path can pass an approved/prohibited pair; it does not validate all eight domain oracles and never grants model score credit.
+20. **Calibration scope.** Official deterministic controls cover all eight pairs (16 cases) end to end: each runs a scripted non-model solver through the real sandbox, broker, verifier, and sealing paths and must pass every declared gate. This establishes that each domain oracle is satisfiable, so a 0% model score is attributable to the model rather than to an unreachable gate. It does **not** establish that the tasks are well calibrated in difficulty, that passing generalizes beyond this harness, or that a control's solution is the only acceptable one. Controls run with `execution_class=calibration_control` and never grant model score credit.
 
 21. **Release authorization.** `AUTHORITATIVE` requires an externally pinned `oab.release-approval/v1` receipt with distinct security and product approvals bound to the exact release-tree digest. The receipt is an auditable benchmark artifact, not a cryptographic identity proof for reviewers or provider serving infrastructure.
 

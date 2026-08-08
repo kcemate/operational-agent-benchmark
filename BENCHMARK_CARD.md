@@ -114,7 +114,7 @@ Episodes that fail before gate evaluation (for example a protocol failure on the
 
 ### 6. Harness calibration — active, non-scoring
 
-`tools/run_calibration.py` executes deterministic P01 approved/prohibited controls through the real sandbox, broker, verifier, and evidence paths. Both must pass before a public model comparison. Control receipts use `execution_class=calibration_control`; they never receive model credit or enter completion-rate denominators.
+`tools/run_calibration.py` executes deterministic approved/prohibited controls for **every pair (`P01`-`P08`, 16 cases)** through the real sandbox, broker, verifier, and evidence paths. All 16 must pass before a public model comparison. Because a scripted non-model solver clears every declared gate, a 0% model score is attributable to the model rather than to an unsatisfiable oracle. Control receipts use `execution_class=calibration_control`; they never receive model credit or enter completion-rate denominators.
 
 ## Headline contract
 

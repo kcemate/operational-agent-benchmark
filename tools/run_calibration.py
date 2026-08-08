@@ -10,7 +10,8 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 
 from oab.case_verifier import verify_case
-from oab.control import DataRollupControlController, tool_policy_from_case
+from oab.control import tool_policy_from_case
+from oab.controls_all_pairs import control_for_case
 from oab.evidence import verify_sealed_evidence
 from oab.registry import load_registry, validate_registry
 from oab.runner import StrictEpisodeSpec
@@ -31,15 +32,34 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
     findings = validate_registry(registry, ROOT)
     if findings:
         raise ValueError("registry invalid: " + ",".join(findings))
+    # Every pair is calibrated. Covering P01 alone proved the harness could carry
+    # one pair but left seven domain oracles unexercised, so a 0% campaign score
+    # could not be attributed to the model rather than to an unsatisfiable gate.
     cases = sorted(
-        (case for case in registry["cases"] if case["pair_id"] == "P01"),
-        key=lambda case: str(case["variant"]),
+        registry["cases"],
+        key=lambda case: (str(case["pair_id"]), str(case["variant"])),
     )
     rows: list[dict[str, Any]] = []
     for case in cases:
         case_id = str(case["case_id"])
         fixture = ROOT / str(case["fixture_path"])
         evidence = output_root / "evidence" / case_id
+        controller = control_for_case(case)
+        if controller is None:
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "pair_id": case["pair_id"],
+                    "variant": case["variant"],
+                    "passed": False,
+                    "runner_status": "no_control",
+                    "reason_codes": ["deterministic_control_missing"],
+                    "gates": [],
+                    "evidence_valid": False,
+                    "evidence_dir": str(evidence),
+                }
+            )
+            continue
         result = run_strict_episode(
             StrictEpisodeSpec(
                 case_id=case_id,
@@ -48,7 +68,7 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
                 input_tree=fixture,
                 timeout_seconds=30,
             ),
-            controller=DataRollupControlController(),
+            controller=controller,
             tool_policy=tool_policy_from_case(case, fixture),
             repository_root=ROOT,
             run_root=output_root / "run-roots" / case_id,
@@ -65,6 +85,7 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
         rows.append(
             {
                 "case_id": case_id,
+                "pair_id": case["pair_id"],
                 "variant": case["variant"],
                 "passed": passed,
                 "runner_status": result.status,
@@ -81,11 +102,16 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
             }
         )
 
+    expected_cases = len(registry["cases"])
+    covered_pairs = sorted({str(row["pair_id"]) for row in rows if row["passed"]})
     report: dict[str, Any] = {
-        "schema": "oab.calibration-report/v1",
+        "schema": "oab.calibration-report/v2",
         "execution_class": "calibration_control",
-        "pair_id": "P01",
-        "passed": len(rows) == 2 and all(row["passed"] for row in rows),
+        "pair_id": "ALL",
+        "pairs_calibrated": covered_pairs,
+        "cases_expected": expected_cases,
+        "cases_passed": sum(1 for row in rows if row["passed"]),
+        "passed": len(rows) == expected_cases and all(row["passed"] for row in rows),
         "model_score_credit": False,
         "cases": rows,
     }

@@ -2,6 +2,25 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.2.0 — 2026-08-08
+
+**Validity milestone. Not scoring-affecting** — no gate, oracle, or metric changed, so 2.1.1 rates remain comparable.
+
+### Every pair is now proven satisfiable
+
+Calibration covered `P01` only. That proved the harness could carry one pair end to end, but seven domain oracles had never been shown to accept a correct solution — so a 0% campaign score could not be attributed to the model rather than to an unreachable gate. The benchmark's only published result is 0.0% on every route, which made this the most load-bearing gap in the project.
+
+- New `oab/controls_all_pairs.py` provides deterministic, non-model controls for `P02`–`P08`. Each reads the same inputs a model would, derives its answer from those inputs, and drives the real broker; none is hardcoded to a fixture value it has not read.
+- `tools/run_calibration.py` now runs **all 16 cases** (8 pairs × approved/prohibited) instead of 2. Report schema is `oab.calibration-report/v2`, adding `pairs_calibrated`, `cases_expected`, and `cases_passed`.
+- **Result: 16/16 pass** through the real sandbox, broker, verifier, and sealing paths, with every declared gate green and sealed evidence valid.
+- `tests/test_all_pairs_calibration.py` pins this with one test per case, so a regression names the pair that broke. A coverage test additionally fails if a newly registered case ships without a control, and asserts no control can ever earn model credit.
+
+This closes the F3 finding from the internal review: **a 0% score is now attributable to the model.**
+
+Controls remain non-scoring: `execution_class=calibration_control`, `identity_source=deterministic_control`, excluded from completion-rate denominators.
+
+`LIMITATIONS.md` #20 is rewritten accordingly, and states plainly what all-pairs calibration still does *not* prove — that difficulty is well calibrated, that results generalize beyond this harness, or that a control's solution is the only acceptable one.
+
 ## 2.1.1 — 2026-08-08
 
 **Benchmark-affecting. Scoring-integrity fix.** A candidate could forge a passing test gate, so completion rates from 2.1.0 and earlier are not comparable for pair P02.
