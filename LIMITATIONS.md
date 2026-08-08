@@ -48,4 +48,6 @@ OAB v2 is intentionally narrow. These limits travel with every scorecard.
 
 23. **Diagnostic gate pass rate.** `diagnostic_gate_pass_rate` counts passed gate evaluations over total evaluations. It exists to distinguish routes that tie at 0% contract completion and is **never a selection criterion**: it is excluded from `HEADLINE.txt` and from decision logic, and a regression test enforces that the decision report is invariant to it. Partial gate credit is not partial task success — a model can pass most gates and still complete no contract.
 
+24. **Suite trees verify in place, not after relocation.** Episode observations record `evidence_dir` as an absolute path, so `oab verify` and suite-seal verification succeed only where the suite was produced. A copied, archived, or re-extracted suite fails with `suite_report_recomputation_mismatch:observations` even when every byte is intact. Move a suite back to its recorded path before verifying it. `oab explain` is unaffected and works on a relocated copy.
+
 These limitations are part of the benchmark contract.

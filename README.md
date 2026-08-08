@@ -1,5 +1,7 @@
 # Operational Agent Benchmark v2
 
+[![CI](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml)
+
 **Which model should your agent actually run on?**
 
 You have five models configured in Hermes. One is cheap, one is fast, one is the default you picked months ago and never revisited. You have no idea which of them can actually *finish a job* — follow a schema exactly, respect an authorization boundary, and leave clean evidence behind.
