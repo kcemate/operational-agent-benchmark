@@ -16,7 +16,7 @@ import json
 import re
 from pathlib import Path
 
-_NOTES_TEMPLATE = """## Verified digests
+_NOTES_TEMPLATE = """## Release digests
 
 ```
 release tree : {tree_sha256}
@@ -34,6 +34,15 @@ test "$(shasum -a 256 {wheel_name} | cut -d' ' -f1)" = "{wheel_sha256}" || exit 
 
 CI computed these digests from a clean `git archive` export of `{tag}` and
 verified that the committed `RELEASE_MANIFEST.json` matches that export.
+
+**What this check does and does not prove.** These digests are published on the
+same page as the artifact they describe, so they detect a corrupted, truncated,
+or substituted download — not a compromise of this repository, where the wheel
+and this digest block could be rewritten together. `AGENTS.md` therefore asks
+for digests obtained from a channel independent of the repository and wheel:
+for high-assurance use, record these values somewhere you control as soon as
+you read them, and verify future downloads against that copy rather than
+against this page.
 
 {changelog_section}
 """
