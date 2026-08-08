@@ -2,20 +2,26 @@
 
 [![CI](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml)
 
-**Which model should your agent actually run on?**
+**A benchmark that measures whether a model can *finish a job*, not whether it sounds smart.**
 
-You have five models configured in Hermes. One is cheap, one is fast, one is the default you picked months ago and never revisited. You have no idea which of them can actually *finish a job* — follow a schema exactly, respect an authorization boundary, and leave clean evidence behind.
+OAB gives a model a real operational task inside a network-denied OS sandbox — read these files, compute these totals, write this exact schema, and call the export tool *only* if the authority record permits it. Then it checks the result deterministically: right values, right shape, right authorization decision. No LLM judge, no partial credit.
 
-Benchmarks that rank "intelligence" don't answer that. OAB v2 does exactly one thing: it runs your real routes through real operational tasks in a locked-down sandbox, and tells you whether switching is justified.
+Every task ships as a **matched pair**: identical work, one version permitted and one forbidden. You get credit only when the model does the job *and* refuses the version it should refuse. That is the difference between competence and compliance theater.
 
-```
-PROVISIONAL | route=custom/qwen3-64k:8b | reasoning_effort=high
-infrastructure_coverage: 100.0% (80/80)
-deterministic_contract_completion_rate: 0.0% (0/80)
-matched_pair_completion_rate: 0.0% | pair_stability_min: 0.0% (P01)
-```
+The output is a decision: whether the evidence justifies switching the model your agent runs on.
 
-That's a real result. An 8B local model executed all 80 episodes without a single infrastructure failure — and completed zero contracts. It computed the right numbers and wrote them under the wrong keys. **That distinction is the entire point of this tool.**
+> [!IMPORTANT]
+> **Requires a Hermes agent installation.** OAB drives models through the Hermes agent harness and reads its configured model routes; `oab` installs next to the active `hermes` executable. It is not a standalone model-evaluation harness today, and there is no adapter for other frameworks yet.
+
+### What you get
+
+| | |
+|---|---|
+| **Deterministic scoring** | Schema shape, computed values against an oracle, authorization effects, source-read coverage. No judge model. |
+| **Real containment** | macOS Seatbelt or Linux Bubblewrap + libseccomp; network-denied, no-fork. The model never touches your filesystem directly. |
+| **Sealed evidence** | Every episode writes a hash-chained trace that recomputes independently. Aggregates are rebuilt from raw receipts. |
+| **Spend gates** | Nothing calls a provider until you approve exact ceilings. Planning and preview cost $0.00. |
+| **Free to try** | Local Ollama routes run the entire suite at $0.00. |
 
 ---
 
@@ -84,6 +90,21 @@ Budget roughly 2.5 minutes per episode for an 8B model on a laptop; a two-route 
 > python3 -c "import json;d=json.load(open('/tmp/probe.json'));print(d['provider'], d['model'])"
 > ```
 > A mismatch is scored as an *infrastructure* failure, never as a model failure.
+
+---
+
+## What a real result looks like
+
+```
+PROVISIONAL | route=custom/qwen3-64k:8b | reasoning_effort=high
+infrastructure_coverage: 100.0% (80/80)
+deterministic_contract_completion_rate: 0.0% (0/80)
+matched_pair_completion_rate: 0.0% | pair_stability_min: 0.0% (P01)
+```
+
+That is an actual published run. An 8B local model executed all 80 episodes without a single infrastructure failure — and completed zero contracts. It computed every number correctly and nested the totals under one key instead of two.
+
+A leaderboard would record that as "0%, model is bad." OAB tells you it was one key away, and `oab explain` shows you which key. **That distinction is the entire point of this tool.**
 
 ---
 
