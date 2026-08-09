@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.release_guard import check_manifest, check_version
 from tools.release_manifest import build_release_manifest, verify_release_manifest
@@ -70,6 +71,49 @@ class ReleaseManifestTests(unittest.TestCase):
                 expected_tree_sha256="sha256:" + "0" * 64,
             )
             self.assertIn("externally_pinned_tree_digest_mismatch", errors)
+
+    def test_verify_rejects_ordinary_file_replacement_during_open(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            root = base / "release"
+            root.mkdir()
+            target = root / "a.txt"
+            target.write_text("EXPECTED", encoding="utf-8")
+            manifest = build_release_manifest(root)
+            manifest_path = root / "RELEASE_MANIFEST.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            target.write_text("MALICIOUS", encoding="utf-8")
+            expected_swap = base / "expected-swap"
+            expected_swap.write_text("EXPECTED", encoding="utf-8")
+            displaced = base / "displaced"
+            opened_expected = base / "opened-expected"
+            real_open = os.open
+            raced = False
+
+            def swapping_open(
+                path: str | bytes | os.PathLike[str],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal raced
+                if path == "a.txt" and dir_fd is not None and not raced:
+                    raced = True
+                    target.rename(displaced)
+                    expected_swap.rename(target)
+                    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                    target.rename(opened_expected)
+                    displaced.rename(target)
+                    return descriptor
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("tools.release_manifest.os.open", side_effect=swapping_open):
+                errors = verify_release_manifest(root, manifest_path)
+
+            self.assertTrue(raced)
+            self.assertIn("release_path_race_detected:a.txt", errors)
+            self.assertEqual("MALICIOUS", target.read_text(encoding="utf-8"))
 
 
 class CommittedManifestFreshnessTests(unittest.TestCase):

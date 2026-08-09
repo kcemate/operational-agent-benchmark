@@ -17,7 +17,10 @@ from oab.registry import load_registry, validate_registry
 from oab.runner import StrictEpisodeSpec
 from oab.strict_runner import run_strict_episode
 from oab.paths import benchmark_root
-from tools.release_manifest import verify_release_manifest
+if __package__:
+    from .release_manifest import verify_release_manifest
+else:
+    from tools.release_manifest import verify_release_manifest
 
 ROOT = benchmark_root()
 

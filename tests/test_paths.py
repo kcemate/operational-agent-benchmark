@@ -15,19 +15,40 @@ from oab.paths import verify_installed_code_binding
 
 
 class InstalledCodeBindingTests(unittest.TestCase):
+    def test_installed_oab_tools_package_binds_to_frozen_tools_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            packages = base / "site-packages"
+            frozen = base / "share" / "operational-agent-benchmark"
+            for installed_relative, frozen_relative in (
+                ("oab/core.py", "oab/core.py"),
+                ("oab_tools/entry.py", "tools/entry.py"),
+            ):
+                (packages / installed_relative).parent.mkdir(parents=True, exist_ok=True)
+                (frozen / frozen_relative).parent.mkdir(parents=True, exist_ok=True)
+                (packages / installed_relative).write_text("VALUE = 1\n", encoding="utf-8")
+                (frozen / frozen_relative).write_text("VALUE = 1\n", encoding="utf-8")
+
+            self.assertEqual([], verify_installed_code_binding(packages, frozen))
+
     def test_installed_code_must_match_frozen_release_copies(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             packages = base / "site-packages"
             frozen = base / "share" / "operational-agent-benchmark"
-            for relative in ("oab/core.py", "tools/entry.py"):
-                (packages / relative).parent.mkdir(parents=True, exist_ok=True)
-                (frozen / relative).parent.mkdir(parents=True, exist_ok=True)
-                (packages / relative).write_text("VALUE = 1\n", encoding="utf-8")
-                (frozen / relative).write_text("VALUE = 1\n", encoding="utf-8")
+            for installed_relative, frozen_relative in (
+                ("oab/core.py", "oab/core.py"),
+                ("oab_tools/entry.py", "tools/entry.py"),
+            ):
+                (packages / installed_relative).parent.mkdir(parents=True, exist_ok=True)
+                (frozen / frozen_relative).parent.mkdir(parents=True, exist_ok=True)
+                (packages / installed_relative).write_text("VALUE = 1\n", encoding="utf-8")
+                (frozen / frozen_relative).write_text("VALUE = 1\n", encoding="utf-8")
 
             self.assertEqual([], verify_installed_code_binding(packages, frozen))
-            (packages / "tools" / "entry.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (packages / "oab_tools" / "entry.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
             self.assertIn(
                 "installed_code_digest_mismatch:tools/entry.py",
                 verify_installed_code_binding(packages, frozen),
@@ -116,11 +137,15 @@ class InstalledCodeBindingTests(unittest.TestCase):
             base = Path(td)
             packages = base / "site-packages"
             frozen = base / "share" / "operational-agent-benchmark"
-            for relative in ("oab/core.py", "tools/entry.py"):
-                for root in (packages, frozen):
-                    (root / relative).parent.mkdir(parents=True, exist_ok=True)
-                    (root / relative).write_text("VALUE = 1\n", encoding="utf-8")
-                py_compile.compile(str(packages / relative), doraise=True)
+            for installed_relative, frozen_relative in (
+                ("oab/core.py", "oab/core.py"),
+                ("oab_tools/entry.py", "tools/entry.py"),
+            ):
+                (packages / installed_relative).parent.mkdir(parents=True, exist_ok=True)
+                (frozen / frozen_relative).parent.mkdir(parents=True, exist_ok=True)
+                (packages / installed_relative).write_text("VALUE = 1\n", encoding="utf-8")
+                (frozen / frozen_relative).write_text("VALUE = 1\n", encoding="utf-8")
+                py_compile.compile(str(packages / installed_relative), doraise=True)
 
             self.assertEqual([], verify_installed_code_binding(packages, frozen))
 
@@ -136,8 +161,10 @@ class InstalledCodeBindingTests(unittest.TestCase):
             for root in (packages, frozen):
                 (root / "oab").mkdir(parents=True)
                 (root / "oab/core.py").write_text(source_text, encoding="utf-8")
-                (root / "tools").mkdir(parents=True)
-                (root / "tools/entry.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (packages / "oab_tools").mkdir(parents=True)
+            (packages / "oab_tools/entry.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (frozen / "tools").mkdir(parents=True)
+            (frozen / "tools/entry.py").write_text("VALUE = 1\n", encoding="utf-8")
             environment = dict(os.environ)
             for seed in range(1, 9):
                 environment["PYTHONHASHSEED"] = str(seed)

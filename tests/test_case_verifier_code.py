@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+import py_compile
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from oab.case_verifier import verify_case
+from oab.case_verifier import _project_files, verify_case
 from oab.registry import load_registry
 from oab.trace import CanonicalTrace
 
@@ -80,6 +82,24 @@ def _unified_patch(old: str, new: str, path: str = PATCH_PATH) -> str:
 
 
 class CodePatchVerifierTests(unittest.TestCase):
+    def test_project_file_walk_prunes_generated_cache_subtrees_before_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "work/project"
+            cache = project / "__pycache__"
+            cache.mkdir(parents=True)
+            (project / "normalize.py").write_text("value = 1\n", encoding="utf-8")
+            (cache / "linked.pyc").symlink_to(root / "outside")
+            original_is_file = Path.is_file
+
+            def guarded_is_file(path: Path) -> bool:
+                if "__pycache__" in path.parts:
+                    raise AssertionError("generated cache entry was statted")
+                return original_is_file(path)
+
+            with patch.object(Path, "is_file", guarded_is_file):
+                self.assertEqual({"normalize.py"}, _project_files(root))
+
     def setUp(self) -> None:
         registry = load_registry(ROOT / "cases.json")
         self.cases = {case["case_id"]: case for case in registry["cases"]}
@@ -197,6 +217,46 @@ class CodePatchVerifierTests(unittest.TestCase):
                 "COD-TEST-TRACE",
             }
             self.assertEqual(expected, set(results))
+            self.assertTrue(all(result.passed for result in results.values()), results)
+
+    def test_approved_fixture_ignores_generated_python_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            evidence = self.make_approved_evidence(root)
+            case = self.cases["oab2-code-patch-a"]
+            fixture = root / "fixture"
+            shutil.copytree(ROOT / case["fixture_path"], fixture)
+            cache = fixture / "work/project/__pycache__"
+            cache.mkdir()
+            (cache / "normalize.cpython-311.pyc").write_bytes(b"generated")
+            test_cache = fixture / "work/project/tests/__pycache__"
+            test_cache.mkdir()
+            (test_cache / "test_normalize.cpython-311.pyc").write_bytes(b"generated")
+            results = {
+                result.dimension: result for result in verify_case(case, fixture, evidence)
+            }
+            self.assertTrue(all(result.passed for result in results.values()), results)
+
+    def test_prohibited_fixture_never_executes_unsealed_python_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            evidence = self.make_prohibited_evidence(root / "receipt")
+            fixture = root / "fixture"
+            shutil.copytree(self.fixture_p, fixture)
+            malicious = root / "malicious_normalize.py"
+            malicious.write_text("raise RuntimeError('unsealed bytecode executed')\n")
+            cache = fixture / "work/project/__pycache__"
+            cache.mkdir()
+            py_compile.compile(
+                str(malicious),
+                cfile=str(cache / f"normalize.{sys.implementation.cache_tag}.pyc"),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            case = self.cases["oab2-code-patch-p"]
+            results = {
+                result.dimension: result for result in verify_case(case, fixture, evidence)
+            }
             self.assertTrue(all(result.passed for result in results.values()), results)
 
     def test_prohibited_positive_control_passes_every_declared_gate(self) -> None:

@@ -2,6 +2,10 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest.
 
+## 2.2.2 — 2026-08-08
+
+**Workflow-integrity and installation repair. Not scoring-affecting.** New campaign receipts keep the embedded `suite_report` identical to the sealed report; elapsed time and suite-verification state remain orchestration metadata. Verification and resume accept historical 2.2.1 receipts only when those two legacy annotations are complete, valid, and the remaining report exactly matches the sealed source; ambiguous dual encoding fails closed. Fixture integrity, policy construction, verification, and staging now consistently exclude pip-generated `__pycache__`, `.pyc`, and `.pyo` artifacts, while all authored fixture files remain digest-bound.
+
 ## 2.2.1 — 2026-08-08
 
 **Workflow bug fix. Not scoring-affecting.** The 2.2.0 all-pairs calibrator correctly emitted `oab.calibration-report/v2`, but campaign initialization still accepted only the retired v1 schema and stopped with `calibration_schema_invalid` before any model call. Campaign recording and verification now accept both v1 historical receipts and current v2 receipts. CLI integration tests execute the v2 path.

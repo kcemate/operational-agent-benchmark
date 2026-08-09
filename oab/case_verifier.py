@@ -4,8 +4,10 @@ import base64
 import csv
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,7 +16,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from .manifest import ManifestError, build_tree_manifest
+from .manifest import (
+    ManifestError,
+    build_fixture_manifest,
+    ignore_generated_python_caches,
+    is_generated_python_cache_path,
+)
 from .sandbox import SandboxPolicy, SandboxUnavailable, select_backend
 from .trace import validate_trace
 from .verifier import (
@@ -214,14 +221,26 @@ def _verify_data_rollup(case: dict[str, Any], fixture: Path, evidence: Path) -> 
     ]
 
 
-def _list_files(root: Path) -> set[str]:
+def _list_files(root: Path, *, exclude_generated_python_caches: bool = False) -> set[str]:
     if not root.is_dir():
         return set()
-    return {
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+    files: set[str] = set()
+
+    def walk(directory: Path) -> None:
+        for child in os.scandir(directory):
+            relative = Path(child.path).relative_to(root).as_posix()
+            if exclude_generated_python_caches and is_generated_python_cache_path(
+                relative
+            ):
+                continue
+            info = child.stat(follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                walk(Path(child.path))
+            elif stat.S_ISREG(info.st_mode):
+                files.add(relative)
+
+    walk(root)
+    return files
 
 
 def _file_bytes(path: Path) -> bytes | None:
@@ -236,7 +255,7 @@ def _subtree_manifest_entries(root: Path, prefix: str) -> list[dict[str, object]
     if not target.exists():
         return None
     try:
-        manifest = build_tree_manifest(target)
+        manifest = build_fixture_manifest(target)
     except (ManifestError, OSError):
         return None
     entries: list[dict[str, object]] = []
@@ -274,7 +293,9 @@ def _output_files(evidence: Path) -> set[str]:
 
 
 def _project_files(root: Path) -> set[str]:
-    return _list_files(root / "work/project")
+    return _list_files(
+        root / "work/project", exclude_generated_python_caches=True
+    )
 
 
 def _projects_equal_except(
@@ -372,7 +393,11 @@ def _apply_patch_to_scratch(fixture: Path, patch_text: str) -> tuple[Path | None
     assert target is not None
     scratch = Path(tempfile.mkdtemp(prefix="oab-p02-patch-"))
     try:
-        shutil.copytree(fixture / "work", scratch / "work")
+        shutil.copytree(
+            fixture / "work",
+            scratch / "work",
+            ignore=ignore_generated_python_caches,
+        )
         patch_path = scratch / "repair.patch"
         patch_path.write_text(patch_text, encoding="utf-8")
         check = subprocess.run(
@@ -437,7 +462,11 @@ def _run_sandboxed(
     """
     workspace = Path(tempfile.mkdtemp(prefix="oab-p02-run-"))
     try:
-        shutil.copytree(candidate_root / "work", workspace / "work")
+        shutil.copytree(
+            candidate_root / "work",
+            workspace / "work",
+            ignore=ignore_generated_python_caches,
+        )
         home = workspace / "home"
         tmp = workspace / "tmp"
         home.mkdir()
@@ -1042,7 +1071,7 @@ def verify_case(
     evidence: Path,
 ) -> list[GateResult]:
     try:
-        actual_digest = build_tree_manifest(fixture)["tree_sha256"]
+        actual_digest = build_fixture_manifest(fixture)["tree_sha256"]
     except (ManifestError, OSError) as exc:
         return _failed_declared(case, "fixture_integrity_error", str(exc))
     if actual_digest != case.get("fixture_manifest_digest"):

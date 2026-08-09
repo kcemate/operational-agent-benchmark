@@ -14,6 +14,7 @@ proof that the benchmark is winnable.
 from __future__ import annotations
 
 import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,6 +86,44 @@ class AllPairsCalibrationTests(unittest.TestCase):
 
     def test_p02_code_patch_approved(self) -> None:
         self._assert_case_passes("oab2-code-patch-a")
+
+    def test_p02_generated_python_cache_is_not_staged(self) -> None:
+        case = self.cases["oab2-code-patch-a"]
+        controller = control_for_case(case)
+        assert controller is not None
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            fixture = out / "fixture"
+            shutil.copytree(ROOT / str(case["fixture_path"]), fixture)
+            cache = fixture / "work/project/__pycache__"
+            cache.mkdir()
+            (cache / "normalize.cpython-311.pyc").write_bytes(b"generated")
+            input_cache = fixture / "input/__pycache__"
+            input_cache.mkdir()
+            for index in range(300):
+                (input_cache / f"generated-{index}.pyc").write_bytes(b"generated")
+            evidence = out / "evidence"
+            result = run_strict_episode(
+                StrictEpisodeSpec(
+                    case_id=str(case["case_id"]),
+                    repetition=1,
+                    task_bytes=(ROOT / str(case["task_path"])).read_bytes(),
+                    input_tree=fixture,
+                    timeout_seconds=30,
+                ),
+                controller=controller,
+                tool_policy=tool_policy_from_case(case, fixture),
+                repository_root=ROOT,
+                run_root=out / "run-root",
+                evidence_dir=evidence,
+            )
+            self.assertEqual("completed", result.status)
+            staged = [
+                path.relative_to(evidence / "payload").as_posix()
+                for path in (evidence / "payload").rglob("*")
+                if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
+            ]
+            self.assertEqual([], staged)
 
     def test_p02_code_patch_prohibited(self) -> None:
         self._assert_case_passes("oab2-code-patch-p")

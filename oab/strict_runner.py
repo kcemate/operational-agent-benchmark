@@ -12,7 +12,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
 
 from .evidence import build_evidence_manifest
-from .manifest import ManifestError, build_tree_manifest
+from .manifest import (
+    ManifestError,
+    build_fixture_manifest,
+    build_tree_manifest,
+    ignore_generated_python_caches,
+)
 from .runner import StrictEpisodeSpec
 from .sandbox import SandboxPolicy, SandboxResult, select_backend
 from .trace import CanonicalTrace, validate_trace
@@ -531,7 +536,7 @@ def run_strict_episode(
         raise FileExistsError(f"evidence directory already exists: {evidence_dir}")
     if tool_policy.max_steps < 1 or tool_policy.max_write_bytes < 0 or tool_policy.max_read_bytes < 0:
         raise ValueError("invalid tool policy limits")
-    input_manifest = build_tree_manifest(spec.input_tree)
+    input_manifest = build_fixture_manifest(spec.input_tree)
     run_root.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix="oab2-episode-", dir=run_root)).resolve()
     if not _disjoint(workspace, repository):
@@ -546,12 +551,29 @@ def run_strict_episode(
     mock_effect_count = 0
     trace_digest: str | None = None
     try:
-        shutil.copytree(spec.input_tree, workspace, dirs_exist_ok=True, symlinks=False)
+        shutil.copytree(
+            spec.input_tree,
+            workspace,
+            dirs_exist_ok=True,
+            symlinks=False,
+            ignore=ignore_generated_python_caches,
+        )
+        staged_fixture_manifest = build_fixture_manifest(workspace)
+        if staged_fixture_manifest != input_manifest:
+            raise RuntimeError("fixture_snapshot_mismatch")
         for name in ("output", "work", "home", "tmp", "broker"):
             (workspace / name).mkdir(mode=0o700, exist_ok=True)
         _seal_tree(workspace / "input")
-        staged_input_manifest = build_tree_manifest(workspace / "input") if (workspace / "input").exists() else None
-        source_input_manifest = build_tree_manifest(spec.input_tree / "input") if (spec.input_tree / "input").exists() else None
+        staged_input_manifest = (
+            build_fixture_manifest(workspace / "input")
+            if (workspace / "input").exists()
+            else None
+        )
+        source_input_manifest = (
+            build_fixture_manifest(spec.input_tree / "input")
+            if (spec.input_tree / "input").exists()
+            else None
+        )
         if staged_input_manifest != source_input_manifest:
             raise RuntimeError("input_snapshot_mismatch")
 
@@ -804,7 +826,12 @@ def run_strict_episode(
             for name in ("output", "work"):
                 source = workspace / name
                 if source.exists():
-                    shutil.copytree(source, payload_dir / name, symlinks=False)
+                    shutil.copytree(
+                        source,
+                        payload_dir / name,
+                        symlinks=False,
+                        ignore=ignore_generated_python_caches,
+                    )
             output_manifest = build_tree_manifest(payload_dir)
             (evidence_dir / "output-manifest.json").write_bytes(
                 _canonical_bytes(output_manifest) + b"\n"

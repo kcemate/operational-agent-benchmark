@@ -3,15 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from .manifest import (
+    ManifestError,
+    build_fixture_manifest,
+    is_generated_python_cache_path,
+)
 from .sandbox import SandboxPolicy, SandboxUnavailable, select_backend
 
 _EVENT_PREFIX = "OAB_EVENT\t"
@@ -66,25 +72,6 @@ def _safe_relative(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _reject_symlinks(root: Path) -> None:
-    if root.is_symlink():
-        raise ValueError(f"symlink not allowed: {root}")
-    seen_casefolded: set[str] = set()
-    for path in root.rglob("*"):
-        relative = path.relative_to(root).as_posix()
-        folded = relative.casefold()
-        if folded in seen_casefolded:
-            raise ValueError(f"case-fold collision not allowed: {relative}")
-        seen_casefolded.add(folded)
-        if path.is_symlink():
-            raise ValueError(f"symlink not allowed: {path}")
-        info = path.lstat()
-        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-            raise ValueError(f"special file not allowed: {path}")
-        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
-            raise ValueError(f"hardlink not allowed: {path}")
-
-
 def _set_read_only(path: Path) -> None:
     if path.is_dir():
         for child in path.rglob("*"):
@@ -111,6 +98,394 @@ def _make_tree_writable(path: Path) -> None:
         pass
 
 
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _assert_path_bound_to_fd(path: Path, descriptor: int) -> os.stat_result:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise ManifestError("snapshot_source_changed") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(current.st_mode) or not _same_inode(current, opened):
+        raise ManifestError("snapshot_source_changed")
+    return opened
+
+
+def _copy_snapshot_tree_fd(
+    source_fd: int,
+    destination_fd: int,
+    relative_parent: str = "",
+) -> None:
+    source_before = os.fstat(source_fd)
+    try:
+        children = list(os.scandir(source_fd))
+    except OSError as exc:
+        raise ManifestError("snapshot_source_changed") from exc
+    children.sort(key=lambda child: child.name)
+    for child in children:
+        relative = (
+            f"{relative_parent}/{child.name}" if relative_parent else child.name
+        )
+        if is_generated_python_cache_path(relative):
+            continue
+        try:
+            info = os.stat(
+                child.name,
+                dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ManifestError("snapshot_source_changed") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ManifestError(f"symlink is not allowed: {relative}")
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child_source_fd = os.open(
+                    child.name,
+                    _directory_open_flags(),
+                    dir_fd=source_fd,
+                )
+            except OSError as exc:
+                raise ManifestError("snapshot_source_changed") from exc
+            try:
+                if not _same_inode(info, os.fstat(child_source_fd)):
+                    raise ManifestError("snapshot_source_changed")
+                os.mkdir(child.name, 0o700, dir_fd=destination_fd)
+                child_destination_fd = os.open(
+                    child.name,
+                    _directory_open_flags(),
+                    dir_fd=destination_fd,
+                )
+                try:
+                    _copy_snapshot_tree_fd(
+                        child_source_fd,
+                        child_destination_fd,
+                        relative,
+                    )
+                finally:
+                    os.close(child_destination_fd)
+                current = os.stat(
+                    child.name,
+                    dir_fd=source_fd,
+                    follow_symlinks=False,
+                )
+                if not _same_inode(current, info):
+                    raise ManifestError("snapshot_source_changed")
+            finally:
+                os.close(child_source_fd)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise ManifestError(f"special file is not allowed: {relative}")
+        if info.st_nlink != 1:
+            raise ManifestError(f"hardlink is not allowed: {relative}")
+        source_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            source_flags |= os.O_NOFOLLOW
+        try:
+            source_file_fd = os.open(
+                child.name,
+                source_flags,
+                dir_fd=source_fd,
+            )
+        except OSError as exc:
+            raise ManifestError("snapshot_source_changed") from exc
+        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            destination_flags |= os.O_NOFOLLOW
+        try:
+            opened_source = os.fstat(source_file_fd)
+            if not _same_inode(opened_source, info) or opened_source.st_nlink != 1:
+                raise ManifestError("snapshot_source_changed")
+            destination_file_fd = os.open(
+                child.name,
+                destination_flags,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                while True:
+                    chunk = os.read(source_file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_file_fd, view)
+                        view = view[written:]
+            finally:
+                os.close(destination_file_fd)
+            closed_source = os.fstat(source_file_fd)
+            if (
+                not _same_inode(closed_source, opened_source)
+                or closed_source.st_size != opened_source.st_size
+                or closed_source.st_mtime_ns != opened_source.st_mtime_ns
+                or closed_source.st_ctime_ns != opened_source.st_ctime_ns
+                or closed_source.st_nlink != 1
+            ):
+                raise ManifestError("snapshot_source_changed")
+        finally:
+            os.close(source_file_fd)
+    source_after = os.fstat(source_fd)
+    if (
+        not _same_inode(source_after, source_before)
+        or source_after.st_mtime_ns != source_before.st_mtime_ns
+        or source_after.st_ctime_ns != source_before.st_ctime_ns
+    ):
+        raise ManifestError("snapshot_source_changed")
+
+
+def _remove_snapshot_tree_fd(directory_fd: int) -> None:
+    os.fchmod(directory_fd, 0o700)
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(
+                name,
+                _directory_open_flags(),
+                dir_fd=directory_fd,
+            )
+            try:
+                if not _same_inode(info, os.fstat(child_fd)):
+                    raise ManifestError("snapshot_source_changed")
+                _remove_snapshot_tree_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _cleanup_snapshot_name(
+    parent_fd: int,
+    name: str,
+    owned_fd: int,
+    owned_identity: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if _same_inode(current, owned_identity) and stat.S_ISDIR(current.st_mode):
+        _remove_snapshot_tree_fd(owned_fd)
+        os.rmdir(name, dir_fd=parent_fd)
+        return
+    # The pathname no longer names the directory represented by owned_fd. It is
+    # attacker-controlled for cleanup purposes: fail closed by leaving it untouched.
+    return
+
+
+def _canonical_manifest_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _snapshot_workspace(source: Path, destination: Path) -> None:
+    max_files = 4096
+    max_total_bytes = 256 * 1024 * 1024
+    parent = destination.parent
+    parent_info = parent.lstat()
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+        raise ManifestError("snapshot_destination_parent_unsafe")
+    parent_fd = os.open(parent, _directory_open_flags())
+    source_fd = -1
+    temporary_fd = -1
+    temporary_name = f".{destination.name}.{secrets.token_hex(16)}"
+    active_name = temporary_name
+    try:
+        _assert_path_bound_to_fd(parent, parent_fd)
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"workspace snapshot already exists: {destination}")
+
+        source_info = source.lstat()
+        if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+            raise ManifestError("snapshot_source_changed")
+        source_fd = os.open(source, _directory_open_flags())
+        if not _same_inode(source_info, os.fstat(source_fd)):
+            raise ManifestError("snapshot_source_changed")
+        source_manifest = build_fixture_manifest(
+            source,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+        )
+        _assert_path_bound_to_fd(source, source_fd)
+
+        os.mkdir(temporary_name, 0o700, dir_fd=parent_fd)
+        temporary_fd = os.open(
+            temporary_name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        temporary_identity = os.fstat(temporary_fd)
+        _copy_snapshot_tree_fd(source_fd, temporary_fd)
+        _assert_path_bound_to_fd(parent / temporary_name, temporary_fd)
+        copied_manifest = build_fixture_manifest(
+            parent / temporary_name,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+        )
+        _assert_path_bound_to_fd(parent / temporary_name, temporary_fd)
+        if _canonical_manifest_bytes(copied_manifest) != _canonical_manifest_bytes(
+            source_manifest
+        ):
+            raise ManifestError("workspace_snapshot_mismatch")
+        _assert_path_bound_to_fd(parent, parent_fd)
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"workspace snapshot already exists: {destination}")
+        os.rename(
+            temporary_name,
+            destination.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        active_name = destination.name
+        installed_info = os.stat(
+            destination.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(installed_info.st_mode) or not _same_inode(
+            installed_info, temporary_identity
+        ):
+            raise ManifestError("snapshot_source_changed")
+        _assert_path_bound_to_fd(parent, parent_fd)
+    except BaseException:
+        if temporary_fd >= 0:
+            _cleanup_snapshot_name(
+                parent_fd,
+                active_name,
+                temporary_fd,
+                os.fstat(temporary_fd),
+            )
+        raise
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(parent_fd)
+
+
+def _copy_verified_fixture_contents(
+    source: Path,
+    destination: Path,
+    expected_manifest: dict[str, object],
+) -> None:
+    """Copy a verified fixture through held descriptors into an existing workspace."""
+    source_info = source.lstat()
+    destination_info = destination.lstat()
+    if (
+        not stat.S_ISDIR(source_info.st_mode)
+        or stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISDIR(destination_info.st_mode)
+        or stat.S_ISLNK(destination_info.st_mode)
+    ):
+        raise ManifestError("snapshot_source_changed")
+    source_fd = os.open(source, _directory_open_flags())
+    destination_fd = os.open(destination, _directory_open_flags())
+    try:
+        if not _same_inode(source_info, os.fstat(source_fd)) or not _same_inode(
+            destination_info, os.fstat(destination_fd)
+        ):
+            raise ManifestError("snapshot_source_changed")
+        _copy_snapshot_tree_fd(source_fd, destination_fd)
+        _assert_path_bound_to_fd(source, source_fd)
+        _assert_path_bound_to_fd(destination, destination_fd)
+        copied_manifest = build_fixture_manifest(destination)
+        _assert_path_bound_to_fd(destination, destination_fd)
+        if _canonical_manifest_bytes(copied_manifest) != _canonical_manifest_bytes(
+            expected_manifest
+        ):
+            raise ManifestError("workspace_snapshot_mismatch")
+    finally:
+        os.close(destination_fd)
+        os.close(source_fd)
+
+
+def _copy_verified_regular_file(source: Path, destination: Path) -> None:
+    """Copy one single-link regular file without following a substituted source."""
+    source_parent_fd = os.open(source.parent, _directory_open_flags())
+    destination_parent_fd = os.open(destination.parent, _directory_open_flags())
+    source_fd = -1
+    destination_fd = -1
+    try:
+        before = os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ManifestError("snapshot_source_changed")
+        source_fd = os.open(
+            source.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=source_parent_fd,
+        )
+        opened_before = os.fstat(source_fd)
+        if not _same_inode(before, opened_before) or opened_before.st_nlink != 1:
+            raise ManifestError("snapshot_source_changed")
+        destination_fd = os.open(
+            destination.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=destination_parent_fd,
+        )
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise ManifestError("snapshot_source_changed")
+                view = view[written:]
+        os.fsync(destination_fd)
+        opened_after = os.fstat(source_fd)
+        if (
+            not _same_inode(opened_before, opened_after)
+            or opened_before.st_size != opened_after.st_size
+            or opened_before.st_mtime_ns != opened_after.st_mtime_ns
+            or opened_before.st_ctime_ns != opened_after.st_ctime_ns
+            or opened_after.st_nlink != 1
+        ):
+            raise ManifestError("snapshot_source_changed")
+    except BaseException:
+        try:
+            os.unlink(destination.name, dir_fd=destination_parent_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(destination_parent_fd)
+        os.close(source_parent_fd)
+
+
 def prepare_episode(
     spec: EpisodeSpec,
     *,
@@ -125,7 +500,7 @@ def prepare_episode(
         raise ValueError("repetition must be positive")
     if not spec.task_path.is_file() or not spec.fixture_path.is_dir():
         raise ValueError("task and fixture must exist")
-    _reject_symlinks(spec.fixture_path)
+    fixture_manifest = build_fixture_manifest(spec.fixture_path)
     if spec.task_path.is_symlink():
         raise ValueError("task symlink not allowed")
 
@@ -141,13 +516,12 @@ def prepare_episode(
         raise ValueError("allocated workspace is inside the repository")
 
     try:
-        for source in spec.fixture_path.iterdir():
-            destination = workspace / source.name
-            if source.is_dir():
-                shutil.copytree(source, destination)
-            else:
-                shutil.copy2(source, destination)
-        shutil.copy2(spec.task_path, workspace / "task.md")
+        _copy_verified_fixture_contents(
+            spec.fixture_path,
+            workspace,
+            fixture_manifest,
+        )
+        _copy_verified_regular_file(spec.task_path, workspace / "task.md")
         for relative in ("submission", "home", "tmp"):
             (workspace / relative).mkdir(parents=True, exist_ok=True)
 
@@ -406,7 +780,7 @@ def run_episode(
         with (output_dir / "events.jsonl").open("w", encoding="utf-8") as handle:
             for event in events:
                 handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
-        shutil.copytree(prepared.workspace, output_dir / "workspace")
+        _snapshot_workspace(prepared.workspace, output_dir / "workspace")
         receipt = {
             "schema_version": 1,
             "case_id": spec.case_id,

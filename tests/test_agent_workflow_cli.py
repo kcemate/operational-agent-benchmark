@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -8,6 +9,7 @@ import time
 import unittest
 from io import StringIO
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
@@ -17,11 +19,42 @@ from tools.agent_workflow import (
     _classify_route_failure,
     _production_suite_runner,
     _run_route_process,
+    _verify_campaign,
     main,
 )
 
 
 class AgentWorkflowCliTests(unittest.TestCase):
+    def test_verify_campaign_rejects_symlinked_internal_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            self.assertEqual(
+                0,
+                main(
+                    [
+                        "benchmark",
+                        "--all-accessible",
+                        "--output-root",
+                        str(root),
+                        "--reasoning-effort",
+                        "high",
+                    ],
+                    doctor_fn=self.doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
+                ),
+            )
+            outside = Path(td) / "outside-results"
+            outside.mkdir()
+            results = root / "qualification/results"
+            results.rmdir()
+            results.symlink_to(outside, target_is_directory=True)
+            verification = _verify_campaign(root)
+            self.assertFalse(verification["valid"])
+            errors = verification["errors"]
+            self.assertIsInstance(errors, list)
+            self.assertIn("campaign_internal_path_unsafe", cast(list[object], errors))
+
     def test_approval_preview_prints_exact_no_spend_controls(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
@@ -90,7 +123,8 @@ class AgentWorkflowCliTests(unittest.TestCase):
                     "error_code": "campaign_controller_failed",
                 },
             ) as execute:
-                runner(route, "qualification", Path(td) / "suite", "high")
+                with self.assertRaisesRegex(RuntimeError, "campaign_controller_failed"):
+                    runner(route, "qualification", Path(td).resolve() / "suite", "high")
             command = execute.call_args.args[0]
             self.assertEqual("17", command[command.index("--repetitions") + 1])
             self.assertEqual("1", command[command.index("--max-steps-per-episode") + 1])
@@ -98,6 +132,142 @@ class AgentWorkflowCliTests(unittest.TestCase):
             self.assertIn("--max-observed-cost-usd", command)
             self.assertEqual("4.75", command[command.index("--max-observed-cost-usd") + 1])
             self.assertIn("--allow-unknown-costs", command)
+
+    def test_production_runner_raises_controlled_error_for_timeout(self) -> None:
+        runner = _production_suite_runner(
+            source_hermes_home=None,
+            release_approval=None,
+            expected_release_approval_sha256=None,
+            timeout_seconds=10,
+        )
+        route: dict[str, object] = {
+            "provider": "xai-oauth",
+            "model": "grok-4.5",
+            "requested_route": "xai-oauth/grok-4.5",
+        }
+        with tempfile.TemporaryDirectory() as td, patch(
+            "tools.agent_workflow._run_route_process",
+            return_value={
+                "timed_out": True,
+                "returncode": None,
+                "diagnostic_sha256": "sha256:" + "0" * 64,
+                "error_code": "campaign_route_timeout",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "campaign_route_timeout"):
+                runner(route, "qualification", Path(td).resolve() / "suite", "high")
+
+    def test_production_runner_rejects_substituted_suite_output_parent(self) -> None:
+        runner = _production_suite_runner(
+            source_hermes_home=None,
+            release_approval=None,
+            expected_release_approval_sha256=None,
+            timeout_seconds=10,
+        )
+        route: dict[str, object] = {
+            "provider": "xai-oauth",
+            "model": "grok-4.5",
+            "requested_route": "xai-oauth/grok-4.5",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            attempts = root / "attempts"
+            attempts.mkdir()
+            attempts.rename(root / "retained-attempts")
+            outside = root / "attacker-selected"
+            outside.mkdir()
+            attempts.symlink_to(outside, target_is_directory=True)
+            with patch("tools.agent_workflow._run_route_process") as execute:
+                with self.assertRaisesRegex(ValueError, "campaign_internal_path_unsafe"):
+                    runner(
+                        route,
+                        "qualification",
+                        attempts / "evidence",
+                        "high",
+                    )
+            execute.assert_not_called()
+            self.assertFalse((outside / "evidence").exists())
+
+    def test_production_runner_verifies_descriptor_created_evidence_after_parent_swap(self) -> None:
+        runner = _production_suite_runner(
+            source_hermes_home=None,
+            release_approval=None,
+            expected_release_approval_sha256=None,
+            timeout_seconds=10,
+        )
+        route: dict[str, object] = {
+            "provider": "xai-oauth",
+            "model": "grok-4.5",
+            "requested_route": "xai-oauth/grok-4.5",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            attempts = root / "attempts"
+            attempts.mkdir()
+            output_name = "a" * 32 + ".evidence"
+            output = attempts / output_name
+
+            def execute(
+                command: list[str], *, timeout_seconds: float, pass_fds: tuple[int, ...]
+            ) -> dict[str, object]:
+                parent_fd = pass_fds[0]
+                os.mkdir(output_name, 0o700, dir_fd=parent_fd)
+                report_fd = os.open(
+                    f"{output_name}/suite-report.json",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(report_fd, b'{"marker":"trusted"}')
+                finally:
+                    os.close(report_fd)
+                seal_fd = os.open(
+                    f"{output_name}/SUITE_SEAL.json",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(seal_fd, b'{"schema":"test"}')
+                finally:
+                    os.close(seal_fd)
+                attempts.rename(root / "retained-attempts")
+                replacement = root / "attempts"
+                (replacement / output_name).mkdir(parents=True)
+                (replacement / output_name / "suite-report.json").write_text(
+                    '{"marker":"attacker"}', encoding="utf-8"
+                )
+                return {
+                    "timed_out": False,
+                    "returncode": 0,
+                    "diagnostic_sha256": "sha256:" + "0" * 64,
+                    "error_code": "campaign_controller_failed",
+                }
+
+            verified_markers: list[str] = []
+
+            def verify(
+                path: Path, *, seal_bytes: bytes, report_bytes: bytes
+            ) -> list[str]:
+                verified_markers.append(
+                    str(json.loads(report_bytes.decode("utf-8"))["marker"])
+                )
+                (path / "suite-report.json").write_text(
+                    '{"marker":"attacker-after-verify"}', encoding="utf-8"
+                )
+                self.assertEqual({"schema": "test"}, json.loads(seal_bytes))
+                return []
+
+            with patch(
+                "tools.agent_workflow._run_route_process", side_effect=execute
+            ), patch(
+                "tools.agent_workflow.verify_suite_seal", side_effect=verify
+            ):
+                report = runner(route, "qualification", output, "high")
+
+            self.assertEqual(["trusted"], verified_markers)
+            self.assertEqual("trusted", report["marker"])
 
     def test_route_failure_classifier_returns_actionable_sanitized_codes(self) -> None:
         cases = {
@@ -348,7 +518,10 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 (output / "suite-report.json").write_text(
                     json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
                 )
-                return report
+                returned_report = dict(report)
+                returned_report["campaign_suite_verified"] = True
+                returned_report["campaign_elapsed_seconds"] = 1.25
+                return returned_report
 
             self.assertEqual(
                 0,
@@ -403,6 +576,115 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 main(["verify", str(root)], suite_verifier=lambda _output: []),
             )
 
+            result_path = next((root / "qualification" / "results").glob("*.json"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            canonical = lambda value: "sha256:" + hashlib.sha256(
+                json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertTrue(result["campaign_suite_verified"])
+            self.assertGreaterEqual(result["campaign_elapsed_seconds"], 0)
+            valid_elapsed = result["campaign_elapsed_seconds"]
+            self.assertNotIn("campaign_suite_verified", result["suite_report"])
+            self.assertNotIn("campaign_elapsed_seconds", result["suite_report"])
+
+            result["suite_report"]["infrastructure_invalid_episodes"] = False
+            result["suite_report_sha256"] = canonical(result["suite_report"])
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+            result["suite_report"]["infrastructure_invalid_episodes"] = 0
+            result["suite_report_sha256"] = canonical(result["suite_report"])
+
+            result["campaign_suite_verified"] = False
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+
+            result["campaign_suite_verified"] = True
+            result["campaign_elapsed_seconds"] = -1
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+
+            result["campaign_elapsed_seconds"] = valid_elapsed
+            result["suite_report"]["campaign_suite_verified"] = result.pop(
+                "campaign_suite_verified"
+            )
+            result["suite_report"]["campaign_elapsed_seconds"] = result.pop(
+                "campaign_elapsed_seconds"
+            )
+            legacy_tree = (
+                "sha256:967445bec99f6df126ae5bbfd19cce47527f4cc50d78bd918ed8c339f8c99c68"
+            )
+            result["suite_report"]["release_tree_sha256"] = legacy_tree
+            sealed_path = Path(result["suite_output"]) / "suite-report.json"
+            sealed_report = json.loads(sealed_path.read_text(encoding="utf-8"))
+            sealed_report["release_tree_sha256"] = legacy_tree
+            sealed_path.write_text(json.dumps(sealed_report), encoding="utf-8")
+            result["suite_report_sha256"] = canonical(result["suite_report"])
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            attempt_id = result["attempt_id"]
+            event_path = root / "qualification/attempts" / f"{attempt_id}.completed.json"
+            event = json.loads(event_path.read_text(encoding="utf-8"))
+            event["result_receipt_sha256"] = result["receipt_sha256"]
+            unsigned_event = dict(event)
+            unsigned_event.pop("receipt_sha256")
+            event["receipt_sha256"] = canonical(unsigned_event)
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+
+            unsupported_tree = "sha256:" + "d" * 64
+            result["suite_report"]["release_tree_sha256"] = unsupported_tree
+            sealed_report["release_tree_sha256"] = unsupported_tree
+            sealed_path.write_text(json.dumps(sealed_report), encoding="utf-8")
+            result["suite_report_sha256"] = canonical(result["suite_report"])
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+
+            result["suite_report"]["campaign_suite_verified"] = False
+            result["suite_report_sha256"] = canonical(result["suite_report"])
+            unsigned_result = dict(result)
+            unsigned_result.pop("receipt_sha256")
+            result["receipt_sha256"] = canonical(unsigned_result)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(
+                2,
+                main(["verify", str(root)], suite_verifier=lambda _output: []),
+            )
+
     def test_blocked_unknown_cost_returns_distinct_nonzero_status(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
@@ -428,6 +710,8 @@ class AgentWorkflowCliTests(unittest.TestCase):
                     "infrastructure_invalid_episodes": 0,
                     "identity_source": "provider_response",
                     "controller_usage": {"api_calls": 34, "cost_usd": None},
+                    "campaign_suite_verified": True,
+                    "campaign_elapsed_seconds": 1.0,
                     "observations": [
                         {"runner_status": "completed", "reason_codes": []},
                         {"runner_status": "completed", "reason_codes": []},
@@ -495,7 +779,10 @@ class AgentWorkflowCliTests(unittest.TestCase):
                     json.dumps(report, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
-                return report
+                returned_report = dict(report)
+                returned_report["campaign_suite_verified"] = True
+                returned_report["campaign_elapsed_seconds"] = 1.0
+                return returned_report
 
             qualification_approval = self.signed_cli_approval(
                 root, stage="qualification", max_cost_usd=1.0, max_api_calls=68, max_routes=2

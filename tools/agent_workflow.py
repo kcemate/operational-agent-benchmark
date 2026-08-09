@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -13,12 +14,19 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from oab.agent_workflow import (
+    LEGACY_V221_RELEASE_TREE_SHA256,
+    _attempt_accounting,
     _canonical_sha256,
     _known_cost_from_report,
+    _open_directory_fd,
     _plan_bound_routes,
     _plan_reasoning_effort,
     _unknown_cost_api_calls_from_report,
+    _validate_campaign_orchestration_metadata,
     build_approval_preview,
     build_conversational_stage_approval,
     build_evidence_posture,
@@ -40,7 +48,10 @@ from oab.agent_workflow import (
 from oab.explain import explain_episode, format_explanation
 from oab.paths import benchmark_root
 from oab.suite_seal import verify_suite_seal
-from tools.run_calibration import run_calibration
+if __package__:
+    from .run_calibration import run_calibration
+else:
+    from tools.run_calibration import run_calibration
 
 ROOT = benchmark_root()
 
@@ -79,18 +90,30 @@ def _campaign_exit_code(state: Mapping[str, object]) -> int:
 
 
 def _run_route_process(
-    command: Sequence[str], *, timeout_seconds: int | float
+    command: Sequence[str],
+    *,
+    timeout_seconds: int | float,
+    pass_fds: Sequence[int] = (),
 ) -> dict[str, object]:
     """Run one route in an isolated process group and return sanitized status."""
 
     with tempfile.TemporaryFile() as diagnostic_stream:
-        process = subprocess.Popen(
-            list(command),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=diagnostic_stream,
-            start_new_session=os.name == "posix",
-        )
+        if os.name == "posix":
+            process = subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=diagnostic_stream,
+                start_new_session=True,
+                pass_fds=tuple(pass_fds),
+            )
+        else:
+            process = subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=diagnostic_stream,
+            )
         timed_out = False
         try:
             returncode = process.wait(timeout=timeout_seconds)
@@ -137,6 +160,58 @@ def _load_json_object(path: Path) -> dict[str, object]:
     return value
 
 
+def _read_regular_bytes_at(
+    directory_fd: int, name: str, *, max_bytes: int = 16 * 1024 * 1024
+) -> bytes:
+    if name in {"", ".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("json_input_file_unsafe")
+
+    def identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("json_input_invalid") from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError("json_input_file_unsafe")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError("json_input_invalid") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(before):
+            raise ValueError("json_input_file_race")
+        payload = bytearray()
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ValueError("json_input_too_large")
+        after_read = os.fstat(descriptor)
+        after_entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if identity(after_read) != identity(opened) or identity(after_entry) != identity(opened):
+            raise ValueError("json_input_file_race")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
 def _production_suite_runner(
     *,
     source_hermes_home: Path | None,
@@ -150,12 +225,22 @@ def _production_suite_runner(
     def run(route: dict[str, object], stage: str, output: Path, effort: str) -> dict[str, object]:
         provider = str(route.get("provider") or "")
         model = str(route.get("model") or "")
-        requested_route = str(route.get("requested_route") or "")
-        scheduled = 34 if stage == "qualification" else 80
+        if output.name in {"", ".", ".."} or "/" in output.name or "\\" in output.name:
+            raise ValueError("campaign_suite_output_invalid")
+        try:
+            output_parent_fd = _open_directory_fd(output.parent.expanduser().absolute())
+        except (OSError, ValueError) as exc:
+            raise ValueError("campaign_internal_path_unsafe") from exc
+
+        suite_module = (
+            f"{__package__}.run_suite"
+            if __package__ in {"tools", "oab_tools"}
+            else "tools.run_suite"
+        )
         command = [
             sys.executable,
             "-m",
-            "tools.run_suite",
+            suite_module,
             "--provider",
             provider,
             "--model",
@@ -165,6 +250,15 @@ def _production_suite_runner(
             "--output-root",
             str(output),
         ]
+        if os.name == "posix":
+            command.extend(
+                [
+                    "--output-parent-fd",
+                    str(output_parent_fd),
+                    "--output-name",
+                    output.name,
+                ]
+            )
         if stage == "qualification":
             command.extend(
                 [
@@ -204,51 +298,53 @@ def _production_suite_runner(
                 ]
             )
         started = time.monotonic()
-        execution = _run_route_process(command, timeout_seconds=timeout_seconds)
-        if execution["timed_out"] is True:
-            return {
-                "requested_route": requested_route,
-                "reasoning_effort": effort,
-                "scheduled_episodes": scheduled,
-                "infrastructure_valid_episodes": 0,
-                "infrastructure_invalid_episodes": scheduled,
-                "identity_source": None,
-                "controller_usage": {"api_calls": None, "cost_usd": None},
-                "diagnostic_sha256": execution["diagnostic_sha256"],
-                "observations": [
-                    {"runner_status": "runner_invalid", "reason_codes": ["campaign_route_timeout"]}
-                ],
-            }
-        report_path = output / "suite-report.json"
-        if execution["returncode"] not in {0, 2} or not report_path.is_file():
-            return {
-                "requested_route": requested_route,
-                "reasoning_effort": effort,
-                "scheduled_episodes": scheduled,
-                "infrastructure_valid_episodes": 0,
-                "infrastructure_invalid_episodes": scheduled,
-                "identity_source": None,
-                "controller_usage": {"api_calls": None, "cost_usd": None},
-                "diagnostic_sha256": execution["diagnostic_sha256"],
-                "observations": [
-                    {"runner_status": "runner_invalid", "reason_codes": [execution["error_code"]]}
-                ],
-            }
-        errors = verify_suite_seal(output)
-        if errors:
-            return {
-                "requested_route": requested_route,
-                "reasoning_effort": effort,
-                "scheduled_episodes": scheduled,
-                "infrastructure_valid_episodes": 0,
-                "infrastructure_invalid_episodes": scheduled,
-                "identity_source": None,
-                "controller_usage": {"api_calls": None, "cost_usd": None},
-                "observations": [
-                    {"runner_status": "runner_invalid", "reason_codes": ["campaign_suite_verification_failed"]}
-                ],
-            }
-        report = _load_json_object(report_path)
+        output_fd = -1
+        saved_cwd_fd = -1
+        try:
+            execution = _run_route_process(
+                command,
+                timeout_seconds=timeout_seconds,
+                pass_fds=(output_parent_fd,),
+            )
+            if execution["timed_out"] is True:
+                raise RuntimeError("campaign_route_timeout")
+            if execution["returncode"] not in {0, 2}:
+                raise RuntimeError(str(execution["error_code"]))
+            try:
+                output_fd = os.open(
+                    output.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=output_parent_fd,
+                )
+                report_bytes = _read_regular_bytes_at(output_fd, "suite-report.json")
+                seal_bytes = _read_regular_bytes_at(output_fd, "SUITE_SEAL.json")
+                saved_cwd_fd = os.open(
+                    ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                )
+                os.fchdir(output_fd)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("campaign_suite_verification_failed") from exc
+            errors = verify_suite_seal(
+                Path("."), seal_bytes=seal_bytes, report_bytes=report_bytes
+            )
+            if errors:
+                raise RuntimeError("campaign_suite_verification_failed")
+            try:
+                report_value = json.loads(report_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("campaign_suite_verification_failed") from exc
+            if not isinstance(report_value, dict):
+                raise RuntimeError("campaign_suite_verification_failed")
+            report = report_value
+        finally:
+            if saved_cwd_fd >= 0:
+                os.fchdir(saved_cwd_fd)
+                os.close(saved_cwd_fd)
+            if output_fd >= 0:
+                os.close(output_fd)
+            os.close(output_parent_fd)
         report["campaign_suite_verified"] = True
         report["campaign_elapsed_seconds"] = round(time.monotonic() - started, 3)
         return report
@@ -390,8 +486,24 @@ def _verify_campaign(
     suite_verifier: Callable[[Path], list[str]] = verify_suite_seal,
 ) -> dict[str, object]:
     root = root.expanduser().resolve(strict=True)
-    state = load_campaign(root)
     errors: list[str] = []
+    try:
+        state = load_campaign(root)
+    except ValueError as exc:
+        return {
+            "schema": "oab.campaign-verification/v1",
+            "valid": False,
+            "campaign_status": None,
+            "evidence_posture": "exploratory",
+            "release_authorized": False,
+            "authority_blockers": ["campaign_internal_path_unsafe"],
+            "route_authority": [],
+            "authority_remediation": None,
+            "checked_suites": 0,
+            "checked_approvals": 0,
+            "errors": [str(exc)],
+            "claim": "campaign layout rejected before artifact traversal",
+        }
     checked = 0
     checked_approvals = 0
     plan = _load_json_object(root / "PLAN.json")
@@ -429,6 +541,7 @@ def _verify_campaign(
             errors.append("calibration_receipt_digest_mismatch")
     spend = state.get("spend")
     spend_map = spend if isinstance(spend, Mapping) else {}
+    campaign_release_tree_sha256 = plan.get("release_tree_sha256")
     full_reports: list[dict[str, object]] = []
 
     for stage in ("qualification", "full"):
@@ -530,13 +643,14 @@ def _verify_campaign(
                     if approval.get("receipt_sha256") != approval_sha_value:
                         errors.append(f"{stage}:stage_approval_state_digest_mismatch")
 
-        expected_suites_root = (root / stage / "suites").resolve()
         seen_route_ids: list[str] = []
+        attempt_results: dict[str, dict[str, object]] = {}
         observed_calls_total = 0
         observed_cost_total = 0.0
         unknown_cost_seen = False
         for result_path in sorted(results_root.glob("*.json")):
             result = _load_json_object(result_path)
+            attempt_results[result_path.stem] = result
             unsigned_result = dict(result)
             recorded_result_digest = unsigned_result.pop("receipt_sha256", None)
             if recorded_result_digest != _canonical_sha256(unsigned_result):
@@ -572,10 +686,21 @@ def _verify_campaign(
             if not isinstance(suite_output, str):
                 errors.append(f"{stage}:suite_output_missing")
                 continue
-            output = Path(suite_output).expanduser().resolve()
-            if not output.is_relative_to(expected_suites_root):
+            attempt_id = result.get("attempt_id")
+            if (
+                isinstance(attempt_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", attempt_id) is not None
+            ):
+                expected_output = root / stage / "attempts" / f"{attempt_id}.evidence"
+            elif campaign_release_tree_sha256 == LEGACY_V221_RELEASE_TREE_SHA256:
+                expected_output = root / stage / "suites" / result_path.stem
+            else:
+                errors.append(f"{stage}:{result_path.stem}:campaign_attempt_ledger_invalid")
+                continue
+            if suite_output != str(expected_output):
                 errors.append(f"{stage}:{result_path.stem}:suite_output_outside_campaign")
                 continue
+            output = expected_output
             suite_errors = suite_verifier(output)
             checked += 1
             errors.extend(f"{stage}:{result_path.stem}:{code}" for code in suite_errors)
@@ -589,7 +714,44 @@ def _verify_campaign(
             if suite_report.get("requested_route") != result.get("requested_route"):
                 errors.append(f"{stage}:{result_path.stem}:suite_report_route_mismatch")
                 continue
-            if not isinstance(embedded_report, Mapping) or dict(embedded_report) != suite_report:
+            comparable_report = dict(embedded_report) if isinstance(embedded_report, Mapping) else None
+            legacy_metadata = comparable_report is not None and any(
+                key in comparable_report
+                for key in ("campaign_suite_verified", "campaign_elapsed_seconds")
+            )
+            top_level_metadata = any(
+                key in result
+                for key in ("campaign_suite_verified", "campaign_elapsed_seconds")
+            )
+            if legacy_metadata:
+                assert comparable_report is not None
+                if top_level_metadata:
+                    errors.append(
+                        f"{stage}:{result_path.stem}:campaign_metadata_layout_invalid"
+                    )
+                try:
+                    _validate_campaign_orchestration_metadata(comparable_report)
+                except ValueError:
+                    errors.append(f"{stage}:{result_path.stem}:legacy_campaign_metadata_invalid")
+                if (
+                    comparable_report.get("release_tree_sha256")
+                    != LEGACY_V221_RELEASE_TREE_SHA256
+                    or campaign_release_tree_sha256
+                    != LEGACY_V221_RELEASE_TREE_SHA256
+                ):
+                    errors.append(
+                        f"{stage}:{result_path.stem}:legacy_campaign_release_invalid"
+                    )
+                comparable_report.pop("campaign_suite_verified", None)
+                comparable_report.pop("campaign_elapsed_seconds", None)
+            else:
+                try:
+                    _validate_campaign_orchestration_metadata(result)
+                except ValueError:
+                    errors.append(f"{stage}:{result_path.stem}:campaign_metadata_invalid")
+            if comparable_report is None or _canonical_sha256(
+                comparable_report
+            ) != _canonical_sha256(suite_report):
                 errors.append(f"{stage}:{result_path.stem}:result_report_mismatch")
             report_usage = suite_report.get("controller_usage")
             report_usage_map = report_usage if isinstance(report_usage, Mapping) else {}
@@ -605,6 +767,44 @@ def _verify_campaign(
                 errors.append(f"{stage}:{result_path.stem}:result_unknown_cost_calls_mismatch")
             if stage == "full":
                 full_reports.append(suite_report)
+
+        try:
+            attempt_accounting = _attempt_accounting(
+                root,
+                stage,
+                attempt_results,
+                require_ledger=(
+                    campaign_release_tree_sha256
+                    != LEGACY_V221_RELEASE_TREE_SHA256
+                ),
+            )
+        except ValueError as exc:
+            errors.append(f"{stage}:{exc}")
+        else:
+            failed_calls = attempt_accounting.get("failed_reserved_api_calls")
+            failed_attempts = attempt_accounting.get("failed_attempts")
+            if not isinstance(failed_calls, int) or not isinstance(failed_attempts, int):
+                errors.append(f"{stage}:campaign_attempt_ledger_invalid")
+            else:
+                observed_calls_total += failed_calls
+                unknown_cost_seen = unknown_cost_seen or bool(
+                    attempt_accounting.get("unknown_cost_encountered")
+                )
+                failed_calls_field = (
+                    "qualification_failed_attempt_reserved_api_calls"
+                    if stage == "qualification"
+                    else "full_failed_attempt_reserved_api_calls"
+                )
+                failed_attempts_field = (
+                    "qualification_failed_attempts"
+                    if stage == "qualification"
+                    else "full_failed_attempts"
+                )
+                if list((root / stage / "attempts").glob("*.json")) and (
+                    spend_map.get(failed_calls_field) != failed_calls
+                    or spend_map.get(failed_attempts_field) != failed_attempts
+                ):
+                    errors.append(f"{stage}:campaign_attempt_state_mismatch")
 
         if approval_values_valid:
             expected_route_set = set(cast(list[str], approved_route_ids))

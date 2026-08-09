@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import ctypes.util
+import contextvars
+import functools
 import hashlib
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
+import secrets
+import shlex
 import shutil
 import stat
+import subprocess
 import sys
-import tempfile
 import urllib.parse
 import urllib.request
 from cryptography.exceptions import InvalidSignature
@@ -20,6 +25,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+_ACTIVE_CAMPAIGN_DIRECTORIES: contextvars.ContextVar[dict[Path, int] | None] = (
+    contextvars.ContextVar("oab_active_campaign_directories", default=None)
+)
 
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _COST_CONTROL_MODE = "post_provider_call_observed_known_cost_stop"
@@ -42,6 +51,10 @@ _EFFORT_REASON_CODES = {
     "reasoning_effort_unattested",
     "reasoning_effort_unsupported",
 }
+
+LEGACY_V221_RELEASE_TREE_SHA256 = (
+    "sha256:967445bec99f6df126ae5bbfd19cce47527f4cc50d78bd918ed8c339f8c99c68"
+)
 
 
 def _utc_now() -> str:
@@ -67,6 +80,67 @@ def _canonical_sha256(payload: Mapping[str, object]) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
+def _validate_campaign_orchestration_metadata(
+    payload: Mapping[str, object], *, required: bool = True
+) -> dict[str, object] | None:
+    has_verified = "campaign_suite_verified" in payload
+    has_elapsed = "campaign_elapsed_seconds" in payload
+    if not has_verified and not has_elapsed and not required:
+        return None
+    verified = payload.get("campaign_suite_verified")
+    elapsed = payload.get("campaign_elapsed_seconds")
+    if (
+        not has_verified
+        or not has_elapsed
+        or verified is not True
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+    ):
+        raise ValueError("campaign_orchestration_metadata_invalid")
+    try:
+        elapsed_value = float(elapsed)
+    except (OverflowError, ValueError):
+        raise ValueError("campaign_orchestration_metadata_invalid") from None
+    if not math.isfinite(elapsed_value) or elapsed_value < 0:
+        raise ValueError("campaign_orchestration_metadata_invalid")
+    return {
+        "campaign_suite_verified": True,
+        "campaign_elapsed_seconds": elapsed_value,
+    }
+
+
+def _normalize_campaign_result_report(
+    result: Mapping[str, object],
+    sealed_report: Mapping[str, object],
+    *,
+    campaign_release_tree_sha256: object,
+) -> tuple[dict[str, object], dict[str, object]]:
+    embedded = result.get("suite_report")
+    if not isinstance(embedded, Mapping):
+        raise ValueError("campaign_stage_result_report_mismatch")
+    comparable = dict(embedded)
+    keys = ("campaign_suite_verified", "campaign_elapsed_seconds")
+    legacy_metadata = any(key in comparable for key in keys)
+    top_level_metadata = any(key in result for key in keys)
+    if legacy_metadata:
+        if top_level_metadata:
+            raise ValueError("campaign_orchestration_metadata_invalid")
+        metadata = _validate_campaign_orchestration_metadata(comparable)
+        if (
+            comparable.get("release_tree_sha256") != LEGACY_V221_RELEASE_TREE_SHA256
+            or campaign_release_tree_sha256 != LEGACY_V221_RELEASE_TREE_SHA256
+        ):
+            raise ValueError("campaign_legacy_receipt_release_invalid")
+        for key in keys:
+            comparable.pop(key, None)
+    else:
+        metadata = _validate_campaign_orchestration_metadata(result)
+    assert metadata is not None
+    if _canonical_bytes(comparable) != _canonical_bytes(dict(sealed_report)):
+        raise ValueError("campaign_stage_result_report_mismatch")
+    return dict(sealed_report), metadata
+
+
 def _plan_sha256(plan: Mapping[str, object]) -> str:
     stable = {
         key: value
@@ -86,44 +160,130 @@ def _clean_model(value: object) -> str | None:
     return text if _MODEL_RE.fullmatch(text) else None
 
 
+def _open_directory_fd(path: Path) -> int:
+    absolute = path.expanduser().absolute()
+    if (
+        sys.platform == "darwin"
+        and len(absolute.parts) > 1
+        and absolute.parts[1] in {"etc", "tmp", "var"}
+    ):
+        absolute = Path("/private").joinpath(*absolute.parts[1:])
+    if not absolute.is_absolute() or any(part == ".." for part in absolute.parts):
+        raise ValueError("campaign_internal_path_unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    active = _ACTIVE_CAMPAIGN_DIRECTORIES.get()
+    descriptor = -1
+    remaining_parts = absolute.parts[1:]
+    if active:
+        candidates: list[tuple[int, Path, int]] = []
+        for base, base_fd in active.items():
+            try:
+                relative = absolute.relative_to(base)
+            except ValueError:
+                continue
+            candidates.append((len(base.parts), relative, base_fd))
+        if candidates:
+            _, relative, base_fd = max(candidates, key=lambda candidate: candidate[0])
+            descriptor = os.dup(base_fd)
+            remaining_parts = relative.parts
+    if descriptor < 0:
+        descriptor = os.open(absolute.anchor, flags)
+    try:
+        for part in remaining_parts:
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError("campaign_internal_path_unsafe")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    if _ACTIVE_CAMPAIGN_DIRECTORIES.get() is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        parent_fd = _open_directory_fd(path.parent)
+    except OSError as exc:
+        raise ValueError("campaign_internal_path_unsafe") from exc
+    temporary_name = f".{path.name}.{secrets.token_hex(16)}"
+    temporary_fd = -1
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written <= 0:
+                raise OSError("short atomic write")
+            view = view[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise ValueError("campaign_internal_path_unsafe") from exc
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
+
+
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
         + "\n"
     ).encode("utf-8")
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-
-
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    _atomic_bytes(path, encoded)
 
 
 def _read_single_link_regular_bytes(
     path: Path, *, error: str, max_bytes: int = 1024 * 1024
 ) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = -1
+    if path.name in {"", ".", ".."} or "/" in path.name or "\\" in path.name:
+        raise ValueError(error)
     try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
+        parent_fd = _open_directory_fd(path.parent)
+        descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+    except (OSError, ValueError) as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise ValueError(error) from exc
+    os.close(parent_fd)
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
             raise ValueError(error)
+        identity = (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
         chunks: list[bytes] = []
         remaining = max_bytes + 1
         while remaining > 0:
@@ -134,6 +294,17 @@ def _read_single_link_regular_bytes(
             remaining -= len(chunk)
         data = b"".join(chunks)
         if len(data) > max_bytes:
+            raise ValueError(error)
+        final_info = os.fstat(descriptor)
+        if identity != (
+            final_info.st_dev,
+            final_info.st_ino,
+            final_info.st_mode,
+            final_info.st_nlink,
+            final_info.st_size,
+            final_info.st_mtime_ns,
+            final_info.st_ctime_ns,
+        ):
             raise ValueError(error)
         return data
     finally:
@@ -150,6 +321,187 @@ def _read_regular_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("campaign_state_invalid")
     return value
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_regular_json_at(directory_fd: int, name: str) -> dict[str, Any]:
+    if not name or name != Path(name).name or name in {".", ".."}:
+        raise ValueError("campaign_state_file_unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError("campaign_state_file_unsafe") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > 1024 * 1024
+        ):
+            raise ValueError("campaign_state_file_unsafe")
+        chunks: list[bytes] = []
+        remaining = 1024 * 1024 + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > 1024 * 1024 or _stat_identity(os.fstat(descriptor)) != _stat_identity(before):
+            raise ValueError("campaign_state_file_unsafe")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("campaign_state_invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError("campaign_state_invalid")
+    return value
+
+
+def _read_json_directory_fd(
+    directory_fd: int, *, suffix: str
+) -> list[tuple[str, dict[str, Any]]]:
+    before = _stat_identity(os.fstat(directory_fd))
+    names = sorted(name for name in os.listdir(directory_fd) if name.endswith(suffix))
+    values = [(name, _read_regular_json_at(directory_fd, name)) for name in names]
+    if _stat_identity(os.fstat(directory_fd)) != before:
+        raise ValueError("campaign_internal_path_unsafe")
+    return values
+
+
+_CAMPAIGN_INTERNAL_DIRECTORIES = (
+    Path("APPROVALS"),
+    Path("qualification"),
+    Path("qualification/results"),
+    Path("qualification/suites"),
+    Path("qualification/attempts"),
+    Path("full"),
+    Path("full/results"),
+    Path("full/suites"),
+    Path("full/attempts"),
+)
+
+
+def _open_campaign_directory_fd(root: Path, relative: Path, *, create: bool) -> int:
+    """Open and return a campaign directory descriptor without following links."""
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("campaign_internal_path_unsafe")
+    if _ACTIVE_CAMPAIGN_DIRECTORIES.get() is not None:
+        try:
+            return _open_directory_fd(root / relative)
+        except (OSError, ValueError) as exc:
+            raise ValueError("campaign_internal_path_unsafe") from exc
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = _open_directory_fd(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("campaign_internal_path_unsafe") from exc
+    try:
+        root_info = os.fstat(descriptor)
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise ValueError("campaign_internal_path_unsafe")
+        for part in relative.parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ValueError("campaign_internal_path_unsafe") from exc
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError as exc:
+                raise ValueError("campaign_internal_path_unsafe") from exc
+            except OSError as exc:
+                raise ValueError("campaign_internal_path_unsafe") from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("campaign_internal_path_unsafe")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _trusted_campaign_root(root: Path) -> Path:
+    """Bind a caller-supplied lexical campaign root without following a final link."""
+    lexical_root = root.expanduser().absolute()
+    try:
+        root_info = os.lstat(lexical_root)
+        checked_root = lexical_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("campaign_internal_path_unsafe") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise ValueError("campaign_internal_path_unsafe")
+    return checked_root
+
+
+def _validate_campaign_layout(root: Path, *, create: bool = False) -> None:
+    """Reject link-mediated campaign parents and optionally create all trusted parents."""
+    checked_root = _trusted_campaign_root(root)
+    for relative in _CAMPAIGN_INTERNAL_DIRECTORIES:
+        descriptor = _open_campaign_directory_fd(
+            checked_root, relative, create=create
+        )
+        os.close(descriptor)
+
+
+def _campaign_operation(function: Any) -> Any:
+    """Retain trusted campaign-directory descriptors for one complete operation."""
+
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if args:
+            supplied_root = Path(args[0])
+        elif "output_root" in kwargs:
+            supplied_root = Path(kwargs["output_root"])
+        else:
+            raise TypeError("campaign operation requires output_root")
+        if _ACTIVE_CAMPAIGN_DIRECTORIES.get() is not None:
+            return function(*args, **kwargs)
+        checked_root = _trusted_campaign_root(supplied_root)
+        descriptors: dict[Path, int] = {}
+        token: contextvars.Token[dict[Path, int] | None] | None = None
+        try:
+            descriptors[checked_root] = _open_directory_fd(checked_root)
+            token = _ACTIVE_CAMPAIGN_DIRECTORIES.set(descriptors)
+            for relative in _CAMPAIGN_INTERNAL_DIRECTORIES:
+                descriptors[checked_root / relative] = _open_campaign_directory_fd(
+                    checked_root, relative, create=False
+                )
+            if args:
+                return function(checked_root, *args[1:], **kwargs)
+            bound_kwargs = dict(kwargs)
+            bound_kwargs["output_root"] = checked_root
+            return function(**bound_kwargs)
+        finally:
+            if token is not None:
+                _ACTIVE_CAMPAIGN_DIRECTORIES.reset(token)
+            for descriptor in descriptors.values():
+                os.close(descriptor)
+
+    return wrapped
 
 
 class _RejectInventoryRedirects(urllib.request.HTTPRedirectHandler):
@@ -170,6 +522,191 @@ def _open_inventory_request(
 ) -> Any:
     opener = urllib.request.build_opener(_RejectInventoryRedirects())
     return opener.open(request, timeout=timeout)
+
+
+def _bounded_hermes_exec_target(executable_text: str) -> Path | None:
+    """Parse one inert shell wrapper whose only action is an absolute exec."""
+    target: Path | None = None
+    for raw_line in executable_text.splitlines()[1:]:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            return None
+        if target is None and words[:1] == ["unset"]:
+            variables = words[1:]
+            if variables and set(variables) <= {"PYTHONPATH", "PYTHONHOME"}:
+                continue
+            return None
+        if target is None and len(words) == 3 and words[0] == "exec" and words[2] == "$@":
+            candidate = Path(words[1])
+            if not candidate.is_absolute():
+                return None
+            target = candidate
+            continue
+        return None
+    return target
+
+
+def _is_single_link_regular_path(path: Path) -> bool:
+    parent_fd = -1
+    descriptor = -1
+    try:
+        parent_fd = _open_directory_fd(path.parent)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        before = _stat_identity(os.fstat(descriptor))
+        info = os.fstat(descriptor)
+        return (
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and _stat_identity(os.fstat(descriptor)) == before
+        )
+    except (OSError, ValueError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _trusted_hermes_sibling_python(path: Path, executable: Path) -> Path | None:
+    """Resolve only the bounded venv-python link chain into Hermes' pinned runtime."""
+    if _is_single_link_regular_path(path):
+        return path
+    expected_root = executable.parents[2] / ".hermes-runtime" / "python"
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(expected_root)
+    except (OSError, ValueError):
+        return None
+    return path if _is_single_link_regular_path(resolved) else None
+
+
+def _hermes_python_command_from_path(
+    executable: Path, *, allow_exec_wrapper: bool
+) -> list[str] | None:
+    try:
+        executable_bytes = _read_single_link_regular_bytes(
+            executable,
+            error="hermes_executable_unsafe",
+            max_bytes=4096,
+        )
+        executable_text = executable_bytes.decode("utf-8")
+        shebang = executable_text.splitlines()[0]
+    except (ValueError, UnicodeDecodeError, IndexError):
+        return None
+    if not shebang.startswith("#!"):
+        return None
+    try:
+        words = shlex.split(shebang[2:].strip())
+    except ValueError:
+        return None
+    if not words:
+        return None
+    interpreter = Path(words[0])
+    if interpreter.name == "env":
+        env_program = next((word for word in words[1:] if not word.startswith("-")), "")
+        env_program_name = Path(env_program).name
+        sibling = executable.parent / "python"
+        trusted_sibling = _trusted_hermes_sibling_python(sibling, executable)
+        if env_program_name in {"python", "python3"} and trusted_sibling is not None:
+            return [str(trusted_sibling)]
+        if allow_exec_wrapper and env_program_name in {"sh", "bash", "dash", "zsh"}:
+            target = _bounded_hermes_exec_target(executable_text)
+            if target is not None:
+                return _hermes_python_command_from_path(target, allow_exec_wrapper=False)
+        return None
+    if interpreter.name in {"sh", "bash", "dash", "zsh"}:
+        for name in ("python3", "python"):
+            sibling = executable.parent / name
+            trusted_sibling = _trusted_hermes_sibling_python(sibling, executable)
+            if "hermes_cli" in executable_text and trusted_sibling is not None:
+                return [str(trusted_sibling)]
+        if allow_exec_wrapper:
+            target = _bounded_hermes_exec_target(executable_text)
+            if target is not None:
+                return _hermes_python_command_from_path(target, allow_exec_wrapper=False)
+        return None
+    return words if _is_single_link_regular_path(interpreter) else None
+
+
+def _hermes_python_command(hermes_path: str | None) -> list[str] | None:
+    if not hermes_path:
+        return None
+    return _hermes_python_command_from_path(
+        Path(hermes_path).expanduser(), allow_exec_wrapper=True
+    )
+
+
+def _hermes_inventory_bridge_available(hermes_path: str | None) -> bool:
+    command = _hermes_python_command(hermes_path)
+    if command is None:
+        return False
+    try:
+        completed = subprocess.run(
+            [*command, "-c", "import hermes_cli.inventory"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _load_inventory_via_hermes_python(hermes_path: str | None) -> dict[str, object]:
+    command = _hermes_python_command(hermes_path)
+    if command is None:
+        raise RuntimeError("hermes_inventory_unavailable")
+    bridge = """
+import json
+from hermes_cli.inventory import build_models_payload, load_picker_context
+payload = build_models_payload(
+    load_picker_context(),
+    explicit_only=True,
+    include_unconfigured=False,
+    picker_hints=False,
+    canonical_order=True,
+    pricing=False,
+    capabilities=True,
+    featured=False,
+    refresh=False,
+    probe_custom_providers=False,
+    probe_current_custom_provider=False,
+    for_picker=False,
+    max_models=2048,
+)
+print(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+"""
+    try:
+        completed = subprocess.run(
+            [*command, "-c", bridge],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("hermes_inventory_unavailable") from exc
+    if completed.returncode != 0 or len(completed.stdout) > 2_000_000:
+        raise RuntimeError("hermes_inventory_unavailable")
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("hermes_inventory_invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("hermes_inventory_invalid")
+    return payload
 
 
 def load_hermes_inventory(
@@ -253,6 +790,8 @@ def load_hermes_inventory(
         try:
             from hermes_cli.inventory import build_models_payload, load_picker_context
         except ImportError as exc:
+            if context_loader is None and payload_builder is None:
+                return _load_inventory_via_hermes_python(shutil.which("hermes"))
             raise RuntimeError("hermes_inventory_unavailable") from exc
         context_loader = context_loader or load_picker_context
         payload_builder = payload_builder or build_models_payload
@@ -308,9 +847,11 @@ def doctor_environment(
 
     if release_manifest_errors is None:
         try:
-            from tools.release_manifest import verify_release_manifest
-
-            release_manifest_errors = verify_release_manifest(
+            try:
+                manifest_module = importlib.import_module("oab_tools.release_manifest")
+            except ModuleNotFoundError:
+                manifest_module = importlib.import_module("tools.release_manifest")
+            release_manifest_errors = manifest_module.verify_release_manifest(
                 root,
                 root / "RELEASE_MANIFEST.json",
                 expected_tree_sha256=expected_release_tree_sha256,
@@ -334,10 +875,16 @@ def doctor_environment(
                 inventory_available = importlib.util.find_spec("hermes_cli.inventory") is not None
             except (ImportError, ModuleNotFoundError, ValueError):
                 inventory_available = False
+            if not inventory_available:
+                inventory_available = _hermes_inventory_bridge_available(hermes_path)
         add(
             "hermes_inventory",
             bool(inventory_available),
-            "available" if inventory_available else "module not importable from this Python environment",
+            (
+                "available"
+                if inventory_available
+                else "unavailable from this Python environment and Hermes executable"
+            ),
         )
 
     if system in {"darwin", "macos"}:
@@ -648,6 +1195,10 @@ def classify_qualification(
     requested_route: str,
     reasoning_effort: str,
 ) -> dict[str, object]:
+    try:
+        orchestration_metadata = _validate_campaign_orchestration_metadata(report)
+    except ValueError:
+        orchestration_metadata = None
     reasons = _reason_codes(report)
     usage = report.get("controller_usage")
     usage_map = usage if isinstance(usage, Mapping) else {}
@@ -673,10 +1224,9 @@ def classify_qualification(
         and raw_unknown_calls >= 0
         else (0 if observed_cost is not None else None)
     )
-    raw_duration = report.get("campaign_elapsed_seconds")
     observed_duration = (
-        float(raw_duration)
-        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool) and raw_duration >= 0
+        orchestration_metadata["campaign_elapsed_seconds"]
+        if orchestration_metadata is not None
         else None
     )
     base: dict[str, object] = {
@@ -711,6 +1261,9 @@ def classify_qualification(
         return base
     if "provider_unavailable" in reasons:
         base["status"] = "provider_unavailable"
+        return base
+    if orchestration_metadata is None:
+        base["status"] = "qualification_contract_invalid"
         return base
     scheduled = report.get("scheduled_episodes")
     valid = report.get("infrastructure_valid_episodes")
@@ -754,6 +1307,7 @@ def initialize_campaign(
     ):
         raise ValueError("campaign_and_benchmark_must_be_disjoint")
     root.mkdir(parents=True, exist_ok=False)
+    _validate_campaign_layout(root, create=True)
     discovery = sanitize_hermes_inventory(inventory_payload)
     release_tree = doctor.get("release_tree_sha256")
     plan = build_campaign_plan(
@@ -790,8 +1344,10 @@ def initialize_campaign(
     return state
 
 
+@_campaign_operation
 def load_campaign(output_root: Path, *, expected_reasoning_effort: str | None = None) -> dict[str, Any]:
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
+    _validate_campaign_layout(root)
     state = _read_regular_json(root / "CAMPAIGN.json")
     if state.get("schema") != "oab.campaign/v1":
         raise ValueError("campaign_schema_invalid")
@@ -800,8 +1356,9 @@ def load_campaign(output_root: Path, *, expected_reasoning_effort: str | None = 
     return state
 
 
+@_campaign_operation
 def record_calibration(output_root: Path, report: Mapping[str, object]) -> dict[str, Any]:
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
     state = load_campaign(root)
     if report.get("schema") not in {
         "oab.calibration-report/v1",
@@ -916,11 +1473,235 @@ def _result_path(root: Path, stage: str, route_id: str) -> Path:
     return root / stage / "results" / f"{route_id}.json"
 
 
+def _attempt_event_path(root: Path, stage: str, attempt_id: str, event: str) -> Path:
+    return root / stage / "attempts" / f"{attempt_id}.{event}.json"
+
+
+def _attempt_evidence_path(root: Path, stage: str, attempt_id: str) -> Path:
+    return root / stage / "attempts" / f"{attempt_id}.evidence"
+
+
+def _write_attempt_event(
+    root: Path,
+    stage: str,
+    attempt_id: str,
+    event: str,
+    body: Mapping[str, object],
+) -> dict[str, object]:
+    if stage not in {"qualification", "full"} or event not in {
+        "reserved",
+        "completed",
+        "failed",
+    }:
+        raise ValueError("campaign_attempt_event_invalid")
+    receipt: dict[str, object] = {
+        "schema": "oab.campaign-attempt/v1",
+        "created_at": _utc_now(),
+        "stage": stage,
+        "attempt_id": attempt_id,
+        "event": event,
+        **dict(body),
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    _atomic_json(_attempt_event_path(root, stage, attempt_id, event), receipt)
+    return receipt
+
+
+def _attempt_accounting(
+    root: Path,
+    stage: str,
+    results: Mapping[str, Mapping[str, object]],
+    *,
+    require_ledger: bool,
+) -> dict[str, object]:
+    events: dict[str, dict[str, dict[str, Any]]] = {}
+    attempts_fd = _open_campaign_directory_fd(
+        root, Path(stage) / "attempts", create=False
+    )
+    try:
+        attempt_events = _read_json_directory_fd(attempts_fd, suffix=".json")
+    finally:
+        os.close(attempts_fd)
+    for event_name_on_disk, event in attempt_events:
+        receipt_sha256 = event.get("receipt_sha256")
+        unsigned = dict(event)
+        unsigned.pop("receipt_sha256", None)
+        attempt_id = event.get("attempt_id")
+        event_name = event.get("event")
+        if (
+            event.get("schema") != "oab.campaign-attempt/v1"
+            or event.get("stage") != stage
+            or not isinstance(attempt_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+            or event_name not in {"reserved", "completed", "failed"}
+            or event_name_on_disk != f"{attempt_id}.{event_name}.json"
+            or receipt_sha256 != _canonical_sha256(unsigned)
+        ):
+            raise ValueError("campaign_attempt_ledger_invalid")
+        by_event = events.setdefault(attempt_id, {})
+        if str(event_name) in by_event:
+            raise ValueError("campaign_attempt_ledger_invalid")
+        by_event[str(event_name)] = event
+
+    result_by_attempt: dict[str, Mapping[str, object]] = {}
+    unbound_results = 0
+    for result in results.values():
+        attempt_id = result.get("attempt_id")
+        if not isinstance(attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
+            unbound_results += 1
+            continue
+        if attempt_id in result_by_attempt:
+            raise ValueError("campaign_attempt_ledger_invalid")
+        result_by_attempt[attempt_id] = result
+    if unbound_results and (require_ledger or events):
+        raise ValueError("campaign_attempt_ledger_invalid")
+    if require_ledger and results and not events:
+        raise ValueError("campaign_attempt_ledger_invalid")
+    approval_digests: set[str] = set()
+    approvals_fd = _open_campaign_directory_fd(root, Path("APPROVALS"), create=False)
+    try:
+        approvals = _read_json_directory_fd(approvals_fd, suffix=".json")
+    finally:
+        os.close(approvals_fd)
+    for _approval_name, approval in approvals:
+        approval_digest = approval.get("receipt_sha256")
+        unsigned_approval = dict(approval)
+        unsigned_approval.pop("receipt_sha256", None)
+        if (
+            approval.get("schema")
+            not in {"oab.stage-approval/v4", "oab.conversational-stage-approval/v2"}
+            or not isinstance(approval_digest, str)
+            or approval_digest != _canonical_sha256(unsigned_approval)
+        ):
+            raise ValueError("campaign_attempt_approval_invalid")
+        approval_digests.add(approval_digest)
+    if set(result_by_attempt) - set(events):
+        raise ValueError("campaign_attempt_ledger_invalid")
+    failed_reserved_calls = 0
+    failed_attempts = 0
+    open_attempt_ids_by_route: dict[str, list[str]] = {}
+    for attempt_id, by_event in events.items():
+        reservation = by_event.get("reserved")
+        if reservation is None or (
+            "completed" in by_event and "failed" in by_event
+        ):
+            raise ValueError("campaign_attempt_ledger_invalid")
+        route_id = reservation.get("route_id")
+        reserved_calls = reservation.get("reserved_api_calls")
+        approval_sha256 = reservation.get("approval_sha256")
+        if (
+            not isinstance(route_id, str)
+            or not route_id
+            or not isinstance(reserved_calls, int)
+            or isinstance(reserved_calls, bool)
+            or reserved_calls < 1
+            or not isinstance(approval_sha256, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", approval_sha256) is None
+            or approval_sha256 not in approval_digests
+        ):
+            raise ValueError("campaign_attempt_ledger_invalid")
+        result = result_by_attempt.get(attempt_id)
+        completion = by_event.get("completed")
+        if completion is not None:
+            if (
+                result is None
+                or completion.get("reservation_sha256") != reservation.get("receipt_sha256")
+                or completion.get("result_receipt_sha256") != result.get("receipt_sha256")
+            ):
+                raise ValueError("campaign_attempt_ledger_invalid")
+        if result is not None:
+            if completion is None or result.get("route_id") != route_id:
+                raise ValueError("campaign_attempt_ledger_invalid")
+            continue
+        failure = by_event.get("failed")
+        if failure is not None and failure.get("reservation_sha256") != reservation.get(
+            "receipt_sha256"
+        ):
+            raise ValueError("campaign_attempt_ledger_invalid")
+        failed_reserved_calls += reserved_calls
+        failed_attempts += 1
+        open_attempt_ids_by_route.setdefault(route_id, []).append(attempt_id)
+    return {
+        "failed_reserved_api_calls": failed_reserved_calls,
+        "failed_attempts": failed_attempts,
+        "unknown_cost_encountered": failed_attempts > 0,
+        "open_attempt_ids_by_route": open_attempt_ids_by_route,
+    }
+
+
+def _require_monotonic_attempt_accounting(
+    state: Mapping[str, object],
+    *,
+    reserved_key: str,
+    attempts_key: str,
+    failed_reserved_calls: int,
+    failed_attempts: int,
+) -> None:
+    spend = state.get("spend")
+    spend_state = spend if isinstance(spend, Mapping) else {}
+    previous_reserved = spend_state.get(reserved_key, 0)
+    previous_attempts = spend_state.get(attempts_key, 0)
+    if (
+        not isinstance(previous_reserved, int)
+        or isinstance(previous_reserved, bool)
+        or previous_reserved < 0
+        or not isinstance(previous_attempts, int)
+        or isinstance(previous_attempts, bool)
+        or previous_attempts < 0
+        or failed_reserved_calls < previous_reserved
+        or failed_attempts < previous_attempts
+    ):
+        raise ValueError("campaign_attempt_ledger_invalid")
+
+
+def _quarantine_partial_suite(
+    root: Path, stage: str, route_id: str, attempt_id: str
+) -> str | None:
+    """Return attempt-owned evidence in place; never rename a pathname after validation."""
+    evidence = _attempt_evidence_path(root, stage, attempt_id)
+    try:
+        info = os.lstat(evidence)
+    except FileNotFoundError:
+        legacy_suite = root / stage / "suites" / route_id
+        if legacy_suite.exists() or legacy_suite.is_symlink():
+            raise ValueError("campaign_partial_suite_unsafe")
+        return None
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ValueError("campaign_partial_suite_unsafe")
+    return str(evidence)
+
+
+def _recover_preexisting_partial_suite(
+    root: Path,
+    stage: str,
+    route_id: str,
+    attempt_accounting: Mapping[str, object],
+) -> None:
+    del attempt_accounting
+    legacy_suite = root / stage / "suites" / route_id
+    if legacy_suite.exists() or legacy_suite.is_symlink():
+        # Historical fixed-name partial outputs cannot be moved safely under an
+        # adversarial same-user rename race. Preserve them in place and stop.
+        raise ValueError("campaign_unledgered_partial_suite")
+
+
+def _safe_attempt_failure_code(exc: BaseException) -> str:
+    rendered = str(exc)
+    if re.fullmatch(r"campaign_[a-z0-9_]+", rendered):
+        return rendered
+    return f"campaign_runner_{type(exc).__name__.lower()}"
+
+
 def _stage_result_receipt(
     body: Mapping[str, object], report: Mapping[str, object]
 ) -> dict[str, object]:
     receipt = dict(body)
     suite_report = dict(report)
+    orchestration_metadata = _validate_campaign_orchestration_metadata(suite_report)
+    assert orchestration_metadata is not None
+    suite_report.pop("campaign_suite_verified")
+    suite_report.pop("campaign_elapsed_seconds")
+    receipt.update(orchestration_metadata)
     receipt["suite_report"] = suite_report
     receipt["suite_report_sha256"] = _canonical_sha256(suite_report)
     receipt["receipt_sha256"] = _canonical_sha256(receipt)
@@ -933,13 +1714,28 @@ def _load_stage_results(
     routes: Sequence[Mapping[str, object]],
     *,
     reasoning_effort: str,
+    campaign_release_tree_sha256: object,
 ) -> dict[str, dict[str, Any]]:
+    selected_route_ids = {str(route.get("route_id") or "") for route in routes}
+    results_fd = _open_campaign_directory_fd(
+        root, Path(stage) / "results", create=False
+    )
+    try:
+        result_entries = _read_json_directory_fd(results_fd, suffix=".json")
+    finally:
+        os.close(results_fd)
+    result_payloads = {name: payload for name, payload in result_entries}
+    existing_route_ids = {Path(name).stem for name in result_payloads}
+    if not existing_route_ids.issubset(selected_route_ids):
+        # A resumed stage may not narrow its route scope around already-billed
+        # completed attempts. Doing so would omit those calls from accounting.
+        raise ValueError("campaign_stage_result_scope_mismatch")
     results: dict[str, dict[str, Any]] = {}
     for route in routes:
         route_id = str(route.get("route_id") or "")
-        path = _result_path(root, stage, route_id)
-        if path.exists() or path.is_symlink():
-            result = _read_regular_json(path)
+        result_name = f"{route_id}.json"
+        if result_name in result_payloads:
+            result = result_payloads[result_name]
             if result.get("route_id") != route_id or result.get("requested_route") != route.get("requested_route"):
                 raise ValueError("campaign_stage_result_route_mismatch")
             receipt_sha256 = result.get("receipt_sha256")
@@ -947,24 +1743,51 @@ def _load_stage_results(
             unsigned.pop("receipt_sha256", None)
             if receipt_sha256 != _canonical_sha256(unsigned):
                 raise ValueError("campaign_stage_result_receipt_digest_mismatch")
-            suite_report = result.get("suite_report")
-            if not isinstance(suite_report, Mapping) or result.get(
+            embedded_report = result.get("suite_report")
+            if not isinstance(embedded_report, Mapping) or result.get(
                 "suite_report_sha256"
-            ) != _canonical_sha256(suite_report):
+            ) != _canonical_sha256(embedded_report):
                 raise ValueError("campaign_stage_result_report_digest_mismatch")
-            expected_suite_output = str(root / stage / "suites" / route_id)
+            attempt_id = result.get("attempt_id")
+            if (
+                isinstance(attempt_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", attempt_id) is not None
+            ):
+                expected_suite_output = str(
+                    _attempt_evidence_path(root, stage, attempt_id)
+                )
+            elif campaign_release_tree_sha256 == LEGACY_V221_RELEASE_TREE_SHA256:
+                expected_suite_output = str(root / stage / "suites" / route_id)
+            else:
+                raise ValueError("campaign_attempt_ledger_invalid")
             if result.get("suite_output") != expected_suite_output:
                 raise ValueError("campaign_stage_result_output_mismatch")
+            sealed_report = _read_regular_json(
+                Path(expected_suite_output) / "suite-report.json"
+            )
+            suite_report, orchestration_metadata = _normalize_campaign_result_report(
+                result,
+                sealed_report,
+                campaign_release_tree_sha256=campaign_release_tree_sha256,
+            )
+            normalized_result = dict(result)
+            normalized_result["suite_report"] = suite_report
+            normalized_result.update(orchestration_metadata)
             if stage == "qualification":
+                classification_report = dict(suite_report)
+                classification_report.update(orchestration_metadata)
                 expected_classification = classify_qualification(
-                    suite_report,
+                    classification_report,
                     requested_route=str(route.get("requested_route") or ""),
                     reasoning_effort=reasoning_effort,
                 )
                 expected_classification["observed_api_calls"] = _api_calls_from_report(
                     suite_report
                 )
-                if result.get("classification") != expected_classification:
+                actual_classification = result.get("classification")
+                if not isinstance(actual_classification, Mapping) or _canonical_sha256(
+                    actual_classification
+                ) != _canonical_sha256(expected_classification):
                     raise ValueError("campaign_stage_result_recomputation_mismatch")
             elif stage == "full":
                 expected_fields = {
@@ -975,11 +1798,12 @@ def _load_stage_results(
                     ),
                     "observed_api_calls": _api_calls_from_report(suite_report),
                 }
-                if any(result.get(key) != value for key, value in expected_fields.items()):
+                actual_fields = {key: result.get(key) for key in expected_fields}
+                if _canonical_sha256(actual_fields) != _canonical_sha256(expected_fields):
                     raise ValueError("campaign_stage_result_recomputation_mismatch")
             else:
                 raise ValueError("campaign_stage_invalid")
-            results[route_id] = result
+            results[route_id] = normalized_result
     return results
 
 
@@ -1074,6 +1898,7 @@ def _planned_stage_routes(
     return plan, routes
 
 
+@_campaign_operation
 def build_approval_preview(
     output_root: Path,
     *,
@@ -1084,7 +1909,7 @@ def build_approval_preview(
     allow_unknown_costs: bool,
 ) -> dict[str, object]:
     """Return a deterministic no-spend preview of the exact stage controls."""
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
     state = load_campaign(root)
     _require_passed_calibration(root, state)
     budget = _validate_budget(max_cost_usd)
@@ -1141,6 +1966,7 @@ def build_approval_preview(
     }
 
 
+@_campaign_operation
 def build_stage_approval_request(
     output_root: Path,
     *,
@@ -1151,7 +1977,7 @@ def build_stage_approval_request(
     allow_unknown_costs: bool,
     approval_public_key_path: Path,
 ) -> dict[str, object]:
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
     state = load_campaign(root)
     _require_passed_calibration(root, state)
     budget = _validate_budget(max_cost_usd)
@@ -1186,6 +2012,7 @@ def build_stage_approval_request(
     return receipt
 
 
+@_campaign_operation
 def build_conversational_stage_approval(
     output_root: Path,
     *,
@@ -1198,7 +2025,7 @@ def build_conversational_stage_approval(
     output_path: Path | None = None,
 ) -> dict[str, object]:
     """Bind an explicit host-conversation approval without exposing key ceremony."""
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
     state = load_campaign(root)
     _require_passed_calibration(root, state)
     budget = _validate_budget(max_cost_usd)
@@ -1447,6 +2274,7 @@ def _validate_budget(value: float) -> float:
     return budget
 
 
+@_campaign_operation
 def run_qualification_stage(
     output_root: Path,
     *,
@@ -1459,7 +2287,8 @@ def run_qualification_stage(
     approval_signature_path: Path | None,
     approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
+    _validate_campaign_layout(root, create=True)
     state = load_campaign(root)
     if state.get("status") == "blocked_environment":
         raise ValueError("campaign_environment_not_ready")
@@ -1470,9 +2299,36 @@ def run_qualification_stage(
         root, state, stage="qualification", route_cap=route_cap
     )
     effort = _plan_reasoning_effort(plan, state)
+    campaign_release_tree_sha256 = plan.get("release_tree_sha256")
     results = _load_stage_results(
-        root, "qualification", routes, reasoning_effort=effort
+        root,
+        "qualification",
+        routes,
+        reasoning_effort=effort,
+        campaign_release_tree_sha256=campaign_release_tree_sha256,
     )
+    attempt_accounting = _attempt_accounting(
+        root,
+        "qualification",
+        results,
+        require_ledger=(
+            campaign_release_tree_sha256 != LEGACY_V221_RELEASE_TREE_SHA256
+        ),
+    )
+    failed_reserved_value = attempt_accounting["failed_reserved_api_calls"]
+    failed_attempt_value = attempt_accounting["failed_attempts"]
+    if not isinstance(failed_reserved_value, int) or not isinstance(failed_attempt_value, int):
+        raise ValueError("campaign_attempt_ledger_invalid")
+    failed_reserved_calls = failed_reserved_value
+    failed_attempt_count = failed_attempt_value
+    _require_monotonic_attempt_accounting(
+        state,
+        reserved_key="qualification_failed_attempt_reserved_api_calls",
+        attempts_key="qualification_failed_attempts",
+        failed_reserved_calls=failed_reserved_calls,
+        failed_attempts=failed_attempt_count,
+    )
+    interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
     approval = _accept_stage_approval(
         root,
         approval_path=approval_path,
@@ -1501,14 +2357,24 @@ def run_qualification_stage(
     )
     spend_state["qualification_approval_signature_path"] = approval.get("signature_path")
     spend_state["qualification_approval_public_key_path"] = approval.get("public_key_path")
+    spend_state["qualification_failed_attempt_reserved_api_calls"] = failed_reserved_calls
+    spend_state["qualification_failed_attempts"] = failed_attempt_count
+    if interrupted_unknown_cost:
+        spend_state["unknown_cost_encountered"] = True
     state["spend"] = spend_state
     _atomic_json(root / "CAMPAIGN.json", state)
+
+    if interrupted_unknown_cost and not allow_unknown_costs:
+        state["status"] = "blocked_unknown_cost"
+        state["updated_at"] = _utc_now()
+        _atomic_json(root / "CAMPAIGN.json", state)
+        return state
 
     for route in routes:
         route_id = str(route.get("route_id") or "")
         if route_id in results:
             continue
-        observed_calls = sum(
+        observed_calls = failed_reserved_calls + sum(
             int(item["classification"]["observed_api_calls"])
             for item in results.values()
             if isinstance(item.get("classification"), Mapping)
@@ -1528,23 +2394,87 @@ def run_qualification_stage(
         if observed_known_before >= budget:
             state["status"] = "qualification_budget_exhausted"
             break
-        suite_output = root / "qualification" / "suites" / route_id
+        _recover_preexisting_partial_suite(
+            root, "qualification", route_id, attempt_accounting
+        )
         execution_route = dict(route)
         execution_route["max_observed_cost_usd"] = max(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
-        execution_route["max_api_calls"] = min(34, call_budget - observed_calls)
+        attempt_reserved_calls = min(34, call_budget - observed_calls)
+        execution_route["max_api_calls"] = attempt_reserved_calls
+        attempt_id = secrets.token_hex(16)
+        suite_output = _attempt_evidence_path(root, "qualification", attempt_id)
+        reservation = _write_attempt_event(
+            root,
+            "qualification",
+            attempt_id,
+            "reserved",
+            {
+                "route_id": route_id,
+                "requested_route": route.get("requested_route"),
+                "reserved_api_calls": attempt_reserved_calls,
+                "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
+                "approval_sha256": approval["receipt_sha256"],
+            },
+        )
         try:
             report = runner(execution_route, "qualification", suite_output, effort)
-        except Exception:
+        except Exception as exc:
+            quarantine = _quarantine_partial_suite(
+                root, "qualification", route_id, attempt_id
+            )
+            _write_attempt_event(
+                root,
+                "qualification",
+                attempt_id,
+                "failed",
+                {
+                    "route_id": route_id,
+                    "reservation_sha256": reservation["receipt_sha256"],
+                    "failure_code": _safe_attempt_failure_code(exc),
+                    "quarantine_path": (
+                        str(Path(quarantine).relative_to(root)) if quarantine else None
+                    ),
+                },
+            )
             state["status"] = "qualification_interrupted"
             state["updated_at"] = _utc_now()
+            spend_state["qualification_failed_attempt_reserved_api_calls"] = (
+                failed_reserved_calls + attempt_reserved_calls
+            )
+            spend_state["qualification_failed_attempts"] = failed_attempt_count + 1
+            spend_state["unknown_cost_encountered"] = True
+            state["spend"] = spend_state
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
         if not isinstance(report, Mapping):
+            quarantine = _quarantine_partial_suite(
+                root, "qualification", route_id, attempt_id
+            )
+            _write_attempt_event(
+                root,
+                "qualification",
+                attempt_id,
+                "failed",
+                {
+                    "route_id": route_id,
+                    "reservation_sha256": reservation["receipt_sha256"],
+                    "failure_code": "campaign_runner_report_invalid",
+                    "quarantine_path": (
+                        str(Path(quarantine).relative_to(root)) if quarantine else None
+                    ),
+                },
+            )
             state["status"] = "qualification_interrupted"
             state["updated_at"] = _utc_now()
+            spend_state["qualification_failed_attempt_reserved_api_calls"] = (
+                failed_reserved_calls + attempt_reserved_calls
+            )
+            spend_state["qualification_failed_attempts"] = failed_attempt_count + 1
+            spend_state["unknown_cost_encountered"] = True
+            state["spend"] = spend_state
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
         requested_route = str(route.get("requested_route") or "")
@@ -1566,12 +2496,24 @@ def run_qualification_stage(
                 "created_at": _utc_now(),
                 "route_id": route_id,
                 "requested_route": requested_route,
+                "attempt_id": attempt_id,
                 "suite_output": str(suite_output),
                 "classification": classification,
             },
             report,
         )
         _atomic_json(_result_path(root, "qualification", route_id), receipt)
+        _write_attempt_event(
+            root,
+            "qualification",
+            attempt_id,
+            "completed",
+            {
+                "route_id": route_id,
+                "reservation_sha256": reservation["receipt_sha256"],
+                "result_receipt_sha256": receipt["receipt_sha256"],
+            },
+        )
         results[route_id] = receipt
 
         if state.get("status") == "qualification_call_budget_exceeded":
@@ -1646,7 +2588,7 @@ def run_qualification_stage(
     state["qualified_routes"] = qualified
     state["excluded_routes"] = excluded
     state["updated_at"] = _utc_now()
-    spend_state["unknown_cost_encountered"] = any(
+    spend_state["unknown_cost_encountered"] = interrupted_unknown_cost or any(
         isinstance(item.get("classification"), Mapping)
         and item["classification"].get("unknown_cost_api_calls") not in {0}
         for item in results.values()
@@ -1687,6 +2629,7 @@ def run_qualification_stage(
     return state
 
 
+@_campaign_operation
 def run_full_stage(
     output_root: Path,
     *,
@@ -1699,7 +2642,8 @@ def run_full_stage(
     approval_signature_path: Path | None,
     approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
-    root = output_root.expanduser().resolve(strict=True)
+    root = _trusted_campaign_root(output_root)
+    _validate_campaign_layout(root, create=True)
     state = load_campaign(root)
     plan = _read_regular_json(root / "PLAN.json")
     if verify_campaign_plan(plan):
@@ -1739,7 +2683,36 @@ def run_full_stage(
     if len(routes) < 2:
         raise ValueError("campaign_comparison_not_supportable")
     effort = _plan_reasoning_effort(plan, state)
-    results = _load_stage_results(root, "full", routes, reasoning_effort=effort)
+    campaign_release_tree_sha256 = plan.get("release_tree_sha256")
+    results = _load_stage_results(
+        root,
+        "full",
+        routes,
+        reasoning_effort=effort,
+        campaign_release_tree_sha256=campaign_release_tree_sha256,
+    )
+    attempt_accounting = _attempt_accounting(
+        root,
+        "full",
+        results,
+        require_ledger=(
+            campaign_release_tree_sha256 != LEGACY_V221_RELEASE_TREE_SHA256
+        ),
+    )
+    failed_reserved_value = attempt_accounting["failed_reserved_api_calls"]
+    failed_attempt_value = attempt_accounting["failed_attempts"]
+    if not isinstance(failed_reserved_value, int) or not isinstance(failed_attempt_value, int):
+        raise ValueError("campaign_attempt_ledger_invalid")
+    failed_reserved_calls = failed_reserved_value
+    failed_attempt_count = failed_attempt_value
+    _require_monotonic_attempt_accounting(
+        state,
+        reserved_key="full_failed_attempt_reserved_api_calls",
+        attempts_key="full_failed_attempts",
+        failed_reserved_calls=failed_reserved_calls,
+        failed_attempts=failed_attempt_count,
+    )
+    interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
     approval = _accept_stage_approval(
         root,
         approval_path=approval_path,
@@ -1767,15 +2740,25 @@ def run_full_stage(
     )
     spend_state["full_run_approval_signature_path"] = approval.get("signature_path")
     spend_state["full_run_approval_public_key_path"] = approval.get("public_key_path")
+    spend_state["full_failed_attempt_reserved_api_calls"] = failed_reserved_calls
+    spend_state["full_failed_attempts"] = failed_attempt_count
+    if interrupted_unknown_cost:
+        spend_state["unknown_full_cost_encountered"] = True
     state["spend"] = spend_state
     state["status"] = "running_full"
     _atomic_json(root / "CAMPAIGN.json", state)
+
+    if interrupted_unknown_cost and not allow_unknown_costs:
+        state["status"] = "blocked_unknown_full_cost"
+        state["updated_at"] = _utc_now()
+        _atomic_json(root / "CAMPAIGN.json", state)
+        return state
 
     for route in routes:
         route_id = str(route.get("route_id") or "")
         if route_id in results:
             continue
-        observed_calls = sum(
+        observed_calls = failed_reserved_calls + sum(
             int(item["observed_api_calls"])
             for item in results.values()
             if isinstance(item.get("observed_api_calls"), int)
@@ -1791,23 +2774,81 @@ def run_full_stage(
         if observed_known_before >= budget:
             state["status"] = "full_budget_exhausted"
             break
-        suite_output = root / "full" / "suites" / route_id
+        _recover_preexisting_partial_suite(root, "full", route_id, attempt_accounting)
         execution_route = dict(route)
         execution_route["max_observed_cost_usd"] = max(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
-        execution_route["max_api_calls"] = min(1360, call_budget - observed_calls)
+        attempt_reserved_calls = min(1360, call_budget - observed_calls)
+        execution_route["max_api_calls"] = attempt_reserved_calls
+        attempt_id = secrets.token_hex(16)
+        suite_output = _attempt_evidence_path(root, "full", attempt_id)
+        reservation = _write_attempt_event(
+            root,
+            "full",
+            attempt_id,
+            "reserved",
+            {
+                "route_id": route_id,
+                "requested_route": route.get("requested_route"),
+                "reserved_api_calls": attempt_reserved_calls,
+                "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
+                "approval_sha256": approval["receipt_sha256"],
+            },
+        )
         try:
             report = runner(execution_route, "full", suite_output, effort)
-        except Exception:
+        except Exception as exc:
+            quarantine = _quarantine_partial_suite(root, "full", route_id, attempt_id)
+            _write_attempt_event(
+                root,
+                "full",
+                attempt_id,
+                "failed",
+                {
+                    "route_id": route_id,
+                    "reservation_sha256": reservation["receipt_sha256"],
+                    "failure_code": _safe_attempt_failure_code(exc),
+                    "quarantine_path": (
+                        str(Path(quarantine).relative_to(root)) if quarantine else None
+                    ),
+                },
+            )
             state["status"] = "full_run_interrupted"
             state["updated_at"] = _utc_now()
+            spend_state["full_failed_attempt_reserved_api_calls"] = (
+                failed_reserved_calls + attempt_reserved_calls
+            )
+            spend_state["full_failed_attempts"] = failed_attempt_count + 1
+            spend_state["unknown_full_cost_encountered"] = True
+            state["spend"] = spend_state
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
         if not isinstance(report, Mapping):
+            quarantine = _quarantine_partial_suite(root, "full", route_id, attempt_id)
+            _write_attempt_event(
+                root,
+                "full",
+                attempt_id,
+                "failed",
+                {
+                    "route_id": route_id,
+                    "reservation_sha256": reservation["receipt_sha256"],
+                    "failure_code": "campaign_runner_report_invalid",
+                    "quarantine_path": (
+                        str(Path(quarantine).relative_to(root)) if quarantine else None
+                    ),
+                },
+            )
             state["status"] = "full_run_interrupted"
             state["updated_at"] = _utc_now()
+            spend_state["full_failed_attempt_reserved_api_calls"] = (
+                failed_reserved_calls + attempt_reserved_calls
+            )
+            spend_state["full_failed_attempts"] = failed_attempt_count + 1
+            spend_state["unknown_full_cost_encountered"] = True
+            state["spend"] = spend_state
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
         receipt = _stage_result_receipt(
@@ -1816,6 +2857,7 @@ def run_full_stage(
                 "created_at": _utc_now(),
                 "route_id": route_id,
                 "requested_route": route.get("requested_route"),
+                "attempt_id": attempt_id,
                 "suite_output": str(suite_output),
                 "observed_cost_usd": _cost_from_report(report),
                 "observed_known_cost_usd": _known_cost_from_report(report),
@@ -1825,6 +2867,17 @@ def run_full_stage(
             report,
         )
         _atomic_json(_result_path(root, "full", route_id), receipt)
+        _write_attempt_event(
+            root,
+            "full",
+            attempt_id,
+            "completed",
+            {
+                "route_id": route_id,
+                "reservation_sha256": reservation["receipt_sha256"],
+                "result_receipt_sha256": receipt["receipt_sha256"],
+            },
+        )
         results[route_id] = receipt
         observed_route_calls = receipt.get("observed_api_calls")
         if (
@@ -1878,7 +2931,7 @@ def run_full_stage(
     )
     spend_state["observed_full_run_known_cost_usd"] = observed_full_known_cost
     spend_state["observed_full_run_cost_usd"] = observed_full_known_cost
-    spend_state["unknown_full_cost_encountered"] = any(
+    spend_state["unknown_full_cost_encountered"] = interrupted_unknown_cost or any(
         item.get("unknown_cost_api_calls") not in {0} for item in results.values()
     )
     state["spend"] = spend_state

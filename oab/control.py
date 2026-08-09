@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .manifest import build_tree_manifest
+from .manifest import build_fixture_manifest
 from .strict_runner import (
     ControllerIdentity,
     FinalResponse,
@@ -63,7 +63,7 @@ def _read_allowed(path: str, policy: dict[str, Any], case: dict[str, Any]) -> bo
 
 
 def tool_policy_from_case(case: dict[str, Any], fixture: Path) -> ToolPolicy:
-    manifest = build_tree_manifest(fixture)
+    manifest = build_fixture_manifest(fixture)
     policy = _policy_object(fixture)
     allowed_reads = tuple(
         str(entry["path"])

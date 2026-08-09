@@ -42,6 +42,13 @@ def _load_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _load_object_bytes(payload: bytes, *, name: str) -> dict[str, Any]:
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"not_json_object:{name}")
+    return value
+
+
 def _suite_grid(
     report: Mapping[str, object],
 ) -> tuple[list[tuple[int, dict[str, object]]], dict[str, dict[str, str]]]:
@@ -261,11 +268,13 @@ def build_suite_seal(
     output_root: Path,
     *,
     release_manifest: Path | None = None,
+    report_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     output_root = output_root.resolve(strict=True)
     report_path = output_root / "suite-report.json"
     headline_path = output_root / "HEADLINE.txt"
-    report = _load_object(report_path)
+    report_payload = report_path.read_bytes() if report_bytes is None else report_bytes
+    report = _load_object_bytes(report_payload, name=report_path.name)
     grid, case_map = _suite_grid(report)
     episodes: list[dict[str, object]] = []
     for repetition, case in grid:
@@ -317,7 +326,7 @@ def build_suite_seal(
             raise ValueError("suite_release_tree_mismatch")
     body: dict[str, Any] = {
         "schema": _SCHEMA,
-        "suite_report_sha256": _sha256_file(report_path),
+        "suite_report_sha256": _sha256_bytes(report_payload),
         "headline_sha256": _sha256_file(headline_path),
         "release_tree_sha256": release_tree_sha256,
         "release_approval_sha256": report.get("release_approval_sha256"),
@@ -347,15 +356,18 @@ def verify_suite_seal(
     output_root: Path,
     *,
     expected_seal_sha256: str | None = None,
+    seal_bytes: bytes | None = None,
+    report_bytes: bytes | None = None,
 ) -> list[str]:
     output_root = output_root.resolve(strict=True)
     path = output_root / _SEAL_NAME
     try:
-        recorded = _load_object(path)
+        seal_payload = path.read_bytes() if seal_bytes is None else seal_bytes
+        recorded = _load_object_bytes(seal_payload, name=path.name)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return ["suite_seal_unreadable"]
     errors: list[str] = []
-    if expected_seal_sha256 is not None and _sha256_file(path) != expected_seal_sha256:
+    if expected_seal_sha256 is not None and _sha256_bytes(seal_payload) != expected_seal_sha256:
         errors.append("suite_external_seal_digest_mismatch")
     if recorded.get("schema") != _SCHEMA:
         errors.append("suite_seal_schema_invalid")
@@ -365,7 +377,7 @@ def verify_suite_seal(
     if recorded_content_digest != _sha256_bytes(_canonical_bytes(unsigned)):
         errors.append("suite_seal_content_digest_mismatch")
     try:
-        actual = build_suite_seal(output_root)
+        actual = build_suite_seal(output_root, report_bytes=report_bytes)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         errors.append(str(exc))
         return sorted(set(errors))

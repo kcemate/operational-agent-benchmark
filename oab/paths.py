@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import importlib.util
 import marshal
 import os
 import stat
-import sys
 import types
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 
-_DATA_DIR_NAME = "operational-agent-benchmark"
-_EXECUTABLE_PACKAGES = ("oab", "tools")
+_EXECUTABLE_PACKAGE_BINDINGS = (("oab", "oab"), ("oab_tools", "tools"))
 _NATIVE_SUFFIXES = tuple(EXTENSION_SUFFIXES)
 
 
@@ -109,6 +108,7 @@ def _python_files(
     errors: list[str],
     *,
     reject_shadows: bool,
+    display_package: str,
     bytecode_filename_root: Path | None = None,
 ) -> dict[str, Path]:
     package_root = root / package
@@ -125,7 +125,8 @@ def _python_files(
                 directories.remove(directory)
         for filename in filenames:
             path = current_path / filename
-            relative = path.relative_to(root).as_posix()
+            package_relative = path.relative_to(package_root).as_posix()
+            relative = f"{display_package}/{package_relative}"
             if reject_shadows:
                 if filename.endswith(".pyc") and not _bytecode_matches_source(
                     path, root, bytecode_filename_root
@@ -135,7 +136,7 @@ def _python_files(
                     errors.append(f"installed_code_shadow_artifact:{relative}")
             if not filename.endswith(".py"):
                 continue
-            found[relative] = path
+            found[package_relative] = path
     return found
 
 
@@ -182,23 +183,33 @@ def verify_installed_code_binding(package_parent: Path, frozen_root: Path) -> li
     package_parent_filename_root = package_parent.absolute()
     package_parent = package_parent.resolve(strict=True)
     frozen_root = frozen_root.resolve(strict=True)
-    for package in _EXECUTABLE_PACKAGES:
+    for installed_package, frozen_package in _EXECUTABLE_PACKAGE_BINDINGS:
         installed = _python_files(
             package_parent,
-            package,
+            installed_package,
             errors,
             reject_shadows=True,
+            display_package=frozen_package,
             bytecode_filename_root=package_parent_filename_root,
         )
-        frozen = _python_files(frozen_root, package, errors, reject_shadows=False)
+        frozen = _python_files(
+            frozen_root,
+            frozen_package,
+            errors,
+            reject_shadows=False,
+            display_package=frozen_package,
+        )
         if set(installed) != set(frozen):
-            errors.append(f"installed_code_path_set_mismatch:{package}")
+            errors.append(f"installed_code_path_set_mismatch:{frozen_package}")
             continue
         for relative in sorted(installed):
-            installed_digest = _secure_digest(installed[relative], relative, errors)
-            frozen_digest = _secure_digest(frozen[relative], relative, errors)
+            display_relative = f"{frozen_package}/{relative}"
+            installed_digest = _secure_digest(
+                installed[relative], display_relative, errors
+            )
+            frozen_digest = _secure_digest(frozen[relative], display_relative, errors)
             if installed_digest is not None and frozen_digest is not None and installed_digest != frozen_digest:
-                errors.append(f"installed_code_digest_mismatch:{relative}")
+                errors.append(f"installed_code_digest_mismatch:{display_relative}")
     return errors
 
 
@@ -208,7 +219,13 @@ def benchmark_root() -> Path:
     if (source_root / "cases.json").is_file() and (source_root / "RELEASE_MANIFEST.json").is_file():
         return source_root.resolve()
 
-    installed_root = Path(sys.prefix).resolve() / "share" / _DATA_DIR_NAME
+    try:
+        packaged_root = importlib.resources.files("oab_release_data").joinpath("tree")
+        if not isinstance(packaged_root, Path):
+            raise TypeError("release data is not installed on a filesystem")
+        installed_root = packaged_root.resolve()
+    except (ImportError, ModuleNotFoundError, TypeError):
+        installed_root = source_root / ".missing-release-data"
     if (installed_root / "cases.json").is_file() and (installed_root / "RELEASE_MANIFEST.json").is_file():
         binding_errors = verify_installed_code_binding(source_root, installed_root)
         if binding_errors:
@@ -216,5 +233,5 @@ def benchmark_root() -> Path:
         return installed_root.resolve()
     raise RuntimeError(
         "benchmark_data_root_missing: expected cases.json and RELEASE_MANIFEST.json "
-        f"under {source_root} or {installed_root}"
+        f"under {source_root} or packaged release data {installed_root}"
     )

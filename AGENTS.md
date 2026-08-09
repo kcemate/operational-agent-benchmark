@@ -10,12 +10,15 @@ This repository provides an agent-native workflow for answering a bounded questi
 2. Obtain the release wheel SHA-256 and release-tree SHA-256 from a channel independent of the repository or wheel. Verify the wheel before installation:
 
    ```bash
-   HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-   OAB_WHEEL=/path/to/operational_agent_benchmark-2.2.1-py3-none-any.whl
+   OAB_WHEEL=/path/to/operational_agent_benchmark-2.2.2-py3-none-any.whl
    OAB_WHEEL_SHA256=<independently-published-wheel-sha256>
    OAB_TREE_SHA256=sha256:<independently-published-release-tree-sha256>
    test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1
-   "$HERMES_PYTHON" -m pip install "$OAB_WHEEL"
+   python3 -c 'import sys; assert (3, 11) <= sys.version_info[:2] < (3, 14)'
+   python3 -m venv "$HOME/.local/share/oab-v2.2.2"
+   "$HOME/.local/share/oab-v2.2.2/bin/python" -m pip install --no-compile "$OAB_WHEEL"
+   export PATH="$HOME/.local/share/oab-v2.2.2/bin:$PATH"
+   command -v hermes >/dev/null || exit 1
    ```
 
 3. Run `oab doctor --json --expected-release-tree-sha256 "$OAB_TREE_SHA256"`. Do not initialize a campaign or start model runs unless every check passes.

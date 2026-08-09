@@ -41,52 +41,129 @@ def _included(relative: PurePosixPath) -> bool:
 
 
 def build_release_manifest(root: Path) -> dict[str, Any]:
-    root = root.resolve(strict=True)
-    if not root.is_dir():
+    root = root.absolute()
+    try:
+        root_info = root.lstat()
+    except OSError as exc:
+        raise ValueError("release_root_invalid") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise ValueError("release_root_invalid")
-    entries: list[dict[str, object]] = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = PurePosixPath(path.relative_to(root).as_posix())
-        if not _included(relative):
-            continue
-        info = path.lstat()
-        mode = info.st_mode
-        if stat.S_ISDIR(mode):
-            continue
-        if stat.S_ISLNK(mode):
-            raise ValueError(f"release_symlink_rejected:{relative}")
-        if not stat.S_ISREG(mode):
-            raise ValueError(f"release_special_file_rejected:{relative}")
-        if info.st_nlink != 1:
-            raise ValueError(f"release_hardlink_rejected:{relative}")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValueError(f"release_special_file_rejected:{relative}")
-            if opened.st_nlink != 1:
-                raise ValueError(f"release_hardlink_rejected:{relative}")
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            payload = b"".join(chunks)
-            mode = opened.st_mode
-        finally:
-            os.close(descriptor)
-        entries.append(
-            {
-                "path": relative.as_posix(),
-                "bytes": len(payload),
-                "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
-                "executable": bool(mode & 0o111),
-            }
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        raise ValueError("release_root_invalid") from exc
+
+    def identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
         )
+
+    entries: list[dict[str, object]] = []
+
+    def walk(directory_fd: int, relative_parent: PurePosixPath | None) -> None:
+        directory_before = os.fstat(directory_fd)
+        try:
+            children = list(os.scandir(directory_fd))
+        except OSError as exc:
+            raise ValueError("release_directory_unreadable") from exc
+        children.sort(key=lambda child: child.name)
+        for child in children:
+            relative = (
+                PurePosixPath(child.name)
+                if relative_parent is None
+                else relative_parent / child.name
+            )
+            if not _included(relative):
+                continue
+            try:
+                before = os.stat(child.name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(f"release_path_unreadable:{relative}") from exc
+            mode = before.st_mode
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"release_symlink_rejected:{relative}")
+            if stat.S_ISDIR(mode):
+                try:
+                    child_fd = os.open(child.name, directory_flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ValueError(f"release_directory_unreadable:{relative}") from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if identity(opened) != identity(before):
+                        raise ValueError(f"release_path_race_detected:{relative}")
+                    walk(child_fd, relative)
+                    after_entry = os.stat(
+                        child.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if identity(after_entry) != identity(opened):
+                        raise ValueError(f"release_path_race_detected:{relative}")
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"release_special_file_rejected:{relative}")
+            if before.st_nlink != 1:
+                raise ValueError(f"release_hardlink_rejected:{relative}")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(child.name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ValueError(f"release_path_unreadable:{relative}") from exc
+            try:
+                opened = os.fstat(descriptor)
+                if identity(opened) != identity(before):
+                    raise ValueError(f"release_path_race_detected:{relative}")
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                payload = b"".join(chunks)
+                after_read = os.fstat(descriptor)
+                if identity(after_read) != identity(opened):
+                    raise ValueError(f"release_path_race_detected:{relative}")
+                after_entry = os.stat(
+                    child.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if identity(after_entry) != identity(opened):
+                    raise ValueError(f"release_path_race_detected:{relative}")
+            finally:
+                os.close(descriptor)
+            entries.append(
+                {
+                    "path": relative.as_posix(),
+                    "bytes": len(payload),
+                    "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                    "executable": bool(opened.st_mode & 0o111),
+                }
+            )
+        directory_after = os.fstat(directory_fd)
+        if identity(directory_after) != identity(directory_before):
+            display = relative_parent.as_posix() if relative_parent is not None else "."
+            raise ValueError(f"release_directory_race_detected:{display}")
+
+    try:
+        opened_root = os.fstat(root_fd)
+        if identity(opened_root) != identity(root_info):
+            raise ValueError("release_root_race_detected")
+        walk(root_fd, None)
+        final_root = root.lstat()
+        if identity(final_root) != identity(opened_root):
+            raise ValueError("release_root_race_detected")
+    finally:
+        os.close(root_fd)
     if not entries:
         raise ValueError("release_manifest_empty")
+    entries.sort(key=lambda entry: str(entry["path"]))
     tree_sha256 = "sha256:" + hashlib.sha256(_canonical_bytes(entries)).hexdigest()
     return {
         "schema": _SCHEMA,

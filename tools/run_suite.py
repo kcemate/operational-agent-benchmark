@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
+import stat
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -22,7 +25,10 @@ from oab.runtime_profile import pinned_hermes_runtime
 from oab.strict_runner import ToolPolicy, run_strict_episode
 from oab.suite_seal import write_suite_seal
 from oab.paths import benchmark_root
-from tools.release_manifest import verify_release_manifest
+if __package__:
+    from .release_manifest import verify_release_manifest
+else:
+    from tools.release_manifest import verify_release_manifest
 
 ROOT = benchmark_root()
 
@@ -227,6 +233,8 @@ def main() -> int:
         help="Repetitions per case (default: registry default_repetitions, usually 5)",
     )
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--output-parent-fd", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--output-name", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-observed-cost-usd",
         type=float,
@@ -306,10 +314,49 @@ def main() -> int:
         release_approval_sha256 = str(approval["file_sha256"])
         release_authorized = True
 
-    output_root = args.output_root.resolve()
-    if output_root == ROOT or output_root.is_relative_to(ROOT) or ROOT.is_relative_to(output_root):
-        raise SystemExit("output root and benchmark repository must be fully disjoint")
-    output_root.mkdir(parents=True, exist_ok=False)
+    if (args.output_parent_fd is None) != (args.output_name is None):
+        raise SystemExit("internal output descriptor and name are required together")
+    if args.output_parent_fd is not None:
+        if os.name != "posix":
+            raise SystemExit("descriptor-bound output is unavailable on this platform")
+        output_name = str(args.output_name)
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}\.evidence", output_name)
+            or args.output_parent_fd < 0
+        ):
+            raise SystemExit("descriptor-bound output name is invalid")
+        try:
+            parent_info = os.fstat(args.output_parent_fd)
+            if not stat.S_ISDIR(parent_info.st_mode):
+                raise OSError("output parent is not a directory")
+            os.fchdir(args.output_parent_fd)
+            parent_path = Path.cwd().resolve()
+            if (
+                parent_path == ROOT
+                or parent_path.is_relative_to(ROOT)
+                or ROOT.is_relative_to(parent_path)
+            ):
+                raise SystemExit(
+                    "output root and benchmark repository must be fully disjoint"
+                )
+            os.mkdir(output_name, 0o700, dir_fd=args.output_parent_fd)
+            output_fd = os.open(
+                output_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=args.output_parent_fd,
+            )
+            os.fchdir(output_fd)
+            os.close(output_fd)
+        except OSError as exc:
+            raise SystemExit("descriptor-bound output creation failed") from exc
+        output_root = Path(".")
+    else:
+        output_root = args.output_root.resolve()
+        if output_root == ROOT or output_root.is_relative_to(ROOT) or ROOT.is_relative_to(output_root):
+            raise SystemExit("output root and benchmark repository must be fully disjoint")
+        output_root.mkdir(parents=True, exist_ok=False)
     if release_authorized and args.release_approval is not None:
         shutil.copyfile(args.release_approval, output_root / "RELEASE_APPROVAL.json")
 

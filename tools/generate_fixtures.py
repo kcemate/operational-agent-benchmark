@@ -10,7 +10,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from oab.manifest import build_tree_manifest
+from oab.manifest import build_fixture_manifest
 
 
 def json_bytes(value: object) -> bytes:
@@ -287,7 +287,7 @@ def main() -> int:
         policy_path = fixture / "input/policy.json"
         policy_path.parent.mkdir(parents=True, exist_ok=True)
         policy_path.write_bytes(json_bytes(policy_for(case)))
-        case["fixture_manifest_digest"] = build_tree_manifest(fixture)["tree_sha256"]
+        case["fixture_manifest_digest"] = build_fixture_manifest(fixture)["tree_sha256"]
     for existing in fixtures_root.iterdir():
         if existing.is_dir() and existing.name not in expected_directories:
             shutil.rmtree(existing)

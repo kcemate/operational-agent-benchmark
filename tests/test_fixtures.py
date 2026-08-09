@@ -1,26 +1,64 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from oab.control import tool_policy_from_case
-from oab.manifest import build_tree_manifest
+from oab import manifest as manifest_module
 from oab.registry import load_registry
 
 
 class FixtureContractTests(unittest.TestCase):
+    def test_generated_python_caches_do_not_change_fixture_manifest(self) -> None:
+        build_fixture_manifest = cast(
+            Any, getattr(manifest_module, "build_fixture_manifest", None)
+        )
+        if not callable(build_fixture_manifest):
+            self.fail("build_fixture_manifest is missing")
+        source = ROOT / "fixtures/oab2-code-patch-a"
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / "fixture"
+            shutil.copytree(source, fixture)
+            cache = fixture / "work/project/__pycache__"
+            cache.mkdir()
+            (cache / "normalize.cpython-311.pyc").write_bytes(b"generated")
+            suffix_directory = fixture / "work/project/generated.pyc"
+            suffix_directory.mkdir()
+            (suffix_directory / "visible.txt").write_text("ignored\n", encoding="utf-8")
+            outside = Path(td) / "outside-cache"
+            outside.write_bytes(b"outside")
+            (fixture / "work/project/linked.pyo").symlink_to(outside)
+            os.link(outside, fixture / "work/project/hardlinked.pyc")
+            self.assertEqual(
+                build_fixture_manifest(source)["tree_sha256"],
+                build_fixture_manifest(fixture)["tree_sha256"],
+            )
+            case = next(
+                item
+                for item in load_registry(ROOT / "cases.json")["cases"]
+                if item["case_id"] == "oab2-code-patch-a"
+            )
+            policy = tool_policy_from_case(case, fixture)
+            self.assertFalse(
+                any("__pycache__" in path or path.endswith((".pyc", ".pyo")) for path in policy.allowed_reads)
+            )
+
     def test_every_fixture_exists_and_matches_registry_digest(self) -> None:
         registry = load_registry(ROOT / "cases.json")
         for case in registry["cases"]:
             with self.subTest(case=case["case_id"]):
                 fixture = ROOT / case["fixture_path"]
                 self.assertTrue(fixture.is_dir())
-                manifest = build_tree_manifest(fixture)
+                manifest = manifest_module.build_fixture_manifest(fixture)
                 self.assertEqual(case["fixture_manifest_digest"], manifest["tree_sha256"])
                 policy = json.loads((fixture / "input/policy.json").read_text())
                 self.assertEqual(case["variant"], policy["authorization"])

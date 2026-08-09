@@ -14,7 +14,13 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import oab.agent_workflow as agent_workflow_module
 from oab.agent_workflow import (
+    _attempt_accounting,
+    _hermes_python_command,
+    _quarantine_partial_suite,
+    _validate_campaign_orchestration_metadata,
+    _write_attempt_event,
     build_campaign_plan,
     build_conversational_stage_approval,
     build_decision_report,
@@ -35,6 +41,97 @@ FULL_PAIR_IDS = [f"P{index:02d}" for index in range(1, 9)]
 
 
 class AgentWorkflowContractTests(unittest.TestCase):
+    def test_load_campaign_rejects_substituted_symlink_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            moved = Path(td) / "moved-campaign"
+            root.rename(moved)
+            root.symlink_to(moved, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "campaign_internal_path_unsafe"):
+                load_campaign(root)
+
+    def test_attempt_event_write_rejects_attempts_parent_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            attempts = root / "qualification/attempts"
+            attempts.rmdir()
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            attempts.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "campaign_internal_path_unsafe"):
+                _write_attempt_event(
+                    root,
+                    "qualification",
+                    "a" * 32,
+                    "reserved",
+                    {
+                        "route_id": "route-a",
+                        "requested_route": "provider/model",
+                        "reserved_api_calls": 34,
+                        "max_observed_cost_usd": 1.0,
+                        "approval_sha256": "sha256:" + "b" * 64,
+                    },
+                )
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_partial_suite_quarantine_never_moves_an_unowned_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            suite = root / "qualification/suites/route-a"
+            suite.mkdir()
+            (suite / "partial.txt").write_text("partial", encoding="utf-8")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "secret.txt").write_text("outside", encoding="utf-8")
+            parked = Path(td) / "parked"
+            real_replace = __import__("os").replace
+
+            def raced_replace(source: object, destination: object) -> None:
+                real_replace(suite, parked)
+                real_replace(outside, suite)
+                real_replace(source, destination)
+
+            with patch("oab.agent_workflow.os.replace", side_effect=raced_replace):
+                with self.assertRaisesRegex(ValueError, "campaign_partial_suite_unsafe"):
+                    _quarantine_partial_suite(
+                        root, "qualification", "route-a", "a" * 32
+                    )
+            self.assertTrue(outside.exists())
+            self.assertEqual(
+                "outside", (outside / "secret.txt").read_text(encoding="utf-8")
+            )
+
+    def test_orchestration_metadata_rejects_unrepresentable_elapsed_integer(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "campaign_orchestration_metadata_invalid"
+        ):
+            _validate_campaign_orchestration_metadata(
+                {
+                    "campaign_suite_verified": True,
+                    "campaign_elapsed_seconds": 10**1000,
+                }
+            )
+
     def signed_stage_approval(
         self,
         root: Path,
@@ -508,6 +605,111 @@ class AgentWorkflowContractTests(unittest.TestCase):
         self.assertTrue(report["ready"])
         self.assertNotIn("credential", json.dumps(report).lower())
 
+    def test_hermes_python_command_resolves_one_bounded_exec_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            interpreter = root / "runtime/python3"
+            interpreter.parent.mkdir()
+            interpreter.write_bytes(b"python-placeholder")
+
+            target = root / "hermes-venv/bin/hermes"
+            target.parent.mkdir(parents=True)
+            target.write_text(f"#!{interpreter}\n", encoding="utf-8")
+
+            wrapper = root / "bin/hermes"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "unset PYTHONPATH\n"
+                "unset PYTHONHOME\n"
+                f'exec "{target}" "$@"\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual([str(interpreter)], _hermes_python_command(str(wrapper)))
+
+    def test_hermes_python_command_rejects_unsafe_exec_wrappers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target-hermes"
+            target.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+            target_link = root / "target-link"
+            target_link.symlink_to(target)
+            hardlink_source = root / "hardlink-source"
+            hardlink_source.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+            target_hardlink = root / "target-hardlink"
+            target_hardlink.hardlink_to(hardlink_source)
+            nested_target = root / "nested-target"
+            nested_target.write_text(
+                f'#!/usr/bin/env bash\nexec "{target}" "$@"\n', encoding="utf-8"
+            )
+
+            cases = {
+                "relative": '#!/usr/bin/env bash\nexec "../target-hermes" "$@"\n',
+                "symlink": f'#!/usr/bin/env bash\nexec "{target_link}" "$@"\n',
+                "hardlink": f'#!/usr/bin/env bash\nexec "{target_hardlink}" "$@"\n',
+                "nested-wrapper": f'#!/usr/bin/env bash\nexec "{nested_target}" "$@"\n',
+                "extra-command": (
+                    "#!/usr/bin/env bash\n"
+                    "echo unsafe\n"
+                    f'exec "{target}" "$@"\n'
+                ),
+            }
+            for name, text in cases.items():
+                with self.subTest(name=name):
+                    wrapper = root / f"wrapper-{name}"
+                    wrapper.write_text(text, encoding="utf-8")
+                    self.assertIsNone(_hermes_python_command(str(wrapper)))
+
+    def test_hermes_python_command_rejects_symlinked_wrapper_and_target_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            interpreter = root / "runtime/python3"
+            interpreter.parent.mkdir()
+            interpreter.write_bytes(b"python-placeholder")
+            target = root / "real-target/hermes"
+            target.parent.mkdir()
+            target.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            wrapper = root / "real-wrapper/hermes"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "unset PYTHONPATH\n"
+                "unset PYTHONHOME\n"
+                f'exec "{target}" "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper_alias = root / "wrapper-alias"
+            wrapper_alias.symlink_to(wrapper.parent, target_is_directory=True)
+            self.assertIsNone(
+                _hermes_python_command(str(wrapper_alias / wrapper.name))
+            )
+
+            target_alias = root / "target-alias"
+            target_alias.symlink_to(target.parent, target_is_directory=True)
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "unset PYTHONPATH\n"
+                "unset PYTHONHOME\n"
+                f'exec "{target_alias / target.name}" "$@"\n',
+                encoding="utf-8",
+            )
+            self.assertIsNone(_hermes_python_command(str(wrapper)))
+
+            interpreter_alias = root / "interpreter-alias"
+            interpreter_alias.symlink_to(interpreter.parent, target_is_directory=True)
+            target.write_text(
+                f"#!{interpreter_alias / interpreter.name}\n", encoding="utf-8"
+            )
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "unset PYTHONPATH\n"
+                "unset PYTHONHOME\n"
+                f'exec "{target}" "$@"\n',
+                encoding="utf-8",
+            )
+            self.assertIsNone(_hermes_python_command(str(wrapper)))
+
     def test_doctor_external_tree_pin_mismatch_blocks_readiness(self) -> None:
         from tools.release_manifest import build_release_manifest
 
@@ -568,6 +770,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
             "identity_source": "provider_response",
             "controller_config_sha256": "sha256:" + "a" * 64,
             "controller_usage": {"api_calls": 34, "cost_usd": 0.12},
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 1.0,
             "observations": [
                 {"runner_status": "task_failed", "reason_codes": ["model_protocol_invalid"]},
                 {"runner_status": "completed", "reason_codes": []},
@@ -730,6 +934,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
             "identity_source": "provider_response",
             "controller_config_sha256": "sha256:" + "a" * 64,
             "controller_usage": {"api_calls": 34, "cost_usd": cost},
+            "campaign_suite_verified": True,
             "campaign_elapsed_seconds": 2.0,
             "observations": [
                 {"runner_status": "task_failed", "reason_codes": ["model_protocol_invalid"]},
@@ -762,6 +967,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
                         "infrastructure_invalid_episodes": 34,
                         "identity_source": None,
                         "controller_usage": {"api_calls": 1, "cost_usd": 0.4},
+                        "campaign_suite_verified": True,
+                        "campaign_elapsed_seconds": 1.0,
                         "observations": [
                             {"runner_status": "runner_invalid", "reason_codes": ["provider_auth_unavailable"]}
                         ],
@@ -815,6 +1022,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     "infrastructure_invalid_episodes": 34,
                     "identity_source": None,
                     "controller_usage": {"api_calls": 1, "cost_usd": 0.6},
+                    "campaign_suite_verified": True,
+                    "campaign_elapsed_seconds": 1.0,
                     "observations": [
                         {"runner_status": "runner_invalid", "reason_codes": ["provider_auth_unavailable"]}
                     ],
@@ -887,7 +1096,15 @@ class AgentWorkflowContractTests(unittest.TestCase):
             def runner(route: dict[str, object], stage: str, output: Path, effort: str) -> dict[str, object]:
                 requested = str(route["requested_route"])
                 calls.append(requested)
-                return self.qualification_report(requested, cost=None)
+                report = self.qualification_report(requested, cost=None)
+                sealed_report = dict(report)
+                sealed_report.pop("campaign_suite_verified")
+                sealed_report.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed_report), encoding="utf-8"
+                )
+                return report
 
             first = run_qualification_stage(
                 root,
@@ -919,6 +1136,396 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("awaiting_full_run_approval", second["status"])
             self.assertEqual(1, calls.count(first_route))
             self.assertEqual(3, len(calls))
+
+    def test_stage_rejects_symlinked_campaign_internal_directories(self) -> None:
+        for relative in (
+            Path("APPROVALS"),
+            Path("qualification/results"),
+            Path("qualification/suites"),
+        ):
+            with self.subTest(relative=str(relative)), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "campaign"
+                initialize_campaign(
+                    root,
+                    doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                    inventory_payload=self.inventory(),
+                    reasoning_effort="high",
+                )
+                approval = self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=False,
+                )
+                target = Path(td) / "outside" / relative.name
+                target.mkdir(parents=True)
+                path = root / relative
+                if path.exists():
+                    path.rmdir()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to(target, target_is_directory=True)
+
+                with self.assertRaisesRegex(ValueError, "campaign_internal_path_unsafe"):
+                    run_qualification_stage(
+                        root,
+                        runner=lambda *_args: self.qualification_report("unused"),
+                        max_cost_usd=1.0,
+                        allow_unknown_costs=False,
+                        max_api_calls=68,
+                        max_routes=2,
+                        **approval,
+                    )
+
+    def test_interrupted_attempt_is_quarantined_and_charged_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            calls: list[str] = []
+
+            def interrupted(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                calls.append(str(route["requested_route"]))
+                output.mkdir(parents=True)
+                (output / "partial.txt").write_text("partial", encoding="utf-8")
+                raise RuntimeError("campaign_controller_timeout")
+
+            first = run_qualification_stage(
+                root,
+                runner=interrupted,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=68,
+                max_routes=2,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual("qualification_interrupted", first["status"])
+            self.assertFalse(any((root / "qualification/suites").iterdir()))
+            attempts = root / "qualification/attempts"
+            self.assertTrue(list(attempts.glob("*.reserved.json")))
+            self.assertTrue(list(attempts.glob("*.failed.json")))
+            self.assertTrue(list(attempts.glob("*.evidence")))
+            self.assertEqual(
+                34,
+                first["spend"]["qualification_failed_attempt_reserved_api_calls"],
+            )
+            self.assertTrue(first["spend"]["unknown_cost_encountered"])
+
+            blocked_calls: list[str] = []
+            blocked = run_qualification_stage(
+                root,
+                runner=lambda route, *_args: blocked_calls.append(str(route["route_id"])),
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=68,
+                max_routes=2,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual("blocked_unknown_cost", blocked["status"])
+            self.assertEqual([], blocked_calls)
+
+            def completed(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                calls.append(str(route["requested_route"]))
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed = dict(report)
+                sealed.pop("campaign_suite_verified")
+                sealed.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True)
+                (output / "suite-report.json").write_text(json.dumps(sealed), encoding="utf-8")
+                return report
+
+            resumed = run_qualification_stage(
+                root,
+                runner=completed,
+                max_cost_usd=1.0,
+                allow_unknown_costs=True,
+                max_api_calls=68,
+                max_routes=2,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=68,
+                    max_routes=2,
+                    allow_unknown_costs=True,
+                ),
+            )
+            self.assertEqual("qualification_call_budget_exhausted", resumed["status"])
+            self.assertEqual(2, len(calls))
+
+    def test_attempt_accounting_rejects_post_validation_attempts_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def interrupted(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                output.mkdir(parents=True)
+                (output / "partial.txt").write_text("partial", encoding="utf-8")
+                raise RuntimeError("campaign_controller_timeout")
+
+            first = run_qualification_stage(
+                root,
+                runner=interrupted,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=34,
+                    max_routes=1,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual(
+                34,
+                first["spend"]["qualification_failed_attempt_reserved_api_calls"],
+            )
+            attempts = root / "qualification/attempts"
+            retained = root / "qualification/retained-attempts"
+            attempts.rename(retained)
+            outside = Path(td) / "outside-attempts"
+            outside.mkdir()
+            attempts.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "campaign_internal_path_unsafe"):
+                _attempt_accounting(root, "qualification", {}, require_ledger=True)
+
+    def test_resume_rejects_regular_attempts_directory_replacement_that_erases_spend(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def interrupted(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                output.mkdir(parents=True)
+                raise RuntimeError("campaign_controller_timeout")
+
+            first = run_qualification_stage(
+                root,
+                runner=interrupted,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=34,
+                    max_routes=1,
+                    allow_unknown_costs=False,
+                ),
+            )
+            self.assertEqual(
+                34,
+                first["spend"]["qualification_failed_attempt_reserved_api_calls"],
+            )
+            attempts = root / "qualification/attempts"
+            attempts.rename(root / "qualification/retained-attempts")
+            attempts.mkdir()
+            resumed_calls: list[str] = []
+
+            with self.assertRaisesRegex(ValueError, "campaign_attempt_ledger_invalid"):
+                run_qualification_stage(
+                    root,
+                    runner=lambda route, *_args: resumed_calls.append(
+                        str(route["route_id"])
+                    ),
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=True,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **self.signed_stage_approval(
+                        root,
+                        stage="qualification",
+                        max_cost_usd=1.0,
+                        max_api_calls=34,
+                        max_routes=1,
+                        allow_unknown_costs=True,
+                    ),
+                )
+            self.assertEqual([], resumed_calls)
+
+    def test_stage_retains_attempts_descriptor_across_post_entry_directory_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def interrupted(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                output.mkdir(parents=True)
+                raise RuntimeError("campaign_controller_timeout")
+
+            run_qualification_stage(
+                root,
+                runner=interrupted,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=34,
+                    max_routes=1,
+                    allow_unknown_costs=False,
+                ),
+            )
+            attempts = root / "qualification/attempts"
+            original_validate = agent_workflow_module._validate_campaign_layout
+            swapped = False
+
+            def validate_then_swap(path: Path, *, create: bool = False) -> None:
+                nonlocal swapped
+                original_validate(path, create=create)
+                if not create and not swapped:
+                    swapped = True
+                    attempts.rename(root / "qualification/retained-attempts")
+                    attempts.mkdir()
+
+            resumed_calls: list[str] = []
+            resume_approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=1.0,
+                max_api_calls=34,
+                max_routes=1,
+                allow_unknown_costs=True,
+            )
+            with patch(
+                "oab.agent_workflow._validate_campaign_layout",
+                side_effect=validate_then_swap,
+            ):
+                resumed = run_qualification_stage(
+                    root,
+                    runner=lambda route, *_args: (
+                        resumed_calls.append(str(route["route_id"])),
+                        (_ for _ in ()).throw(RuntimeError("campaign_controller_timeout")),
+                    )[1],
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=True,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **resume_approval,
+                )
+            self.assertTrue(swapped)
+            self.assertEqual([], resumed_calls)
+            self.assertEqual(
+                34,
+                resumed["spend"]["qualification_failed_attempt_reserved_api_calls"],
+            )
+
+    def test_resume_cannot_narrow_scope_around_completed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={
+                    "schema": "oab.doctor/v1",
+                    "ready": True,
+                    "release_tree_sha256": "sha256:" + "c" * 64,
+                    "checks": [],
+                },
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed = dict(report)
+                sealed.pop("campaign_suite_verified")
+                sealed.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed), encoding="utf-8"
+                )
+                return report
+
+            run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=102,
+                max_routes=3,
+                **self.signed_stage_approval(
+                    root,
+                    stage="qualification",
+                    max_cost_usd=1.0,
+                    max_api_calls=102,
+                    max_routes=3,
+                    allow_unknown_costs=False,
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "campaign_stage_result_scope_mismatch"
+            ):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=102,
+                    max_routes=1,
+                    **self.signed_stage_approval(
+                        root,
+                        stage="qualification",
+                        max_cost_usd=1.0,
+                        max_api_calls=102,
+                        max_routes=1,
+                        allow_unknown_costs=False,
+                    ),
+                )
 
     def test_resume_rejects_result_cost_and_unknown_telemetry_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -988,6 +1595,297 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 )
             self.assertEqual(1, len(calls))
 
+    def test_resume_rejects_self_consistent_unverified_suite_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed_report = dict(report)
+                sealed_report.pop("campaign_suite_verified")
+                sealed_report.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed_report), encoding="utf-8"
+                )
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=1.0,
+                max_api_calls=34,
+                max_routes=1,
+                allow_unknown_costs=False,
+            )
+            run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **approval,
+            )
+            result_path = next((root / "qualification" / "results").glob("*.json"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["campaign_suite_verified"] = False
+            unsigned = dict(result)
+            unsigned.pop("receipt_sha256")
+            result["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "campaign_orchestration_metadata_invalid"
+            ):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **approval,
+                )
+
+    def test_resume_rejects_numeric_type_confusion_in_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed_report = dict(report)
+                sealed_report.pop("campaign_suite_verified")
+                sealed_report.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed_report), encoding="utf-8"
+                )
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=1.0,
+                max_api_calls=34,
+                max_routes=1,
+                allow_unknown_costs=False,
+            )
+            run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **approval,
+            )
+            result_path = next((root / "qualification/results").glob("*.json"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            attempt_id = str(result["attempt_id"])
+            result["classification"]["observed_api_calls"] = 34.0
+            unsigned = dict(result)
+            unsigned.pop("receipt_sha256")
+            result["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            completion_path = (
+                root / "qualification/attempts" / f"{attempt_id}.completed.json"
+            )
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            completion["result_receipt_sha256"] = result["receipt_sha256"]
+            unsigned_completion = dict(completion)
+            unsigned_completion.pop("receipt_sha256")
+            completion["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned_completion,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            completion_path.write_text(json.dumps(completion), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "campaign_stage_result_recomputation_mismatch"
+            ):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **approval,
+                )
+
+    def test_current_campaign_rejects_result_without_attempt_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={
+                    "schema": "oab.doctor/v1",
+                    "ready": True,
+                    "release_tree_sha256": "sha256:" + "c" * 64,
+                    "checks": [],
+                },
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed = dict(report)
+                sealed.pop("campaign_suite_verified")
+                sealed.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed), encoding="utf-8"
+                )
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=1.0,
+                max_api_calls=34,
+                max_routes=1,
+                allow_unknown_costs=False,
+            )
+            run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **approval,
+            )
+            result_path = next((root / "qualification/results").glob("*.json"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result.pop("attempt_id")
+            unsigned = dict(result)
+            unsigned.pop("receipt_sha256")
+            result["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            for event in (root / "qualification/attempts").glob("*.json"):
+                event.unlink()
+
+            with self.assertRaisesRegex(ValueError, "campaign_attempt_ledger_invalid"):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **approval,
+                )
+
+    def test_resume_rejects_result_without_completed_attempt_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={
+                    "schema": "oab.doctor/v1",
+                    "ready": True,
+                    "release_tree_sha256": "sha256:" + "c" * 64,
+                    "checks": [],
+                },
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                report = self.qualification_report(str(route["requested_route"]))
+                sealed = dict(report)
+                sealed.pop("campaign_suite_verified")
+                sealed.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed), encoding="utf-8"
+                )
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=1.0,
+                max_api_calls=34,
+                max_routes=1,
+                allow_unknown_costs=False,
+            )
+            run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=1.0,
+                allow_unknown_costs=False,
+                max_api_calls=34,
+                max_routes=1,
+                **approval,
+            )
+            completed = next(
+                (root / "qualification/attempts").glob("*.completed.json")
+            )
+            completed.unlink()
+
+            with self.assertRaisesRegex(ValueError, "campaign_attempt_ledger_invalid"):
+                run_qualification_stage(
+                    root,
+                    runner=runner,
+                    max_cost_usd=1.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=34,
+                    max_routes=1,
+                    **approval,
+                )
+
     def test_full_stage_builds_switch_decision(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
@@ -1033,7 +1931,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 requested = str(route["requested_route"])
                 full_calls.append(requested)
                 baseline = requested.endswith("gpt-current")
-                return {
+                report = {
                     "requested_route": requested,
                     "authoritative": True,
                     "reasoning_effort": "high",
@@ -1048,7 +1946,17 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     "matched_pair_completion_rate": 0.60 if baseline else 0.80,
                     "pair_stability": {"min": 0.40 if baseline else 0.60},
                     "controller_usage": {"api_calls": 80, "cost_usd": 2.0},
+                    "campaign_suite_verified": True,
+                    "campaign_elapsed_seconds": 2.0,
                 }
+                sealed_report = dict(report)
+                sealed_report.pop("campaign_suite_verified")
+                sealed_report.pop("campaign_elapsed_seconds")
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "suite-report.json").write_text(
+                    json.dumps(sealed_report), encoding="utf-8"
+                )
+                return report
 
             state = run_full_stage(
                 root,
@@ -1069,6 +1977,140 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("openai-codex/gpt-current", decision["current_route"])
             self.assertEqual("switch", decision["recommendation"])
             self.assertEqual("openai-codex/gpt-next", decision["recommended_route"])
+
+            result_path = next((root / "full" / "results").glob("*.json"))
+            original_result = json.loads(result_path.read_text(encoding="utf-8"))
+            campaign_path = root / "CAMPAIGN.json"
+
+            def write_result(result: dict[str, object]) -> None:
+                result["suite_report_sha256"] = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        result["suite_report"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                unsigned = dict(result)
+                unsigned.pop("receipt_sha256", None)
+                result["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        unsigned,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                result_path.write_text(json.dumps(result), encoding="utf-8")
+                attempt_id = result.get("attempt_id")
+                if isinstance(attempt_id, str):
+                    event_path = root / "full/attempts" / f"{attempt_id}.completed.json"
+                    event = json.loads(event_path.read_text(encoding="utf-8"))
+                    event["result_receipt_sha256"] = result["receipt_sha256"]
+                    unsigned_event = dict(event)
+                    unsigned_event.pop("receipt_sha256", None)
+                    event["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                        json.dumps(
+                            unsigned_event,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    event_path.write_text(json.dumps(event), encoding="utf-8")
+                campaign_state = json.loads(campaign_path.read_text(encoding="utf-8"))
+                campaign_state["status"] = "running_full"
+                campaign_path.write_text(json.dumps(campaign_state), encoding="utf-8")
+
+            def resume_full() -> dict[str, object]:
+                return run_full_stage(
+                    root,
+                    runner=full,
+                    max_cost_usd=10.0,
+                    allow_unknown_costs=False,
+                    max_api_calls=2720,
+                    max_routes=2,
+                    **self.signed_stage_approval(
+                        root,
+                        stage="full",
+                        max_cost_usd=10.0,
+                        max_api_calls=2720,
+                        max_routes=2,
+                        allow_unknown_costs=False,
+                    ),
+                )
+
+            legacy_result = json.loads(json.dumps(original_result))
+            legacy_report = cast(dict[str, object], legacy_result["suite_report"])
+            legacy_report["campaign_suite_verified"] = legacy_result.pop(
+                "campaign_suite_verified"
+            )
+            legacy_report["campaign_elapsed_seconds"] = legacy_result.pop(
+                "campaign_elapsed_seconds"
+            )
+            sealed_path = Path(str(original_result["suite_output"])) / "suite-report.json"
+            original_sealed_report = json.loads(sealed_path.read_text(encoding="utf-8"))
+            legacy_report["release_tree_sha256"] = (
+                "sha256:967445bec99f6df126ae5bbfd19cce47527f4cc50d78bd918ed8c339f8c99c68"
+            )
+            legacy_sealed_report = dict(original_sealed_report)
+            legacy_sealed_report["release_tree_sha256"] = legacy_report[
+                "release_tree_sha256"
+            ]
+            sealed_path.write_text(json.dumps(legacy_sealed_report), encoding="utf-8")
+            write_result(legacy_result)
+            with self.assertRaisesRegex(
+                ValueError, "campaign_legacy_receipt_release_invalid"
+            ):
+                resume_full()
+
+            unsupported_legacy = json.loads(json.dumps(original_result))
+            unsupported_report = cast(
+                dict[str, object], unsupported_legacy["suite_report"]
+            )
+            unsupported_report["campaign_suite_verified"] = unsupported_legacy.pop(
+                "campaign_suite_verified"
+            )
+            unsupported_report["campaign_elapsed_seconds"] = unsupported_legacy.pop(
+                "campaign_elapsed_seconds"
+            )
+            sealed_path.write_text(json.dumps(original_sealed_report), encoding="utf-8")
+            write_result(unsupported_legacy)
+            with self.assertRaisesRegex(
+                ValueError, "campaign_legacy_receipt_release_invalid"
+            ):
+                resume_full()
+
+            ambiguous_result = json.loads(json.dumps(legacy_result))
+            ambiguous_result["campaign_suite_verified"] = True
+            ambiguous_result["campaign_elapsed_seconds"] = 1.0
+            write_result(ambiguous_result)
+            with self.assertRaisesRegex(
+                ValueError, "campaign_orchestration_metadata_invalid"
+            ):
+                resume_full()
+
+            type_confused_result = json.loads(json.dumps(original_result))
+            type_confused_report = cast(
+                dict[str, object], type_confused_result["suite_report"]
+            )
+            type_confused_report["authoritative"] = 1
+            write_result(type_confused_result)
+            with self.assertRaisesRegex(
+                ValueError, "campaign_stage_result_report_mismatch"
+            ):
+                resume_full()
+
+            invalid_result = json.loads(json.dumps(original_result))
+            invalid_result["campaign_suite_verified"] = False
+            write_result(invalid_result)
+            with self.assertRaisesRegex(
+                ValueError, "campaign_orchestration_metadata_invalid"
+            ):
+                resume_full()
 
     def test_qualification_refuses_to_start_route_without_full_call_allowance(self) -> None:
         with tempfile.TemporaryDirectory() as td:

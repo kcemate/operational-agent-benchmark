@@ -11,7 +11,7 @@ Every task ships as a **matched pair**: identical work, one version permitted an
 The output is a decision: whether the evidence justifies switching the model your agent runs on.
 
 > [!IMPORTANT]
-> **Requires a Hermes agent installation.** OAB drives models through the Hermes agent harness and reads its configured model routes; `oab` installs next to the active `hermes` executable. It is not a standalone model-evaluation harness today, and there is no adapter for other frameworks yet.
+> **Requires a Hermes agent installation.** OAB drives models through the Hermes agent harness and reads its configured model routes; the active `hermes` command must remain on `PATH`. It is not a standalone model-evaluation harness today, and there is no adapter for other frameworks yet.
 
 ### What you get
 
@@ -42,19 +42,22 @@ You approve a number. It does the rest. `AGENTS.md` is the runbook it follows.
 Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin.
 
 ```bash
-gh release download v2.2.1 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+gh release download v2.2.2 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
 
-HERMES_PYTHON="$(dirname "$(command -v hermes)")/python3"
-OAB_WHEEL=operational_agent_benchmark-2.2.1-py3-none-any.whl
+OAB_WHEEL=operational_agent_benchmark-2.2.2-py3-none-any.whl
 OAB_WHEEL_SHA256=sha256:<from-the-release-notes>
 OAB_TREE_SHA256=sha256:<from-the-release-notes>
 
 test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1
-"$HERMES_PYTHON" -m pip install "$OAB_WHEEL"
+python3 -c 'import sys; assert (3, 11) <= sys.version_info[:2] < (3, 14)'
+python3 -m venv "$HOME/.local/share/oab-v2.2.2"
+"$HOME/.local/share/oab-v2.2.2/bin/python" -m pip install --no-compile "$OAB_WHEEL"
+export PATH="$HOME/.local/share/oab-v2.2.2/bin:$PATH"
+command -v hermes >/dev/null || exit 1
 oab doctor --json --expected-release-tree-sha256 "$OAB_TREE_SHA256"
 ```
 
-Install next to the active `hermes` executable. `oab doctor` must pass before you start a campaign.
+The isolated OAB environment avoids package collisions while `oab doctor` safely discovers the active Hermes installation through its command on `PATH`. Doctor must pass before you start a campaign.
 
 **Linux:** install `bubblewrap` and `libseccomp2`, and make sure unprivileged user namespaces are permitted. On Ubuntu/AppArmor hosts you may otherwise see `setting up uid map: Permission denied`. Don't relax `kernel.apparmor_restrict_unprivileged_userns` on a shared host without review.
 
