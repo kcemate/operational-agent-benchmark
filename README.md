@@ -29,30 +29,41 @@ The output is a decision: whether the evidence justifies switching the model you
 
 OAB is built to be driven by the agent, not by you. Point Hermes at it:
 
-> "Install the Operational Agent Benchmark, discover every model route we have access to, and tell me whether I should switch."
+> "Run OAB on this new model and tell me if it beats our current model."
 
-Hermes will verify the release digests, install the wheel, discover your configured routes, calibrate the harness, estimate cost, **stop and ask you to approve any spend**, run the bounded comparison, resume anything that failed, verify the seals, and hand you a decision report.
+Hermes confirms which route is your current one and which is the candidate, verifies the release digests, installs the wheel, pins the campaign to those **two** routes, calibrates the harness, **stops and asks you to approve exact spend ceilings**, runs the bounded comparison, resumes anything that failed, verifies the seals, and hands you a decision report.
 
-You approve a number. It does the rest. `AGENTS.md` is the runbook it follows.
+Qualification and the full comparison are **separate** approvals. Neither is implied by asking the question.
+
+Two honest caveats, stated before you spend anything:
+
+- **A winner is not guaranteed.** `stay` and "no supportable comparison" are ordinary results. The candidate has to strictly beat your current route on contract completion *without* regressing matched pairs or the weakest pair.
+- **Exploratory evidence cannot authorize a switch.** Authoritative status additionally requires an exact-tree release approval with two distinct reviewers. Without one your campaign is explicitly `exploratory`, and the report will decline to recommend a switch regardless of the numbers.
+
+You approve the disclosed call and cost limits. Before a paid stage can run, a
+separately controlled Ed25519 signer must also sign that exact stage request.
+Once both gates are present, the agent handles the benchmark mechanics.
+`AGENTS.md` is the runbook it follows.
 
 ---
 
 ## Install
 
-Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin.
+Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin. **That release-notes page is where a cold agent obtains its pin. If the version you want has no published release notes carrying both digests, no trusted pin exists: stop rather than installing an unpinned artifact.**
 
 ```bash
-gh release download v2.2.2 --repo kcemate/operational-agent-benchmark --pattern '*.whl'
+gh release list --repo kcemate/operational-agent-benchmark   # pick a published version
+gh release download v<version> --repo kcemate/operational-agent-benchmark --pattern '*.whl'
 
-OAB_WHEEL=operational_agent_benchmark-2.2.2-py3-none-any.whl
+OAB_WHEEL=operational_agent_benchmark-<version>-py3-none-any.whl
 OAB_WHEEL_SHA256=sha256:<from-the-release-notes>
 OAB_TREE_SHA256=sha256:<from-the-release-notes>
 
 test "$(shasum -a 256 "$OAB_WHEEL" | cut -d' ' -f1)" = "${OAB_WHEEL_SHA256#sha256:}" || exit 1
 python3 -c 'import sys; assert (3, 11) <= sys.version_info[:2] < (3, 14)'
-python3 -m venv "$HOME/.local/share/oab-v2.2.2"
-"$HOME/.local/share/oab-v2.2.2/bin/python" -m pip install --no-compile "$OAB_WHEEL"
-export PATH="$HOME/.local/share/oab-v2.2.2/bin:$PATH"
+python3 -m venv "$HOME/.local/share/oab-<version>"
+"$HOME/.local/share/oab-<version>/bin/python" -m pip install --no-compile "$OAB_WHEEL"
+export PATH="$HOME/.local/share/oab-<version>/bin:$PATH"
 command -v hermes >/dev/null || exit 1
 oab doctor --json --expected-release-tree-sha256 "$OAB_TREE_SHA256"
 ```
@@ -189,19 +200,42 @@ Cost control is a first-class feature, not a footnote.
 - Before any paid stage, `oab approval-preview` prints exactly what will run — ordered routes, episode counts, call ceilings, cost stop, and unknown-cost posture — with **no provider calls**.
 - Nothing runs until you approve those exact values. Approval is bound to the plan and calibration digests, so a receipt can't be reused for a different run.
 - Qualification is capped at 34 one-call episodes per route. A full comparison is a **separate** approval.
-- If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing.
+- If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing. Continuing requires a fresh preview and a new approval carrying `--allow-unknown-costs`.
+
+To compare just your current route against one candidate, pass a two-route inventory instead of letting discovery enumerate everything. Both `oab discover` and `oab benchmark` accept `--inventory-json`:
+
+```json
+{
+  "provider": "example-provider",
+  "model": "current-model",
+  "providers": [
+    {"slug": "example-provider", "authenticated": true,
+     "models": ["current-model", "candidate-model"]}
+  ]
+}
+```
+
+`provider`/`model` name the current route and become the plan's baseline — they must also appear in `providers`, or the baseline ends up null. Every other field is discarded by the sanitizer, so never put credentials in this file. See `AGENTS.md` for the full contract.
+
+Two routes at 34 calls each is a **68-call** qualification ceiling; the full comparison reserves 1,360 calls per route, a **2,720-call** ceiling. Those are call counts, not dollar estimates — OAB cannot estimate dollars until qualification telemetry exists.
 
 ```bash
 oab approval-preview "$HOME/OAB-Runs/my-campaign" --stage qualification \
   --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n>
 
+# Show that preview, get an explicit yes in conversation, then produce a signed
+# approval. A conversation reference alone is not accepted: OAB cannot verify it.
 oab approval-request "$HOME/OAB-Runs/my-campaign" --stage qualification \
   --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n> \
-  --conversation-approval-reference '<host>:<message-reference>' \
+  --approval-public-key /path/to/approval-public.pem \
   --output /tmp/qualification-approval.json
+
+# Sign /tmp/qualification-approval.json.signing-payload externally (Ed25519).
 
 oab resume "$HOME/OAB-Runs/my-campaign" \
   --qualification-approval /tmp/qualification-approval.json \
+  --approval-signature /tmp/qualification-approval.sig \
+  --approval-public-key /path/to/approval-public.pem \
   --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n>
 ```
 
@@ -214,7 +248,7 @@ oab report "$HOME/OAB-Runs/my-campaign"
 
 One honest caveat: providers only reveal billed cost *after* a call, so the call that first crosses your threshold may exceed it. Everything after it stops. `--max-cost-usd` is a compatibility alias, not a prepaid cap.
 
-For high-assurance authorization, use `--approval-public-key`, sign the canonical `.signing-payload` externally, and pass the detached Ed25519 signature to `resume`. Conversational approval authorizes **spend only** — it never confers release authority.
+**Approval assurance.** Preview and ask in conversation; execute only with a signed approval. Both steps are required. OAB has no host-backed way to prove that a quoted message reference exists or that its text approves these exact controls, so `--conversation-approval-reference` is refused with `conversation_approval_not_host_verified`, and any hand-written conversational receipt is refused at `resume`. The only accepted spend gate is the externally signed Ed25519 stage approval above; that path is unchanged and still accepted. It authorizes **spend only** — it never confers release authority.
 
 ---
 

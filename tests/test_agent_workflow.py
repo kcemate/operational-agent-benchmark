@@ -18,11 +18,11 @@ import oab.agent_workflow as agent_workflow_module
 from oab.agent_workflow import (
     _attempt_accounting,
     _hermes_python_command,
+    _planned_stage_routes,
     _quarantine_partial_suite,
     _validate_campaign_orchestration_metadata,
     _write_attempt_event,
     build_campaign_plan,
-    build_conversational_stage_approval,
     build_decision_report,
     build_stage_approval_request,
     classify_qualification,
@@ -265,7 +265,12 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("oab.calibration-report/v2", receipt["schema"])
             self.assertTrue(load_campaign(root)["calibration_passed"])
 
-    def test_conversational_approval_binds_exact_controls_without_key_ceremony(self) -> None:
+    def test_caller_asserted_conversational_receipt_cannot_authorize_spend(self) -> None:
+        """A caller-asserted conversation reference is not host-verified evidence.
+
+        Anyone able to run the CLI can write such a receipt, so it must never reach a
+        spend-capable stage. Only the externally signed stage approval qualifies.
+        """
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
             initialize_campaign(
@@ -275,65 +280,100 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
             )
             record_calibration(root, {"schema": "oab.calibration-report/v1", "passed": True})
+            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
+            state = load_campaign(root)
+            _plan, routes = _planned_stage_routes(
+                root, state, stage="qualification", route_cap=2
+            )
+            body: dict[str, object] = {
+                "schema": "oab.conversational-stage-approval/v2",
+                "created_at": "2026-08-09T00:00:00+00:00",
+                "approval_assurance": "conversation_attested",
+                "user_approval_reference": "telegram:user-confirmed:$5:68:2:unknown-cost",
+                "stage": "qualification",
+                "plan_sha256": plan["plan_sha256"],
+                "calibration_sha256": state["calibration_sha256"],
+                "route_ids": [str(route["route_id"]) for route in routes],
+                "observed_cost_stop_usd": 5.0,
+                "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+                "max_cost_overshoot_api_calls": 1,
+                "max_api_calls": 68,
+                "max_routes": 2,
+                "allow_unknown_costs": True,
+            }
+            body["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    body,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
             approval_path = Path(td) / "qualification-conversation.json"
-            with self.assertRaisesRegex(ValueError, "conversation_approval_reference_invalid"):
-                build_conversational_stage_approval(
+            approval_path.write_text(json.dumps(body), encoding="utf-8")
+            calls: list[str] = []
+
+            def runner(route: dict[str, object], _stage: str, _output: Path, _effort: str) -> dict[str, object]:
+                calls.append(str(route["requested_route"]))
+                return self.qualification_report(str(route["requested_route"]))
+
+            with self.assertRaisesRegex(
+                ValueError, "conversation_approval_not_host_verified"
+            ):
+                run_qualification_stage(
                     root,
-                    stage="qualification",
+                    runner=runner,
+                    approval_path=approval_path,
+                    approval_signature_path=None,
+                    approval_public_key_path=None,
                     max_cost_usd=5.0,
                     max_api_calls=68,
                     max_routes=2,
                     allow_unknown_costs=True,
-                    user_approval_reference="telegram:user-approved\nembedded-text",
                 )
-            receipt = build_conversational_stage_approval(
+            self.assertEqual([], calls)
+            spend = load_campaign(root).get("spend")
+            self.assertTrue(
+                not isinstance(spend, dict)
+                or spend.get("qualification_approved") is not True
+            )
+            self.assertFalse(sorted((root / "APPROVALS").glob("*.json")))
+
+    def test_signed_stage_approval_still_authorizes_qualification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+            )
+            approval = self.signed_stage_approval(
                 root,
                 stage="qualification",
                 max_cost_usd=5.0,
                 max_api_calls=68,
                 max_routes=2,
                 allow_unknown_costs=True,
-                user_approval_reference="telegram:user-confirmed:$5:68:2:unknown-cost",
-                output_path=approval_path,
             )
-            self.assertEqual("oab.conversational-stage-approval/v2", receipt["schema"])
-            self.assertEqual("conversation_attested", receipt["approval_assurance"])
-            self.assertEqual(5.0, receipt["observed_cost_stop_usd"])
-            self.assertEqual(
-                "post_provider_call_observed_known_cost_stop", receipt["cost_control_mode"]
-            )
-            self.assertEqual(1, receipt["max_cost_overshoot_api_calls"])
-            with self.assertRaisesRegex(ValueError, "conversation_approval_cost_limit_mismatch"):
-                run_qualification_stage(
-                    root,
-                    runner=lambda route, _stage, _output, _effort: self.qualification_report(
-                        str(route["requested_route"])
-                    ),
-                    approval_path=approval_path,
-                    approval_signature_path=None,
-                    approval_public_key_path=None,
-                    max_cost_usd=6.0,
-                    max_api_calls=68,
-                    max_routes=2,
-                    allow_unknown_costs=True,
-                )
             state = run_qualification_stage(
                 root,
                 runner=lambda route, _stage, _output, _effort: self.qualification_report(
                     str(route["requested_route"])
                 ),
-                approval_path=approval_path,
-                approval_signature_path=None,
-                approval_public_key_path=None,
                 max_cost_usd=5.0,
                 max_api_calls=68,
                 max_routes=2,
                 allow_unknown_costs=True,
+                **approval,
             )
             spend = state["spend"]
             assert isinstance(spend, dict)
             self.assertTrue(spend["qualification_approved"])
-            self.assertEqual("conversation_attested", spend["qualification_approval_assurance"])
+            self.assertEqual(
+                "external_signature", spend["qualification_approval_assurance"]
+            )
 
     def test_route_semantics_cannot_change_after_plan_and_approval(self) -> None:
         with tempfile.TemporaryDirectory() as td:

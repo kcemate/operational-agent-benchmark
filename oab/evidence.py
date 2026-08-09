@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +69,18 @@ def _load_trace_events(path: Path) -> list[dict[str, Any]] | None:
 
 
 def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
-    """Verify a completed-tree evidence directory against sealed manifest/trace digests."""
-    evidence_dir = evidence_dir.resolve()
+    """Verify a completed-tree evidence directory against sealed manifest/trace digests.
+
+    The caller's binding is used exactly as given. ``Path.resolve`` is deliberately
+    not called: resolving rewrites symlinked components and re-derives an absolute
+    pathname, which would silently convert a descriptor-rooted binding (such as the
+    suite sealer's ``Path(".")`` view of a retained snapshot descriptor) back into a
+    mutable pathname that a concurrent rename or symlink substitution could redirect
+    to a victim directory. Every read below therefore stays relative to the binding
+    the caller established. ``reported_dir`` is a lexical, display-only rendering
+    that is never opened.
+    """
+    reported_dir = os.path.abspath(evidence_dir)
     errors: list[str] = []
     status: str | None = None
     trace_output_tree_sha256: str | None = None
@@ -79,7 +90,7 @@ def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
             "valid": False,
             "errors": ["result_missing"],
             "status": None,
-            "evidence_dir": str(evidence_dir),
+            "evidence_dir": reported_dir,
         }
 
     receipt, receipt_error = _load_json_object(result_path)
@@ -88,7 +99,7 @@ def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
             "valid": False,
             "errors": [f"result_{receipt_error}"],
             "status": None,
-            "evidence_dir": str(evidence_dir),
+            "evidence_dir": reported_dir,
         }
     if receipt.get("schema") != _RESULT_SCHEMA:
         errors.append("result_schema_invalid")
@@ -254,7 +265,7 @@ def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
         "valid": not errors,
         "errors": errors,
         "status": status,
-        "evidence_dir": str(evidence_dir),
+        "evidence_dir": reported_dir,
         "trace_sha256": claimed_trace if _digest_field_valid(claimed_trace) else None,
         "output_tree_sha256": claimed_output if _digest_field_valid(claimed_output) else None,
     }

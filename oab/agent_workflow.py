@@ -1568,8 +1568,7 @@ def _attempt_accounting(
         unsigned_approval = dict(approval)
         unsigned_approval.pop("receipt_sha256", None)
         if (
-            approval.get("schema")
-            not in {"oab.stage-approval/v4", "oab.conversational-stage-approval/v2"}
+            approval.get("schema") != "oab.stage-approval/v4"
             or not isinstance(approval_digest, str)
             or approval_digest != _canonical_sha256(unsigned_approval)
         ):
@@ -2012,177 +2011,15 @@ def build_stage_approval_request(
     return receipt
 
 
-@_campaign_operation
-def build_conversational_stage_approval(
-    output_root: Path,
-    *,
-    stage: str,
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-    user_approval_reference: str,
-    output_path: Path | None = None,
-) -> dict[str, object]:
-    """Bind an explicit host-conversation approval without exposing key ceremony."""
-    root = _trusted_campaign_root(output_root)
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    budget = _validate_budget(max_cost_usd)
-    call_budget = _validate_positive_int(max_api_calls, "stage_api_call_budget_required")
-    route_cap = _validate_positive_int(max_routes, "stage_route_cap_required")
-    reference = str(user_approval_reference).strip()
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@#$+\-]{0,255}", reference):
-        raise ValueError("conversation_approval_reference_invalid")
-    plan, routes = _planned_stage_routes(root, state, stage=stage, route_cap=route_cap)
-    plan_digest = _plan_sha256(plan)
-    receipt: dict[str, object] = {
-        "schema": "oab.conversational-stage-approval/v2",
-        "created_at": _utc_now(),
-        "approval_assurance": "conversation_attested",
-        "user_approval_reference": reference,
-        "stage": stage,
-        "plan_sha256": plan_digest,
-        "calibration_sha256": state["calibration_sha256"],
-        "route_ids": [str(route.get("route_id") or "") for route in routes],
-        "observed_cost_stop_usd": budget,
-        "cost_control_mode": _COST_CONTROL_MODE,
-        "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
-        "max_api_calls": call_budget,
-        "max_routes": route_cap,
-        "allow_unknown_costs": bool(allow_unknown_costs),
-    }
-    receipt["receipt_sha256"] = _canonical_sha256(receipt)
-    if output_path is not None:
-        _atomic_json(output_path.expanduser().resolve(), receipt)
-    return receipt
+CONVERSATIONAL_STAGE_APPROVAL_SCHEMA = "oab.conversational-stage-approval/v2"
 
-
-def _verify_conversational_stage_approval(
-    receipt: Mapping[str, object],
-    *,
-    expected_plan_sha256: str,
-    expected_calibration_sha256: str,
-    expected_stage: str,
-    expected_route_ids: Sequence[str],
-    expected_max_cost_usd: float,
-    expected_max_api_calls: int,
-    expected_max_routes: int,
-    expected_allow_unknown_costs: bool,
-) -> list[str]:
-    errors: list[str] = []
-    body_fields = {
-        "schema",
-        "created_at",
-        "approval_assurance",
-        "user_approval_reference",
-        "stage",
-        "plan_sha256",
-        "calibration_sha256",
-        "route_ids",
-        "observed_cost_stop_usd",
-        "cost_control_mode",
-        "max_cost_overshoot_api_calls",
-        "max_api_calls",
-        "max_routes",
-        "allow_unknown_costs",
-    }
-    if set(receipt) != body_fields | {"receipt_sha256"}:
-        errors.append("conversation_approval_fields_invalid")
-    if receipt.get("schema") != "oab.conversational-stage-approval/v2":
-        errors.append("conversation_approval_schema_invalid")
-    if receipt.get("approval_assurance") != "conversation_attested":
-        errors.append("conversation_approval_assurance_invalid")
-    reference = receipt.get("user_approval_reference")
-    if not isinstance(reference, str) or not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._:/@#$+\-]{0,255}", reference
-    ):
-        errors.append("conversation_approval_reference_invalid")
-    if receipt.get("stage") != expected_stage:
-        errors.append("conversation_approval_stage_mismatch")
-    if receipt.get("plan_sha256") != expected_plan_sha256:
-        errors.append("conversation_approval_plan_mismatch")
-    if receipt.get("calibration_sha256") != expected_calibration_sha256:
-        errors.append("conversation_approval_calibration_mismatch")
-    unsigned = {key: receipt.get(key) for key in body_fields}
-    try:
-        computed_receipt = _canonical_sha256(unsigned)
-    except (TypeError, ValueError):
-        computed_receipt = None
-    if receipt.get("receipt_sha256") != computed_receipt:
-        errors.append("conversation_approval_digest_mismatch")
-    route_ids = receipt.get("route_ids")
-    if not isinstance(route_ids, list) or not route_ids or any(
-        not isinstance(route_id, str) or not route_id for route_id in route_ids
-    ):
-        errors.append("conversation_approval_routes_invalid")
-    elif route_ids != list(expected_route_ids):
-        errors.append("conversation_approval_routes_mismatch")
-    elif len(set(route_ids)) != len(route_ids):
-        errors.append("conversation_approval_routes_invalid")
-    max_cost = receipt.get("observed_cost_stop_usd")
-    if (
-        not isinstance(max_cost, (int, float))
-        or isinstance(max_cost, bool)
-        or not (float(max_cost) > 0.0)
-        or not (float(max_cost) < float("inf"))
-    ):
-        errors.append("conversation_approval_cost_limit_invalid")
-    elif float(max_cost) != float(expected_max_cost_usd):
-        errors.append("conversation_approval_cost_limit_mismatch")
-    if receipt.get("cost_control_mode") != _COST_CONTROL_MODE:
-        errors.append("conversation_approval_cost_control_mode_invalid")
-    if receipt.get("max_cost_overshoot_api_calls") != _MAX_COST_OVERSHOOT_API_CALLS:
-        errors.append("conversation_approval_cost_overshoot_limit_invalid")
-    max_calls = receipt.get("max_api_calls")
-    if not isinstance(max_calls, int) or isinstance(max_calls, bool) or max_calls < 1:
-        errors.append("conversation_approval_api_call_limit_invalid")
-    elif max_calls != expected_max_api_calls:
-        errors.append("conversation_approval_api_call_limit_mismatch")
-    max_routes_value = receipt.get("max_routes")
-    if (
-        not isinstance(max_routes_value, int)
-        or isinstance(max_routes_value, bool)
-        or max_routes_value < 1
-    ):
-        errors.append("conversation_approval_route_limit_invalid")
-    elif max_routes_value != expected_max_routes:
-        errors.append("conversation_approval_route_limit_mismatch")
-    allow_unknown = receipt.get("allow_unknown_costs")
-    if not isinstance(allow_unknown, bool):
-        errors.append("conversation_approval_unknown_cost_policy_invalid")
-    elif allow_unknown != expected_allow_unknown_costs:
-        errors.append("conversation_approval_unknown_cost_policy_mismatch")
-    return errors
-
-
-def verify_conversational_stage_approval(
-    path: Path,
-    *,
-    expected_plan_sha256: str,
-    expected_calibration_sha256: str,
-    expected_stage: str,
-    expected_route_ids: Sequence[str],
-    expected_max_cost_usd: float,
-    expected_max_api_calls: int,
-    expected_max_routes: int,
-    expected_allow_unknown_costs: bool,
-) -> list[str]:
-    try:
-        receipt = _read_regular_json(path)
-    except ValueError:
-        return ["conversation_approval_invalid"]
-    return _verify_conversational_stage_approval(
-        receipt,
-        expected_plan_sha256=expected_plan_sha256,
-        expected_calibration_sha256=expected_calibration_sha256,
-        expected_stage=expected_stage,
-        expected_route_ids=expected_route_ids,
-        expected_max_cost_usd=expected_max_cost_usd,
-        expected_max_api_calls=expected_max_api_calls,
-        expected_max_routes=expected_max_routes,
-        expected_allow_unknown_costs=expected_allow_unknown_costs,
-    )
+# No host-backed verifier exists for a conversational approval: nothing in this
+# repository or in an installed Hermes can prove that a caller-supplied message
+# reference names a real message whose content approves these exact controls. A
+# caller can therefore forge any such reference, so conversational receipts are
+# refused for every spend-capable path. `approval-preview` stays conversational
+# and no-spend; actual execution requires the externally signed stage approval.
+CONVERSATION_APPROVAL_NOT_HOST_VERIFIED = "conversation_approval_not_host_verified"
 
 
 def stage_approval_signing_payload(receipt: Mapping[str, object]) -> bytes:
@@ -2209,44 +2046,35 @@ def _accept_stage_approval(
     _require_passed_calibration(root, state)
     calibration_sha256 = str(state.get("calibration_sha256") or "")
     receipt = _read_regular_json(approval_path)
-    if receipt.get("schema") == "oab.conversational-stage-approval/v2":
-        errors = _verify_conversational_stage_approval(
-            receipt,
-            expected_plan_sha256=plan_digest,
-            expected_calibration_sha256=calibration_sha256,
-            expected_stage=stage,
-            expected_route_ids=route_ids,
-            expected_max_cost_usd=max_cost_usd,
-            expected_max_api_calls=max_api_calls,
-            expected_max_routes=max_routes,
-            expected_allow_unknown_costs=allow_unknown_costs,
+    if receipt.get("schema") == CONVERSATIONAL_STAGE_APPROVAL_SCHEMA:
+        # A caller-asserted conversation reference is not host-verified evidence of
+        # approval, so it can never authorize spend. Fail closed before any route runs.
+        raise ValueError(
+            f"{CONVERSATION_APPROVAL_NOT_HOST_VERIFIED}:"
+            "signed_stage_approval_required"
         )
-        error_prefix = "conversation_approval_invalid:"
-    else:
-        if signature_path is None or public_key_path is None:
-            raise ValueError("stage_approval_signature_and_public_key_required")
-        errors = verify_stage_approval(
-            approval_path,
-            expected_plan_sha256=plan_digest,
-            expected_calibration_sha256=calibration_sha256,
-            expected_stage=stage,
-            expected_route_ids=route_ids,
-            expected_max_cost_usd=max_cost_usd,
-            expected_max_api_calls=max_api_calls,
-            expected_max_routes=max_routes,
-            expected_allow_unknown_costs=allow_unknown_costs,
-            public_key_path=public_key_path,
-            signature_path=signature_path,
-        )
-        error_prefix = "stage_approval_invalid:"
+    if signature_path is None or public_key_path is None:
+        raise ValueError("stage_approval_signature_and_public_key_required")
+    errors = verify_stage_approval(
+        approval_path,
+        expected_plan_sha256=plan_digest,
+        expected_calibration_sha256=calibration_sha256,
+        expected_stage=stage,
+        expected_route_ids=route_ids,
+        expected_max_cost_usd=max_cost_usd,
+        expected_max_api_calls=max_api_calls,
+        expected_max_routes=max_routes,
+        expected_allow_unknown_costs=allow_unknown_costs,
+        public_key_path=public_key_path,
+        signature_path=signature_path,
+    )
+    error_prefix = "stage_approval_invalid:"
     if errors:
         raise ValueError(error_prefix + ",".join(sorted(set(errors))))
     stem = f"{stage}-{str(receipt['receipt_sha256']).removeprefix('sha256:')[:16]}"
     approvals = root / "APPROVALS"
     receipt_destination = approvals / f"{stem}.json"
     _atomic_json(receipt_destination, receipt)
-    if receipt.get("schema") == "oab.conversational-stage-approval/v2":
-        return {**receipt, "path": str(receipt_destination)}
     assert signature_path is not None
     assert public_key_path is not None
     signature = _read_single_link_regular_bytes(

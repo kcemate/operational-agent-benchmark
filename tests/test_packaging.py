@@ -47,8 +47,23 @@ class PackagingContractTests(unittest.TestCase):
 
         for document in (readme, agents):
             self.assertNotIn('$(dirname "$(command -v hermes)")/python3', document)
-            self.assertIn('python3 -m venv "$HOME/.local/share/oab-v2.2.2"', document)
-            self.assertIn('export PATH="$HOME/.local/share/oab-v2.2.2/bin:$PATH"', document)
+            self.assertIn('python3 -m venv "$HOME/.local/share/oab-<version>"', document)
+            self.assertIn('export PATH="$HOME/.local/share/oab-<version>/bin:$PATH"', document)
+
+    def test_calibration_help_describes_all_deterministic_pairs(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "tools/run_calibration.py"), "--help"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stdout)
+        self.assertNotIn("P01 approved/prohibited", completed.stdout)
+        self.assertIn("eight", completed.stdout)
+        self.assertIn("16 controls", completed.stdout)
 
 
 if __name__ == "__main__":

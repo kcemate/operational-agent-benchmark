@@ -28,7 +28,8 @@ from oab.agent_workflow import (
     _unknown_cost_api_calls_from_report,
     _validate_campaign_orchestration_metadata,
     build_approval_preview,
-    build_conversational_stage_approval,
+    CONVERSATIONAL_STAGE_APPROVAL_SCHEMA,
+    CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
     build_evidence_posture,
     build_stage_approval_request,
     build_decision_report,
@@ -42,7 +43,6 @@ from oab.agent_workflow import (
     sanitize_hermes_inventory,
     stage_approval_signing_payload,
     verify_campaign_plan,
-    verify_conversational_stage_approval,
     verify_stage_approval,
 )
 from oab.explain import explain_episode, format_explanation
@@ -402,7 +402,8 @@ def _parser() -> argparse.ArgumentParser:
     preview.add_argument("--allow-unknown-costs", action="store_true")
 
     approval = subparsers.add_parser(
-        "approval-request", help="Create an exact conversational or externally signed stage approval"
+        "approval-request",
+        help="Create an exact externally signed stage approval",
     )
     approval.add_argument("output_root", type=Path)
     approval.add_argument("--stage", required=True, choices=("qualification", "full"))
@@ -422,7 +423,14 @@ def _parser() -> argparse.ArgumentParser:
     approval.add_argument("--allow-unknown-costs", action="store_true")
     approval_mode = approval.add_mutually_exclusive_group(required=True)
     approval_mode.add_argument("--approval-public-key", type=Path)
-    approval_mode.add_argument("--conversation-approval-reference")
+    approval_mode.add_argument(
+        "--conversation-approval-reference",
+        help=(
+            "Disabled: a caller-asserted conversation reference is not host-verified "
+            "evidence of approval and is refused with "
+            "conversation_approval_not_host_verified"
+        ),
+    )
     approval.add_argument("--output", type=Path, required=True)
 
     resume = subparsers.add_parser("resume", help="Resume a campaign with an exact stage approval")
@@ -563,7 +571,6 @@ def _verify_campaign(
         allow_unknown_value = spend_map.get(
             "allow_unknown_costs" if stage == "qualification" else "allow_unknown_full_costs"
         )
-        conversational = approval_assurance == "conversation_attested"
         approval_values_valid = (
             isinstance(approval_path_value, str)
             and isinstance(plan_sha256, str)
@@ -578,12 +585,9 @@ def _verify_campaign(
             and not isinstance(max_routes_value, bool)
             and isinstance(allow_unknown_value, bool)
             and (
-                (conversational and signature_path_value is None and public_key_path_value is None)
-                or (
-                    approval_assurance == "external_signature"
-                    and isinstance(signature_path_value, str)
-                    and isinstance(public_key_path_value, str)
-                )
+                approval_assurance == "external_signature"
+                and isinstance(signature_path_value, str)
+                and isinstance(public_key_path_value, str)
             )
         )
         if not approval_values_valid:
@@ -597,45 +601,29 @@ def _verify_campaign(
             checked_max_routes = cast(int, max_routes_value)
             checked_allow_unknown = cast(bool, allow_unknown_value)
             approvals_root = (root / "APPROVALS").resolve()
-            artifact_paths = [approval_path]
-            if not conversational:
-                artifact_paths.extend(
-                    [
-                        Path(cast(str, signature_path_value)).expanduser().resolve(),
-                        Path(cast(str, public_key_path_value)).expanduser().resolve(),
-                    ]
-                )
+            artifact_paths = [
+                approval_path,
+                Path(cast(str, signature_path_value)).expanduser().resolve(),
+                Path(cast(str, public_key_path_value)).expanduser().resolve(),
+            ]
             if any(not candidate.is_relative_to(approvals_root) for candidate in artifact_paths):
                 errors.append(f"{stage}:stage_approval_path_outside_campaign")
             else:
-                if conversational:
-                    approval_errors = verify_conversational_stage_approval(
-                        approval_path,
-                        expected_plan_sha256=checked_plan_sha256,
-                        expected_calibration_sha256=cast(str, calibration_sha256),
-                        expected_stage=stage,
-                        expected_route_ids=checked_route_ids,
-                        expected_max_cost_usd=checked_max_cost,
-                        expected_max_api_calls=checked_max_calls,
-                        expected_max_routes=checked_max_routes,
-                        expected_allow_unknown_costs=checked_allow_unknown,
-                    )
-                else:
-                    signature_path = artifact_paths[1]
-                    public_key_path = artifact_paths[2]
-                    approval_errors = verify_stage_approval(
-                        approval_path,
-                        expected_plan_sha256=checked_plan_sha256,
-                        expected_calibration_sha256=cast(str, calibration_sha256),
-                        expected_stage=stage,
-                        expected_route_ids=checked_route_ids,
-                        expected_max_cost_usd=checked_max_cost,
-                        expected_max_api_calls=checked_max_calls,
-                        expected_max_routes=checked_max_routes,
-                        expected_allow_unknown_costs=checked_allow_unknown,
-                        public_key_path=public_key_path,
-                        signature_path=signature_path,
-                    )
+                signature_path = artifact_paths[1]
+                public_key_path = artifact_paths[2]
+                approval_errors = verify_stage_approval(
+                    approval_path,
+                    expected_plan_sha256=checked_plan_sha256,
+                    expected_calibration_sha256=cast(str, calibration_sha256),
+                    expected_stage=stage,
+                    expected_route_ids=checked_route_ids,
+                    expected_max_cost_usd=checked_max_cost,
+                    expected_max_api_calls=checked_max_calls,
+                    expected_max_routes=checked_max_routes,
+                    expected_allow_unknown_costs=checked_allow_unknown,
+                    public_key_path=public_key_path,
+                    signature_path=signature_path,
+                )
                 checked_approvals += 1
                 errors.extend(f"{stage}:{code}" for code in approval_errors)
                 if not approval_errors:
@@ -954,6 +942,20 @@ def main(
             return 0 if preview.get("call_ceiling_sufficient") is True else 2
 
         if args.command == "approval-request":
+            if args.conversation_approval_reference is not None:
+                # Caller-asserted references are not host-verified evidence of
+                # approval, so they may not yield a spend-capable receipt.
+                _json_print(
+                    {
+                        "error": CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
+                        "remediation": (
+                            "Approve in conversation using `oab approval-preview`, then "
+                            "produce an externally signed stage approval with "
+                            "--approval-public-key and an Ed25519 signature."
+                        ),
+                    }
+                )
+                return 2
             preview = build_approval_preview(
                 args.output_root,
                 stage=args.stage,
@@ -964,35 +966,22 @@ def main(
             )
             if preview.get("call_ceiling_sufficient") is not True:
                 raise ValueError("stage_api_call_ceiling_insufficient")
-            if args.conversation_approval_reference is not None:
-                request = build_conversational_stage_approval(
-                    args.output_root,
-                    stage=args.stage,
-                    max_cost_usd=args.max_cost_usd,
-                    max_api_calls=args.max_api_calls,
-                    max_routes=args.max_routes,
-                    allow_unknown_costs=args.allow_unknown_costs,
-                    user_approval_reference=args.conversation_approval_reference,
-                )
-            else:
-                request = build_stage_approval_request(
-                    args.output_root,
-                    stage=args.stage,
-                    max_cost_usd=args.max_cost_usd,
-                    max_api_calls=args.max_api_calls,
-                    max_routes=args.max_routes,
-                    allow_unknown_costs=args.allow_unknown_costs,
-                    approval_public_key_path=args.approval_public_key,
-                )
+            request = build_stage_approval_request(
+                args.output_root,
+                stage=args.stage,
+                max_cost_usd=args.max_cost_usd,
+                max_api_calls=args.max_api_calls,
+                max_routes=args.max_routes,
+                allow_unknown_costs=args.allow_unknown_costs,
+                approval_public_key_path=args.approval_public_key,
+            )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", encoding="utf-8") as handle:
                 json.dump(request, handle, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
                 handle.write("\n")
-            signing_payload_path = None
-            if args.conversation_approval_reference is None:
-                signing_payload_path = Path(str(args.output) + ".signing-payload")
-                with signing_payload_path.open("xb") as handle:
-                    handle.write(stage_approval_signing_payload(request))
+            signing_payload_path = Path(str(args.output) + ".signing-payload")
+            with signing_payload_path.open("xb") as handle:
+                handle.write(stage_approval_signing_payload(request))
             _json_print(
                 {
                     "schema": "oab.approval-request-created/v1",
@@ -1015,14 +1004,15 @@ def main(
                 _json_print(load_campaign(args.output_root))
                 return 0
             approval_receipt = _load_json_object(approval_path)
-            conversational = (
-                approval_receipt.get("schema") == "oab.conversational-stage-approval/v2"
-            )
-            if conversational:
-                if args.approval_signature is not None or args.approval_public_key is not None:
-                    _json_print({"error": "conversation_approval_rejects_key_artifacts"})
-                    return 2
-            elif args.approval_signature is None or args.approval_public_key is None:
+            if approval_receipt.get("schema") == CONVERSATIONAL_STAGE_APPROVAL_SCHEMA:
+                _json_print(
+                    {
+                        "error": CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
+                        "remediation": "signed_stage_approval_required",
+                    }
+                )
+                return 2
+            if args.approval_signature is None or args.approval_public_key is None:
                 _json_print({"error": "signed_stage_approval_required"})
                 return 2
             if args.max_cost_usd is None or args.max_cost_usd <= 0:

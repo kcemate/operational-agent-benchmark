@@ -15,6 +15,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from oab.agent_workflow import _planned_stage_routes, load_campaign
 from tools.agent_workflow import (
     _classify_route_failure,
     _production_suite_runner,
@@ -290,6 +291,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
         max_cost_usd: float,
         max_api_calls: int,
         max_routes: int,
+        allow_unknown_costs: bool = False,
     ) -> list[str]:
         private_key = Ed25519PrivateKey.generate()
         public_path = root.parent / f"{stage}-approval-public.pem"
@@ -308,6 +310,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 "--max-routes", str(max_routes), "--approval-public-key", str(public_path),
                 "--output", str(request_path),
             ]
+            + (["--allow-unknown-costs"] if allow_unknown_costs else [])
         )
         self.assertEqual(0, code)
         receipt = json.loads(request_path.read_text(encoding="utf-8"))
@@ -459,7 +462,12 @@ class AgentWorkflowCliTests(unittest.TestCase):
             )
             self.assertEqual(2, code)
 
-    def test_conversational_qualification_requires_no_key_files(self) -> None:
+    def test_unverified_conversational_receipt_cannot_authorize_resume(self) -> None:
+        """`approval-request --conversation-approval-reference` must be refused.
+
+        The reference is caller-asserted, so it is not host-verified evidence of
+        approval and may not produce a spend-capable receipt.
+        """
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
             self.assertEqual(
@@ -472,9 +480,8 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 ),
             )
             approval = Path(td) / "qualification-conversation.json"
-            self.assertEqual(
-                0,
-                main(
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(
                     [
                         "approval-request", str(root), "--stage", "qualification",
                         "--max-cost-usd", "5", "--max-api-calls", "68", "--max-routes", "2",
@@ -482,9 +489,79 @@ class AgentWorkflowCliTests(unittest.TestCase):
                         "--conversation-approval-reference", "telegram:user-confirmed:$5:68:2:unknown-cost",
                         "--output", str(approval),
                     ]
+                )
+            self.assertEqual(2, code)
+            self.assertIn(
+                "conversation_approval_not_host_verified", stdout.getvalue()
+            )
+            self.assertFalse(approval.exists())
+
+            # A hand-written conversational receipt must not authorize resume either.
+            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
+            state = json.loads((root / "CAMPAIGN.json").read_text(encoding="utf-8"))
+            _plan, routes = _planned_stage_routes(
+                root.resolve(), load_campaign(root), stage="qualification", route_cap=2
+            )
+            body: dict[str, object] = {
+                "schema": "oab.conversational-stage-approval/v2",
+                "created_at": "2026-08-09T00:00:00+00:00",
+                "approval_assurance": "conversation_attested",
+                "user_approval_reference": "telegram:user-confirmed:$5:68:2:unknown-cost",
+                "stage": "qualification",
+                "plan_sha256": plan["plan_sha256"],
+                "calibration_sha256": state["calibration_sha256"],
+                "route_ids": [str(route["route_id"]) for route in routes],
+                "observed_cost_stop_usd": 5.0,
+                "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+                "max_cost_overshoot_api_calls": 1,
+                "max_api_calls": 68,
+                "max_routes": 2,
+                "allow_unknown_costs": True,
+            }
+            body["receipt_sha256"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    body, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            approval.write_text(json.dumps(body), encoding="utf-8")
+            calls: list[str] = []
+
+            def counting_runner(route: dict[str, object], stage: str, output: Path, effort: str) -> dict[str, object]:
+                calls.append(str(route["requested_route"]))
+                return {}
+
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(
+                    [
+                        "resume", str(root), "--qualification-approval", str(approval),
+                        "--max-cost-usd", "5", "--max-api-calls", "68", "--max-routes", "2",
+                        "--allow-unknown-costs",
+                    ],
+                    suite_runner=counting_runner,
+                )
+            self.assertEqual(2, code)
+            self.assertIn(
+                "conversation_approval_not_host_verified", stdout.getvalue()
+            )
+            self.assertEqual([], calls)
+
+    def test_signed_qualification_and_full_flow_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            self.assertEqual(
+                0,
+                main(
+                    ["benchmark", "--all-accessible", "--output-root", str(root), "--reasoning-effort", "high"],
+                    doctor_fn=self.doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
                 ),
             )
-            self.assertFalse(Path(str(approval) + ".signing-payload").exists())
+            approval = self.signed_cli_approval(
+                root, stage="qualification", max_cost_usd=5.0, max_api_calls=68,
+                max_routes=2, allow_unknown_costs=True,
+            )
 
             def runner(route: dict[str, object], stage: str, output: Path, effort: str) -> dict[str, object]:
                 if stage == "qualification":
@@ -527,7 +604,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 0,
                 main(
                     [
-                        "resume", str(root), "--qualification-approval", str(approval),
+                        "resume", str(root), *approval,
                         "--max-cost-usd", "5", "--max-api-calls", "68", "--max-routes", "2",
                         "--allow-unknown-costs",
                     ],
@@ -535,26 +612,17 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 ),
             )
             state = json.loads((root / "CAMPAIGN.json").read_text(encoding="utf-8"))
-            self.assertEqual("conversation_attested", state["spend"]["qualification_approval_assurance"])
+            self.assertEqual("external_signature", state["spend"]["qualification_approval_assurance"])
 
-            full_approval = Path(td) / "full-conversation.json"
-            self.assertEqual(
-                0,
-                main(
-                    [
-                        "approval-request", str(root), "--stage", "full",
-                        "--max-cost-usd", "50", "--max-api-calls", "2720", "--max-routes", "2",
-                        "--allow-unknown-costs",
-                        "--conversation-approval-reference", "telegram:user-confirmed:$50:2720:2:unknown-cost",
-                        "--output", str(full_approval),
-                    ]
-                ),
+            full_approval = self.signed_cli_approval(
+                root, stage="full", max_cost_usd=50.0, max_api_calls=2720,
+                max_routes=2, allow_unknown_costs=True,
             )
             self.assertEqual(
                 0,
                 main(
                     [
-                        "resume", str(root), "--full-approval", str(full_approval),
+                        "resume", str(root), *full_approval,
                         "--max-cost-usd", "50", "--max-api-calls", "2720", "--max-routes", "2",
                         "--allow-unknown-costs",
                     ],
@@ -562,7 +630,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 ),
             )
             state = json.loads((root / "CAMPAIGN.json").read_text(encoding="utf-8"))
-            self.assertEqual("conversation_attested", state["spend"]["full_run_approval_assurance"])
+            self.assertEqual("external_signature", state["spend"]["full_run_approval_assurance"])
             self.assertEqual("exploratory", state["evidence_posture"])
             self.assertFalse(state["release_authorized"])
             self.assertIn("release_not_authorized", state["authority_blockers"])
