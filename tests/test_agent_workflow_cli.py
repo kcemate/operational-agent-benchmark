@@ -93,7 +93,16 @@ class AgentWorkflowCliTests(unittest.TestCase):
             )
             self.assertEqual(2, preview["episodes_per_route"])
             self.assertEqual(4, preview["scheduled_episodes"])
-            self.assertEqual(4, preview["minimum_required_api_calls"])
+            # First attempt: 2 routes × 2 probes × 4 steps = 16 calls.
+            self.assertEqual(16, preview["minimum_required_api_calls"])
+            # Absolute reserve with one infrastructure retry/probe: 2 × 16 = 32.
+            self.assertEqual(32, preview["absolute_reserved_api_calls"])
+            self.assertEqual(8, preview["first_attempt_api_calls_per_route"])
+            self.assertEqual(16, preview["absolute_api_calls_per_route"])
+            self.assertEqual(4, preview["max_api_calls_per_episode"])
+            self.assertTrue(preview["call_ceiling_sufficient"])
+            self.assertIn("plumbing", preview["stage_purpose"].lower())
+            self.assertIn("no model-quality score", preview["stage_purpose"].lower())
             self.assertEqual("post_provider_call_observed_known_cost_stop", preview["cost_control_mode"])
             self.assertEqual(1, preview["max_cost_overshoot_api_calls"])
             self.assertTrue(preview["allow_unknown_costs"])

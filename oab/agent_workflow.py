@@ -1999,12 +1999,28 @@ def build_approval_preview(
     ):
         raise ValueError("campaign_plan_stage_invalid")
     scheduled_episodes = episodes_per_route * len(routes)
-    calls_per_episode = (
-        _QUALIFICATION_MAX_API_CALLS_PER_EPISODE
-        if stage == "qualification"
-        else _FULL_MAX_API_CALLS_PER_EPISODE
-    )
-    minimum_calls = scheduled_episodes * calls_per_episode
+    if stage == "qualification":
+        # v2.3.0 plumbing contract: two probes, up to four steps each.
+        # Absolute signed reserve is 16 calls/route (one infrastructure retry/probe).
+        calls_per_episode = _QUALIFICATION_V230_MAX_API_CALLS_PER_EPISODE
+        first_attempt_calls_per_route = (
+            _QUALIFICATION_V230_PROBES_PER_ROUTE
+            * _QUALIFICATION_V230_MAX_API_CALLS_PER_EPISODE
+        )
+        absolute_calls_per_route = _QUALIFICATION_V230_MAX_CALLS_PER_ROUTE
+        minimum_calls = first_attempt_calls_per_route * len(routes)
+        absolute_calls = absolute_calls_per_route * len(routes)
+        purpose = (
+            "Plumbing-only route readiness: bounded multi-turn tool loops. "
+            "No model-quality score is produced."
+        )
+    else:
+        calls_per_episode = _FULL_MAX_API_CALLS_PER_EPISODE
+        first_attempt_calls_per_route = episodes_per_route * calls_per_episode
+        absolute_calls_per_route = first_attempt_calls_per_route
+        minimum_calls = scheduled_episodes * calls_per_episode
+        absolute_calls = minimum_calls
+        purpose = "Full 80-episode quality comparison per route."
     return {
         "schema": "oab.approval-preview/v1",
         "stage": stage,
@@ -2020,13 +2036,17 @@ def build_approval_preview(
         "route_count": len(routes),
         "episodes_per_route": episodes_per_route,
         "scheduled_episodes": scheduled_episodes,
+        "stage_purpose": purpose,
         "observed_cost_stop_usd": budget,
         "cost_control_mode": _COST_CONTROL_MODE,
         "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
         "max_api_calls": call_budget,
         "minimum_required_api_calls": minimum_calls,
+        "absolute_reserved_api_calls": absolute_calls,
+        "first_attempt_api_calls_per_route": first_attempt_calls_per_route,
+        "absolute_api_calls_per_route": absolute_calls_per_route,
         "max_api_calls_per_episode": calls_per_episode,
-        "call_ceiling_sufficient": call_budget >= minimum_calls,
+        "call_ceiling_sufficient": call_budget >= absolute_calls,
         "max_routes": route_cap,
         "allow_unknown_costs": bool(allow_unknown_costs),
         "intended_evidence_posture": "exploratory_by_default",
@@ -2494,9 +2514,17 @@ def run_qualification_stage(
         full_plan_for_projection.get("episodes_per_route"), int
     ):
         raise ValueError("campaign_plan_projection_invalid")
+    qual_plan = plan.get("qualification")
+    qual_episodes = (
+        int(qual_plan["episodes_per_route"])
+        if isinstance(qual_plan, Mapping)
+        and isinstance(qual_plan.get("episodes_per_route"), int)
+        and not isinstance(qual_plan.get("episodes_per_route"), bool)
+        and int(qual_plan["episodes_per_route"]) > 0
+        else _QUALIFICATION_V230_PROBES_PER_ROUTE
+    )
     projection_factor = (
-        int(full_plan_for_projection["episodes_per_route"])
-        / _QUALIFICATION_EPISODES_PER_ROUTE
+        int(full_plan_for_projection["episodes_per_route"]) / qual_episodes
     )
     for route in routes:
         receipt_result = results.get(str(route.get("route_id") or ""))
@@ -2505,12 +2533,21 @@ def run_qualification_stage(
         classification = receipt_result.get("classification")
         if not isinstance(classification, Mapping):
             continue
+        status = classification.get("status")
+        if status == "qualified":
+            readiness = "READY"
+        elif status == "agent_loop_incompatible":
+            readiness = "INCOMPATIBLE"
+        else:
+            readiness = "NOT READY"
         summary = {
             "route_id": route.get("route_id"),
             "requested_route": route.get("requested_route"),
-            "status": classification.get("status"),
+            "status": status,
+            "readiness": readiness,
+            "reason_codes": classification.get("reason_codes") or [],
         }
-        if classification.get("status") == "qualified":
+        if status == "qualified":
             qualified.append(summary)
             cost = classification.get("observed_cost_usd")
             if isinstance(cost, (int, float)):
@@ -2549,21 +2586,45 @@ def run_qualification_stage(
     # total remains unavailable whenever unknown_cost_encountered is true.
     spend_state["observed_qualification_cost_usd"] = observed_qualification_known_cost
     state["spend"] = spend_state
+    if any(item.get("readiness") == "INCOMPATIBLE" for item in excluded):
+        headline_readiness = "INCOMPATIBLE"
+    elif len(qualified) >= 2 and state.get("status") == "awaiting_full_run_approval":
+        headline_readiness = "READY"
+    else:
+        headline_readiness = "NOT READY"
     qualification_report: dict[str, object] = {
-        "schema": "oab.qualification-summary/v1",
+        "schema": "oab.qualification-summary/v2",
         "created_at": _utc_now(),
         "status": state["status"],
+        "readiness": headline_readiness,
+        "headline": (
+            f"{headline_readiness}: qualification is a plumbing check only; "
+            "no model-quality score is produced."
+        ),
         "route_count": len(routes),
         "discovered_route_count": int(plan["route_count"]),
         "completed_routes": len(results),
         "qualified_routes": qualified,
         "excluded_routes": excluded,
+        "telemetry_posture": {
+            "api_calls": "locally_counted",
+            "tokens": "known_or_unknown_never_zero_coerced",
+            "billed_cost": "known_or_unknown_never_zero_coerced",
+        },
         "projected_full_run_cost_usd": round(projected, 12) if costs_known else None,
-        "cost_projection_basis": "qualification observed cost multiplied by 80/34 episodes",
+        "cost_projection_basis": (
+            f"qualification observed cost multiplied by "
+            f"{int(full_plan_for_projection['episodes_per_route'])}/{qual_episodes} episodes; "
+            "projection is spend planning only, not a quality score"
+        ),
         "projected_full_run_duration_seconds": (
             round(projected_duration, 3) if durations_known else None
         ),
-        "duration_projection_basis": "qualification elapsed time multiplied by 80/34 episodes",
+        "duration_projection_basis": (
+            f"qualification elapsed time multiplied by "
+            f"{int(full_plan_for_projection['episodes_per_route'])}/{qual_episodes} episodes; "
+            "projection is spend planning only, not a quality score"
+        ),
     }
     _atomic_json(root / "QUALIFICATION.json", qualification_report)
     _atomic_json(root / "CAMPAIGN.json", state)

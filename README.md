@@ -199,7 +199,7 @@ Cost control is a first-class feature, not a footnote.
 - `oab benchmark` performs **zero model inference**. It checks the environment, discovers routes, and calibrates.
 - Before any paid stage, `oab approval-preview` prints exactly what will run — ordered routes, episode counts, call ceilings, cost stop, and unknown-cost posture — with **no provider calls**.
 - Nothing runs until you approve those exact values. Approval is bound to the plan and calibration digests, so a receipt can't be reused for a different run.
-- Qualification is capped at 34 one-call episodes per route. A full comparison is a **separate** approval.
+- Qualification is a **plumbing-only** check: two bounded multi-turn probes per route (up to four provider calls each; absolute reserve 16 calls/route including one infrastructure-only retry per probe). It reports READY / NOT READY / INCOMPATIBLE and never a model-quality score. A full comparison is a **separate** approval.
 - If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing. Continuing requires a fresh preview and a new approval carrying `--allow-unknown-costs`.
 
 To compare just your current route against one candidate, pass a two-route inventory instead of letting discovery enumerate everything. Both `oab discover` and `oab benchmark` accept `--inventory-json`:
@@ -217,7 +217,7 @@ To compare just your current route against one candidate, pass a two-route inven
 
 `provider`/`model` name the current route and become the plan's baseline — they must also appear in `providers`, or the baseline ends up null. Every other field is discarded by the sanitizer, so never put credentials in this file. See `AGENTS.md` for the full contract.
 
-Two routes at 34 calls each is a **68-call** qualification ceiling; the full comparison reserves 1,360 calls per route, a **2,720-call** ceiling. Those are call counts, not dollar estimates — OAB cannot estimate dollars until qualification telemetry exists.
+Two routes at 16 absolute calls each is a **32-call** qualification ceiling; the full comparison reserves 1,360 calls per route, a **2,720-call** ceiling. Those are call counts, not dollar estimates — OAB cannot estimate dollars until qualification telemetry exists.
 
 ```bash
 oab approval-preview "$HOME/OAB-Runs/my-campaign" --stage qualification \

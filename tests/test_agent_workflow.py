@@ -968,16 +968,16 @@ class AgentWorkflowContractTests(unittest.TestCase):
         return {
             "requested_route": route,
             "reasoning_effort": "high",
-            "scheduled_episodes": 34,
-            "infrastructure_valid_episodes": 34,
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 2,
             "infrastructure_invalid_episodes": 0,
             "identity_source": "provider_response",
             "controller_config_sha256": "sha256:" + "a" * 64,
-            "controller_usage": {"api_calls": 34, "cost_usd": cost},
+            "controller_usage": {"api_calls": 8, "cost_usd": cost},
             "campaign_suite_verified": True,
             "campaign_elapsed_seconds": 2.0,
             "observations": [
-                {"runner_status": "task_failed", "reason_codes": ["model_protocol_invalid"]},
+                {"runner_status": "completed", "reason_codes": []},
                 {"runner_status": "completed", "reason_codes": []},
             ],
         }
@@ -1002,9 +1002,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     return {
                         "requested_route": requested,
                         "reasoning_effort": "high",
-                        "scheduled_episodes": 34,
+                        "scheduled_episodes": 2,
                         "infrastructure_valid_episodes": 0,
-                        "infrastructure_invalid_episodes": 34,
+                        "infrastructure_invalid_episodes": 2,
                         "identity_source": None,
                         "controller_usage": {"api_calls": 1, "cost_usd": 0.4},
                         "campaign_suite_verified": True,
@@ -1020,10 +1020,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=102,
+                max_api_calls=48,
                 max_routes=3,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=102,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=48,
                     max_routes=3, allow_unknown_costs=False,
                 ),
             )
@@ -1036,12 +1036,19 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual(1, len(approvals))
             approval = json.loads(approvals[0].read_text(encoding="utf-8"))
             self.assertEqual("qualification", approval["stage"])
-            self.assertEqual(102, approval["max_api_calls"])
+            self.assertEqual(48, approval["max_api_calls"])
             self.assertEqual(3, approval["max_routes"])
             self.assertRegex(approval["receipt_sha256"], r"^sha256:[0-9a-f]{64}$")
             qualification = json.loads((root / "QUALIFICATION.json").read_text(encoding="utf-8"))
-            self.assertEqual(0.470588235294, qualification["projected_full_run_cost_usd"])
-            self.assertEqual(9.412, qualification["projected_full_run_duration_seconds"])
+            # 2 qualified routes × $0.1 × (80 full episodes / 2 qual probes) = $8.0
+            self.assertEqual(8.0, qualification["projected_full_run_cost_usd"])
+            self.assertEqual(160.0, qualification["projected_full_run_duration_seconds"])
+            self.assertEqual("READY", qualification["readiness"])
+            self.assertIn("plumbing", qualification["headline"].lower())
+            self.assertNotIn("%", qualification["headline"])
+            for route in qualification["qualified_routes"]:
+                self.assertEqual("READY", route["readiness"])
+            self.assertEqual("NOT READY", qualification["excluded_routes"][0]["readiness"])
 
     def test_infrastructure_invalid_known_cost_exhausts_signed_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:

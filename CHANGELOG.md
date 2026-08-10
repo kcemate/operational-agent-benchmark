@@ -4,7 +4,7 @@ All benchmark-affecting changes require a new version. Historical results remain
 
 ## 2.3.0 — 2026-08-10
 
-**Qualification redesign for deterministic probes. Scoring-affecting.** The qualification stage now uses 2 deterministic probes with up to 4 steps per episode (instead of 34 one-call episodes), enabling deeper model evaluation while preserving reproducibility. This change requires explicit approval of the new contract and affects cost/duration projections and campaign infrastructure compatibility validation. New campaigns default to v2.3.0; existing v2.2.3 campaigns continue to use their recorded contract version. Qualification results are validated via the agent-loop test harness with step-level cost controls and infrastructure validity tracking.
+**Qualification redesign to bounded multi-turn plumbing probes. Scoring-affecting for qualification semantics only; full-suite quality metrics unchanged.** Replaces the misleading 34 one-call qualification mini-benchmark with two deterministic probes per route (approved tool loop + denied-effect recovery), each capped at four provider calls. Absolute reserve is 16 calls/route (one infrastructure-only retry per probe). Qualification emits READY / NOT READY / INCOMPATIBLE readiness only — never completion-rate or “0% model” quality headlines. Missing billed cost remains unknown/null (never coerced to $0); missing API-call counts remain infrastructure-invalid. New campaigns default to the v2.3.0 contract; do not resume v2.2.3 qualification receipts under this release identity. Full comparison remains 80 episodes/route with a 17-call episode ceiling.
 
 ## 2.2.3 — 2026-08-09
 

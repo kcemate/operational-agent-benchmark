@@ -119,7 +119,7 @@ oab resume "$HOME/OAB-Runs/my-campaign" \
   --max-routes <same-approved-route-count>
 ```
 
-Qualification runs the P01 matched approved/prohibited pair for 17 repetitions: exactly 34 one-call episodes and at most 34 provider API calls per route. This is a bounded infrastructure, identity, effort, telemetry, and first-response probe—not a substitute for the 80-episode full comparison. A route with all 34 infrastructure-valid episodes, pinned effort, and route identity attestation is qualified even if its one-call model outputs earn zero task credit. Authentication, route, provider, controller, containment, and effort-attestation failures are excluded and never become model scores.
+Qualification runs two deterministic multi-turn plumbing probes per route (approved read/tool loop and denied-effect recovery), each bounded to four provider calls. First-attempt reserve is eight calls per route; with one infrastructure-only retry per probe the absolute signed ceiling is sixteen calls per route. Qualification reports only READY / NOT READY / INCOMPATIBLE plus failure reasons — never a completion rate, pair stability, or “0% model” quality headline. It is not a substitute for the 80-episode full comparison. Authentication, route, provider, controller, containment, effort-attestation, and missing API-call-count failures remain infrastructure exclusions, never model scores.
 
 If any route lacks cost telemetry, OAB pauses after that route and returns exit status `3`. Continue only after disclosing the unknown-cost condition and obtaining a **new** exact preview and approval that include `--allow-unknown-costs`; pass the same flag on `resume`.
 
@@ -155,7 +155,7 @@ The detached Ed25519 path is the only spend-capable authorization path: create t
 
 A stage approval authorizes only the exact bounded spend stage. It **does not confer release authority**. Receipts bind the plan/calibration digests, ordered route IDs, observed known-billed-cost stop, cost-control mode, maximum one crossing call, API-call and route ceilings, and unknown-cost posture. Because cost arrives after provider calls, the call revealing a threshold crossing may exceed it; all later calls stop. `--max-cost-usd` is only a compatibility alias, not an absolute prepaid cap.
 
-Qualification schedules exactly 34 one-call episodes and reserves up to 34 calls per route; full comparison reserves up to 1,360 calls per route. Exact-tree release approval plus all identity, coverage, grid, runtime, and seal gates is required for `authoritative_comparable`. Otherwise `report` and `verify` must label the campaign `exploratory`, expose route-level blockers, and decline an authoritative switch recommendation.
+Qualification schedules exactly two probes and reserves up to 16 calls per route (32 for a two-route campaign); full comparison reserves up to 1,360 calls per route. Exact-tree release approval plus all identity, coverage, grid, runtime, and seal gates is required for `authoritative_comparable`. Otherwise `report` and `verify` must label the campaign `exploratory`, expose route-level blockers, and decline an authoritative switch recommendation.
 
 ## Resume and verification
 
