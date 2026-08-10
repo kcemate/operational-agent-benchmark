@@ -33,9 +33,18 @@ _ACTIVE_CAMPAIGN_DIRECTORIES: contextvars.ContextVar[dict[Path, int] | None] = (
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _COST_CONTROL_MODE = "post_provider_call_observed_known_cost_stop"
 _MAX_COST_OVERSHOOT_API_CALLS = 1
+
+# v2.2.3 (legacy) qualification: 34 one-call episodes per route
 _QUALIFICATION_REPETITIONS = 17
 _QUALIFICATION_EPISODES_PER_ROUTE = 34
 _QUALIFICATION_MAX_API_CALLS_PER_EPISODE = 1
+
+# v2.3.0 (new) qualification: 2 deterministic probes with up to 4 steps per episode
+_QUALIFICATION_V230_PROBES_PER_ROUTE = 2
+_QUALIFICATION_V230_MAX_API_CALLS_PER_EPISODE = 4
+_QUALIFICATION_V230_MAX_CALLS_PER_ROUTE = 16  # 2 probes × 4 calls + 1 retry per probe = 16
+
+# Full-stage suite (unchanged)
 _FULL_MAX_API_CALLS_PER_EPISODE = 17
 _PROVIDER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MODEL_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,256}$")
@@ -1195,6 +1204,12 @@ def classify_qualification(
     requested_route: str,
     reasoning_effort: str,
 ) -> dict[str, object]:
+    """Classify qualification results for route readiness.
+
+    Supports both:
+    - v2.2.3 (legacy): 34 one-call episodes per route, emits scoreable
+    - v2.3.0: 2 deterministic probes with up to 4 steps, never emits scoreable
+    """
     try:
         orchestration_metadata = _validate_campaign_orchestration_metadata(report)
     except ValueError:
@@ -1229,10 +1244,14 @@ def classify_qualification(
         if orchestration_metadata is not None
         else None
     )
+
+    # Detect contract version by episode count
+    scheduled = report.get("scheduled_episodes")
+    is_v230_contract = scheduled == _QUALIFICATION_V230_PROBES_PER_ROUTE
+
     base: dict[str, object] = {
         "requested_route": requested_route,
         "status": "infrastructure_invalid",
-        "scoreable": False,
         "reason_codes": sorted(reasons),
         "observed_cost_usd": observed_cost,
         "observed_known_cost_usd": observed_known_cost,
@@ -1241,6 +1260,11 @@ def classify_qualification(
         "identity_source": report.get("identity_source"),
         "controller_config_sha256": report.get("controller_config_sha256"),
     }
+
+    # Only add scoreable field for legacy v2.2.3 contracts
+    if not is_v230_contract:
+        base["scoreable"] = False
+
     if report.get("requested_route") != requested_route:
         base["status"] = "route_mismatch"
         return base
@@ -1265,24 +1289,45 @@ def classify_qualification(
     if orchestration_metadata is None:
         base["status"] = "qualification_contract_invalid"
         return base
-    scheduled = report.get("scheduled_episodes")
+
     valid = report.get("infrastructure_valid_episodes")
     invalid = report.get("infrastructure_invalid_episodes")
     observed_api_calls = usage_map.get("api_calls")
-    if (
-        scheduled != _QUALIFICATION_EPISODES_PER_ROUTE
-        or valid != _QUALIFICATION_EPISODES_PER_ROUTE
-        or invalid != 0
-        or observed_api_calls != _QUALIFICATION_EPISODES_PER_ROUTE
-    ):
-        base["status"] = "qualification_contract_invalid"
-        return base
+
+    # v2.3.0 contract: 2 probes, expect 2 scheduled and valid
+    if is_v230_contract:
+        # Check for agent_loop_incompatible: both probes failed with controller_step_limit_exceeded
+        if (valid == 0 and invalid == _QUALIFICATION_V230_PROBES_PER_ROUTE and
+            all("controller_step_limit_exceeded" in obs.get("reason_codes", [])
+                for obs in (report.get("observations") or []))):
+            base["status"] = "agent_loop_incompatible"
+            return base
+        # Otherwise treat infrastructure failures normally
+        if valid != _QUALIFICATION_V230_PROBES_PER_ROUTE or invalid != 0:
+            base["status"] = "qualification_contract_invalid"
+            return base
+        # v2.3.0: validate api_calls are reasonable (at least 2 per probe minimum)
+        if isinstance(observed_api_calls, int) and observed_api_calls < 4:
+            base["status"] = "qualification_contract_invalid"
+            return base
+    # v2.2.3 contract (legacy): 34 episodes, expect 34 scheduled and valid
+    else:
+        if (
+            scheduled != _QUALIFICATION_EPISODES_PER_ROUTE
+            or valid != _QUALIFICATION_EPISODES_PER_ROUTE
+            or invalid != 0
+            or observed_api_calls != _QUALIFICATION_EPISODES_PER_ROUTE
+        ):
+            base["status"] = "qualification_contract_invalid"
+            return base
+
     if report.get("identity_source") not in {"provider_response", "adapter_runtime"}:
         base["status"] = "identity_unattested"
         return base
     base["status"] = "qualified"
-    base["scoreable"] = True
-    base["authority_eligible"] = report.get("identity_source") == "provider_response"
+    # Only set authority_eligible for legacy contracts; v2.3.0 has no authority concept in qualification
+    if not is_v230_contract:
+        base["authority_eligible"] = report.get("identity_source") == "provider_response"
     return base
 
 

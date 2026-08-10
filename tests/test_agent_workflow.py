@@ -2215,6 +2215,81 @@ class AgentWorkflowContractTests(unittest.TestCase):
             )
             self.assertEqual(["xai-oauth/grok-test"], calls)
 
+    def test_v230_qualification_with_completed_probes_is_ready(self) -> None:
+        """GREEN: v2.3.0 qualification accepts 2 completed probes and reports READY status."""
+        report = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,  # v2.3.0: 2 probes instead of 34 episodes
+            "infrastructure_valid_episodes": 2,  # Both probes succeeded
+            "infrastructure_invalid_episodes": 0,
+            "identity_source": "provider_response",
+            "controller_usage": {"api_calls": 8, "cost_usd": 0.08},  # 2 probes × 4 calls
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 2.5,
+            "observations": [],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        # v2.3.0: No scoreable field for qualification
+        self.assertNotIn("scoreable", result)
+        self.assertEqual("qualified", result["status"])
+
+    def test_v230_qualification_agent_loop_incompatible_when_model_cannot_tool_loop(self) -> None:
+        """GREEN: v2.3.0 adds agent_loop_incompatible for models that can't complete tool loop."""
+        report = {
+            "requested_route": "openai-codex/gpt-current",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,  # 2 probes attempted
+            "infrastructure_valid_episodes": 0,  # No probes completed
+            "infrastructure_invalid_episodes": 2,  # Both failed
+            "identity_source": "provider_response",
+            "controller_usage": {"api_calls": 4, "cost_usd": 0.04},
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 1.2,
+            "observations": [
+                {"runner_status": "task_failed", "reason_codes": ["controller_step_limit_exceeded"]},
+                {"runner_status": "task_failed", "reason_codes": ["controller_step_limit_exceeded"]},
+            ],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="openai-codex/gpt-current",
+            reasoning_effort="high",
+        )
+        # v2.3.0: agent_loop_incompatible when model cannot complete tool loop within bounds
+        self.assertEqual("agent_loop_incompatible", result["status"])
+        self.assertNotIn("scoreable", result)
+
+    def test_v230_qualification_infrastructure_failure_is_not_quality_score(self) -> None:
+        """GREEN: v2.3.0 infrastructure failures are never reported as model quality."""
+        report = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 0,
+            "infrastructure_invalid_episodes": 2,
+            "identity_source": None,
+            "controller_usage": {"api_calls": 0, "cost_usd": 0.0},
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 0.8,
+            "observations": [
+                {"runner_status": "runner_invalid", "reason_codes": ["provider_rate_limited"]},
+                {"runner_status": "runner_invalid", "reason_codes": ["provider_rate_limited"]},
+            ],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("provider_rate_limited", result["status"])
+        # No scoreable field - infrastructure failures never score
+        self.assertNotIn("scoreable", result)
+
     def test_decision_declines_without_two_authoritative_comparable_routes(self) -> None:
         report = build_decision_report(
             current_route="openai-codex/gpt-current",
