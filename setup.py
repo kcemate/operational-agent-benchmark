@@ -10,6 +10,7 @@ from setuptools.command.build_py import build_py
 ROOT = Path(__file__).resolve().parent
 EXCLUDED_PARTS = {
     ".git",
+    ".hermes",  # local agent runtime/plans: git-ignored, never release content
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",

@@ -1,16 +1,60 @@
 from __future__ import annotations
 
 import tomllib
+import importlib.util
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingContractTests(unittest.TestCase):
+    def test_frozen_release_tree_excludes_local_agent_runtime(self) -> None:
+        """`.hermes/` must never be copied into the wheel's frozen release tree.
+
+        It is git-ignored local agent runtime and plans; embedding it would both
+        diverge from RELEASE_MANIFEST.json and publish untracked local state.
+        """
+        sys.path.insert(0, str(ROOT))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_oab_setup_under_test", ROOT / "setup.py"
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            with patch("setuptools.setup"):
+                spec.loader.exec_module(module)
+            self.assertIn(".hermes", module.EXCLUDED_PARTS)
+            offenders = [
+                str(path)
+                for path in module.release_files()
+                if path.parts and path.parts[0] == ".hermes"
+            ]
+            self.assertEqual([], offenders)
+        finally:
+            sys.path.remove(str(ROOT))
+
+    def test_frozen_release_tree_matches_release_manifest_exclusions(self) -> None:
+        """setup.py and tools/release_manifest.py must agree on what is release content."""
+        sys.path.insert(0, str(ROOT))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_oab_setup_exclusions", ROOT / "setup.py"
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            with patch("setuptools.setup"):
+                spec.loader.exec_module(module)
+            from tools.release_manifest import _EXCLUDED_PARTS
+
+            self.assertEqual(set(_EXCLUDED_PARTS), set(module.EXCLUDED_PARTS))
+        finally:
+            sys.path.remove(str(ROOT))
+
     def test_runtime_package_does_not_import_collision_prone_tools_namespace(self) -> None:
         offenders = []
         for path in sorted((ROOT / "oab").glob("*.py")):
