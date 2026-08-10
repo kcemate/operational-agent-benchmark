@@ -1334,8 +1334,19 @@ def classify_qualification(
         if valid != _QUALIFICATION_V230_PROBES_PER_ROUTE or invalid != 0:
             base["status"] = "qualification_contract_invalid"
             return base
-        # v2.3.0: validate api_calls are reasonable (at least 2 per probe minimum)
-        if isinstance(observed_api_calls, int) and observed_api_calls < 4:
+        # API-call counting is mandatory and locally enforceable. A missing or
+        # non-integer count means OAB cannot enforce its own spend ceiling, so the
+        # route is infrastructure-invalid rather than qualified (plan Task 4 step 1).
+        if not isinstance(observed_api_calls, int) or isinstance(observed_api_calls, bool):
+            base["status"] = "qualification_contract_invalid"
+            return base
+        # Two probes must each complete a real tool loop (>= 2 calls per probe) and
+        # can never exceed the signed absolute reserve of 16 calls per route.
+        if (
+            observed_api_calls
+            < _QUALIFICATION_V230_PROBES_PER_ROUTE * 2
+            or observed_api_calls > _QUALIFICATION_V230_MAX_CALLS_PER_ROUTE
+        ):
             base["status"] = "qualification_contract_invalid"
             return base
     # v2.2.3 contract (legacy): 34 episodes, expect 34 scheduled and valid

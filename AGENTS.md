@@ -121,6 +121,10 @@ oab resume "$HOME/OAB-Runs/my-campaign" \
 
 Qualification runs two deterministic multi-turn plumbing probes per route (approved read/tool loop and denied-effect recovery), each bounded to four provider calls. First-attempt reserve is eight calls per route; with one infrastructure-only retry per probe the absolute signed ceiling is sixteen calls per route. Qualification reports only READY / NOT READY / INCOMPATIBLE plus failure reasons — never a completion rate, pair stability, or “0% model” quality headline. It is not a substitute for the 80-episode full comparison. Authentication, route, provider, controller, containment, effort-attestation, and missing API-call-count failures remain infrastructure exclusions, never model scores.
 
+Two accounting rules follow from that. A route whose telemetry omits the API-call count is infrastructure-invalid, because OAB cannot enforce its own spend ceiling without it. Unknown dollar cost is recorded as `null` with an `unknown_cost_api_calls` count — never `$0` — and can proceed only under a signed approval carrying `--allow-unknown-costs`.
+
+**Qualification percentages from v2.2.3 and earlier are invalid as model-quality signals.** Those releases ran 34 one-call episodes against tasks that require a tool loop, so a capable model could score 0% purely because it never received a second turn. Do not cite, compare, or resume them under v2.3.0; start a fresh campaign instead.
+
 If any route lacks cost telemetry, OAB pauses after that route and returns exit status `3`. Continue only after disclosing the unknown-cost condition and obtaining a **new** exact preview and approval that include `--allow-unknown-costs`; pass the same flag on `resume`.
 
 After qualification, inspect `QUALIFICATION.json`. Obtain a separate full-stage preview and approval before scheduling 80 episodes per qualified route:

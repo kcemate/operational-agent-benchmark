@@ -23,6 +23,7 @@ from oab.agent_workflow import (
     _validate_campaign_orchestration_metadata,
     _write_attempt_event,
     build_campaign_plan,
+    build_approval_preview,
     build_decision_report,
     build_stage_approval_request,
     classify_qualification,
@@ -2447,6 +2448,173 @@ class AgentWorkflowContractTests(unittest.TestCase):
         # When known_cost_usd is missing but cost_usd is provided, use cost_usd
         self.assertEqual(0.08, result["observed_known_cost_usd"])
         self.assertEqual(0.08, result["observed_cost_usd"])
+
+    def _v230_qualification_report(self, **overrides: object) -> dict[str, object]:
+        report: dict[str, object] = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 2,
+            "infrastructure_invalid_episodes": 0,
+            "identity_source": "provider_response",
+            "controller_usage": {
+                "api_calls": 8,
+                "cost_usd": 0.08,
+                "known_cost_usd": 0.08,
+                "unknown_cost_api_calls": 0,
+            },
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 2.5,
+            "observations": [],
+        }
+        report.update(overrides)
+        return report
+
+    def test_v230_missing_api_call_count_is_infrastructure_invalid(self) -> None:
+        """Missing API-call telemetry must never qualify: the spend ceiling is unenforceable."""
+        report = self._v230_qualification_report(
+            controller_usage={"cost_usd": 0.08, "known_cost_usd": 0.08, "unknown_cost_api_calls": 0}
+        )
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("qualification_contract_invalid", result["status"])
+        self.assertNotIn("scoreable", result)
+
+    def test_v230_null_api_call_count_is_infrastructure_invalid(self) -> None:
+        report = self._v230_qualification_report(
+            controller_usage={
+                "api_calls": None,
+                "cost_usd": 0.08,
+                "known_cost_usd": 0.08,
+                "unknown_cost_api_calls": 0,
+            }
+        )
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("qualification_contract_invalid", result["status"])
+
+    def test_v230_api_calls_above_absolute_route_reserve_is_invalid(self) -> None:
+        """Absolute reserve is 16 calls/route; more than that cannot be a valid probe pair."""
+        report = self._v230_qualification_report(
+            controller_usage={
+                "api_calls": 17,
+                "cost_usd": 0.2,
+                "known_cost_usd": 0.2,
+                "unknown_cost_api_calls": 0,
+            }
+        )
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("qualification_contract_invalid", result["status"])
+
+    def test_v230_unknown_cost_qualifies_and_stays_null_never_zero(self) -> None:
+        report = self._v230_qualification_report(
+            controller_usage={
+                "api_calls": 8,
+                "cost_usd": None,
+                "known_cost_usd": None,
+                "unknown_cost_api_calls": 8,
+            }
+        )
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("qualified", result["status"])
+        self.assertIsNone(result["observed_known_cost_usd"])
+        self.assertIsNone(result["observed_cost_usd"])
+        self.assertNotEqual(0.0, result["observed_known_cost_usd"])
+        self.assertEqual(8, result["unknown_cost_api_calls"])
+
+    def test_v230_qualification_output_carries_no_quality_metric(self) -> None:
+        result = classify_qualification(
+            self._v230_qualification_report(),
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        forbidden = {
+            "scoreable",
+            "completion_rate",
+            "matched_pair_completion_rate",
+            "pair_stability",
+            "diagnostic_gate_pass_rate",
+            "contract_completion_rate",
+        }
+        self.assertEqual(set(), forbidden & set(result))
+
+    def test_v230_route_mismatch_is_infrastructure_not_quality(self) -> None:
+        result = classify_qualification(
+            self._v230_qualification_report(requested_route="xai-oauth/other"),
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        self.assertEqual("route_mismatch", result["status"])
+        self.assertNotIn("scoreable", result)
+
+    def test_qualification_preview_binds_plumbing_only_2_probe_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            record_calibration(
+                root, {"schema": "oab.calibration-report/v1", "passed": True, "failures": []}
+            )
+            preview = build_approval_preview(
+                root,
+                stage="qualification",
+                max_cost_usd=25.0,
+                max_api_calls=32,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+            self.assertEqual(2, preview["episodes_per_route"])
+            self.assertEqual(4, preview["max_api_calls_per_episode"])
+            self.assertEqual(8, preview["first_attempt_api_calls_per_route"])
+            self.assertEqual(16, preview["absolute_api_calls_per_route"])
+            self.assertEqual(16, preview["minimum_required_api_calls"])
+            self.assertEqual(32, preview["absolute_reserved_api_calls"])
+            self.assertTrue(preview["call_ceiling_sufficient"])
+            self.assertIn("Plumbing-only", str(preview["stage_purpose"]))
+            self.assertIn("No model-quality score", str(preview["stage_purpose"]))
+            serialized = json.dumps(preview)
+            self.assertNotIn("completion_rate", serialized)
+            self.assertNotIn("%", serialized)
+
+    def test_qualification_preview_rejects_ceiling_below_absolute_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+            record_calibration(
+                root, {"schema": "oab.calibration-report/v1", "passed": True, "failures": []}
+            )
+            preview = build_approval_preview(
+                root,
+                stage="qualification",
+                max_cost_usd=25.0,
+                max_api_calls=31,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+            self.assertFalse(preview["call_ceiling_sufficient"])
 
     def test_classification_truly_unknown_cost_is_null(self) -> None:
         """GREEN: When both cost_usd and known_cost_usd are missing, result is None."""
