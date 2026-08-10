@@ -1051,7 +1051,7 @@ def build_campaign_plan(
     if repetitions < 1:
         raise ValueError("repetitions_invalid")
     route_count = len(routes)
-    qualification_per_route = _QUALIFICATION_EPISODES_PER_ROUTE
+    qualification_per_route = _QUALIFICATION_V230_PROBES_PER_ROUTE
     full_per_route = len(pair_ids) * 2 * repetitions
     plan: dict[str, object] = {
         "schema": "oab.campaign-plan/v1",
@@ -1064,7 +1064,7 @@ def build_campaign_plan(
         "routes": [str(route.get("requested_route")) for route in routes if isinstance(route, Mapping)],
         "qualification": {
             "pair_ids": ["P01"],
-            "repetitions": _QUALIFICATION_REPETITIONS,
+            "repetitions": _QUALIFICATION_V230_PROBES_PER_ROUTE,
             "episodes_per_route": qualification_per_route,
             "scheduled_episodes": route_count * qualification_per_route,
         },

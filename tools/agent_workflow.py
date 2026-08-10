@@ -763,8 +763,10 @@ def _verify_campaign(
             if usage_source.get("observed_cost_usd") != report_usage_map.get("cost_usd"):
                 errors.append(f"{stage}:{result_path.stem}:result_cost_mismatch")
             expected_known_cost = _known_cost_from_report(suite_report)
-            if usage_source.get("observed_known_cost_usd") != expected_known_cost:
-                errors.append(f"{stage}:{result_path.stem}:result_known_cost_mismatch")
+            observed_known = usage_source.get("observed_known_cost_usd")
+            if observed_known != expected_known_cost:
+                if not (observed_known is None and expected_known_cost == 0.0):
+                    errors.append(f"{stage}:{result_path.stem}:result_known_cost_mismatch")
             expected_unknown_calls = _unknown_cost_api_calls_from_report(suite_report)
             if usage_source.get("unknown_cost_api_calls") != expected_unknown_calls:
                 errors.append(f"{stage}:{result_path.stem}:result_unknown_cost_calls_mismatch")

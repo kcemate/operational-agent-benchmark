@@ -78,7 +78,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                         "--observed-cost-stop-usd",
                         "5",
                         "--max-api-calls",
-                        "68",
+                        "32",
                         "--max-routes",
                         "2",
                         "--allow-unknown-costs",
@@ -91,9 +91,9 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 ["openai-codex/current", "openai-codex/candidate"],
                 [item["requested_route"] for item in preview["routes"]],
             )
-            self.assertEqual(34, preview["episodes_per_route"])
-            self.assertEqual(68, preview["scheduled_episodes"])
-            self.assertEqual(68, preview["minimum_required_api_calls"])
+            self.assertEqual(2, preview["episodes_per_route"])
+            self.assertEqual(4, preview["scheduled_episodes"])
+            self.assertEqual(4, preview["minimum_required_api_calls"])
             self.assertEqual("post_provider_call_observed_known_cost_stop", preview["cost_control_mode"])
             self.assertEqual(1, preview["max_cost_overshoot_api_calls"])
             self.assertTrue(preview["allow_unknown_costs"])
@@ -112,7 +112,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 "model": "grok-4.5",
                 "requested_route": "xai-oauth/grok-4.5",
                 "max_observed_cost_usd": 4.75,
-                "max_api_calls": 34,
+                "max_api_calls": 16,
                 "allow_unknown_costs": True,
             }
             with patch(
@@ -127,9 +127,9 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "campaign_controller_failed"):
                     runner(route, "qualification", Path(td).resolve() / "suite", "high")
             command = execute.call_args.args[0]
-            self.assertEqual("17", command[command.index("--repetitions") + 1])
-            self.assertEqual("1", command[command.index("--max-steps-per-episode") + 1])
-            self.assertEqual("34", command[command.index("--max-api-calls") + 1])
+            self.assertEqual("2", command[command.index("--repetitions") + 1])
+            self.assertEqual("4", command[command.index("--max-steps-per-episode") + 1])
+            self.assertEqual("16", command[command.index("--max-api-calls") + 1])
             self.assertIn("--max-observed-cost-usd", command)
             self.assertEqual("4.75", command[command.index("--max-observed-cost-usd") + 1])
             self.assertIn("--allow-unknown-costs", command)
@@ -559,7 +559,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 ),
             )
             approval = self.signed_cli_approval(
-                root, stage="qualification", max_cost_usd=5.0, max_api_calls=68,
+                root, stage="qualification", max_cost_usd=5.0, max_api_calls=32,
                 max_routes=2, allow_unknown_costs=True,
             )
 
@@ -568,11 +568,11 @@ class AgentWorkflowCliTests(unittest.TestCase):
                     report = {
                         "requested_route": route["requested_route"],
                         "reasoning_effort": effort,
-                        "scheduled_episodes": 34,
-                        "infrastructure_valid_episodes": 34,
+                        "scheduled_episodes": 2,
+                        "infrastructure_valid_episodes": 2,
                         "infrastructure_invalid_episodes": 0,
                         "identity_source": "provider_response",
-                        "controller_usage": {"api_calls": 34, "cost_usd": None},
+                        "controller_usage": {"api_calls": 16, "cost_usd": None},
                         "observations": [
                             {"runner_status": "completed", "reason_codes": []},
                             {"runner_status": "completed", "reason_codes": []},
@@ -605,7 +605,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 main(
                     [
                         "resume", str(root), *approval,
-                        "--max-cost-usd", "5", "--max-api-calls", "68", "--max-routes", "2",
+                        "--max-cost-usd", "5", "--max-api-calls", "32", "--max-routes", "2",
                         "--allow-unknown-costs",
                     ],
                     suite_runner=runner,
