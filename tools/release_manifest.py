@@ -17,7 +17,16 @@ from oab import __version__
 from oab.paths import benchmark_root
 
 _SCHEMA = "oab.release-manifest/v1"
-_EXCLUDED_PARTS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist"}
+_EXCLUDED_PARTS = {
+    ".git",
+    ".hermes",  # local agent runtime/plans: git-ignored, never release content
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "build",
+    "dist",
+}
 _EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 _EXCLUDED_NAMES = {".DS_Store", "RELEASE_MANIFEST.json"}
 

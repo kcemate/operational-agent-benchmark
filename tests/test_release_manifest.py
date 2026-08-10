@@ -27,6 +27,26 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertEqual(1, first["file_count"])
             self.assertEqual("a.txt", first["files"][0]["path"])
 
+    def test_local_agent_runtime_is_never_part_of_the_release_tree(self) -> None:
+        """`.hermes/` holds local agent runtime and plans, never release content.
+
+        It is git-ignored, so a filesystem walk would otherwise bind untracked —
+        and possibly secret-bearing — agent state into the published release-tree
+        digest.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("alpha", encoding="utf-8")
+            runtime = root / ".hermes" / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "session-receipt.md").write_text("local", encoding="utf-8")
+            (root / ".hermes" / "plans").mkdir()
+            (root / ".hermes" / "plans" / "plan.md").write_text("plan", encoding="utf-8")
+            manifest = build_release_manifest(root)
+            paths = [entry["path"] for entry in manifest["files"]]
+            self.assertEqual(["a.txt"], paths)
+            self.assertEqual(1, manifest["file_count"])
+
     def test_verify_detects_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
