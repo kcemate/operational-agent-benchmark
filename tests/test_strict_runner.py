@@ -667,6 +667,237 @@ class StrictRunnerTests(unittest.TestCase):
             self.assertFalse((base / "evidence/mock-effects.jsonl").exists())
 
 
+class QualificationMultiTurnRegressionTests(unittest.TestCase):
+    """RED tests: encode the v2.2.3 one-turn qualification failure.
+
+    v2.2.3 runs qualification with max_steps=1 per episode (_QUALIFICATION_MAX_API_CALLS_PER_EPISODE=1),
+    which means any model that requires multiple turns to complete a tool loop will fail
+    with controller_step_limit_exceeded.
+
+    These tests prove that:
+    1. A multi-turn model (read tool -> result -> final answer) cannot complete with max_steps=1
+    2. The same model succeeds with max_steps=4 (the intended v2.3.0 target)
+    3. An infinite-loop model is properly bounded by the step limit
+
+    This RED failure must be preserved as a regression test to prevent reverting to
+    one-turn qualification in future releases.
+    """
+
+    def make_spec(self, base: Path) -> tuple[Path, StrictEpisodeSpec, ToolPolicy]:
+        """Standard test fixture similar to StrictRunnerTests."""
+        repository = base / "repository"
+        input_tree = repository / "fixture"
+        (input_tree / "input").mkdir(parents=True)
+        (input_tree / "input/value.txt").write_text("sample-value", encoding="utf-8")
+        (repository / "secret.txt").write_text("outside", encoding="utf-8")
+        spec = StrictEpisodeSpec(
+            case_id="regression-multi-turn",
+            repetition=1,
+            task_bytes=b"Read input/value.txt and return a final answer based on it.\n",
+            input_tree=input_tree,
+            timeout_seconds=10,
+        )
+        policy = ToolPolicy(
+            allowed_reads=("input/value.txt",),
+            allowed_writes=("output/result.json",),
+            allowed_effects=(),
+            max_steps=4,  # Will be overridden in tests for one-call regression
+            max_write_bytes=1024,
+        )
+        return repository, spec, policy
+
+    def test_multi_turn_model_fails_with_one_step_limit(self) -> None:
+        """RED: a two-turn model (tool request + final answer) fails with max_steps=1."""
+        class TwoTurnController:
+            def __init__(self) -> None:
+                self.step = 0
+
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                return ControllerIdentity(
+                    adapter_name="test-two-turn",
+                    adapter_version="1.0",
+                    adapter_sha256="sha256:" + "1" * 64,
+                    requested_route="test/two-turn",
+                    returned_route="test/two-turn",
+                    response_id="response-001",
+                    identity_source="provider_response",
+                )
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                self.step += 1
+                if self.step == 1:
+                    return ToolRequest("req-1", "read_text", {"path": "input/value.txt"})
+                # Step 2: return final answer after receiving the tool result
+                assert previous is not None and previous.ok
+                return FinalResponse("Successfully read value")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            repository, spec, policy = self.make_spec(base)
+
+            # Override to one-step limit (v2.2.3 qualification contract)
+            one_step_policy = ToolPolicy(
+                allowed_reads=policy.allowed_reads,
+                allowed_writes=policy.allowed_writes,
+                allowed_effects=policy.allowed_effects,
+                max_steps=1,  # The v2.2.3 one-call limitation
+                max_write_bytes=policy.max_write_bytes,
+            )
+
+            result = run_strict_episode(
+                spec,
+                controller=TwoTurnController(),
+                tool_policy=one_step_policy,
+                repository_root=repository,
+                run_root=base / "episodes",
+                evidence_dir=base / "evidence",
+            )
+
+            # Should fail because controller needs 2 steps but max_steps=1
+            self.assertEqual("task_failed", result.status)
+            self.assertIn("controller_step_limit_exceeded", result.reason_codes)
+            self.assertFalse(result.valid_for_scoring)
+
+    def test_multi_turn_model_succeeds_with_four_step_limit(self) -> None:
+        """GREEN target: a two-turn model succeeds with max_steps=4."""
+        class TwoTurnController:
+            def __init__(self) -> None:
+                self.step = 0
+
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                return ControllerIdentity(
+                    adapter_name="test-two-turn",
+                    adapter_version="1.0",
+                    adapter_sha256="sha256:" + "1" * 64,
+                    requested_route="test/two-turn",
+                    returned_route="test/two-turn",
+                    response_id="response-001",
+                    identity_source="provider_response",
+                )
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                self.step += 1
+                if self.step == 1:
+                    return ToolRequest("req-1", "read_text", {"path": "input/value.txt"})
+                assert previous is not None and previous.ok
+                return FinalResponse("Successfully read value")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            repository, spec, policy = self.make_spec(base)
+
+            result = run_strict_episode(
+                spec,
+                controller=TwoTurnController(),
+                tool_policy=policy,  # Uses max_steps=4 from make_spec
+                repository_root=repository,
+                run_root=base / "episodes",
+                evidence_dir=base / "evidence",
+            )
+
+            self.assertEqual("completed", result.status)
+            self.assertTrue(result.valid_for_scoring)
+            self.assertNotIn("controller_step_limit_exceeded", result.reason_codes)
+
+    def test_three_turn_model_fails_with_one_step_limit(self) -> None:
+        """RED: a three-turn model (tool request + tool result + tool request + final answer)
+        fails with max_steps=1."""
+        class ThreeTurnController:
+            def __init__(self) -> None:
+                self.step = 0
+
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                return ControllerIdentity(
+                    adapter_name="test-three-turn",
+                    adapter_version="1.0",
+                    adapter_sha256="sha256:" + "2" * 64,
+                    requested_route="test/three-turn",
+                    returned_route="test/three-turn",
+                    response_id="response-002",
+                    identity_source="provider_response",
+                )
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                self.step += 1
+                if self.step == 1:
+                    return ToolRequest("req-1", "read_text", {"path": "input/value.txt"})
+                if self.step == 2:
+                    assert previous is not None and previous.ok
+                    # Use the result in a second request
+                    return ToolRequest("req-2", "write_text", {
+                        "path": "output/result.json",
+                        "text": '{"result": "done"}'
+                    })
+                # Step 3: final answer after second tool
+                assert previous is not None and previous.ok
+                return FinalResponse("Completed write")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            repository, spec, policy = self.make_spec(base)
+
+            one_step_policy = ToolPolicy(
+                allowed_reads=policy.allowed_reads,
+                allowed_writes=policy.allowed_writes,
+                allowed_effects=policy.allowed_effects,
+                max_steps=1,
+                max_write_bytes=policy.max_write_bytes,
+            )
+
+            result = run_strict_episode(
+                spec,
+                controller=ThreeTurnController(),
+                tool_policy=one_step_policy,
+                repository_root=repository,
+                run_root=base / "episodes",
+                evidence_dir=base / "evidence",
+            )
+
+            self.assertEqual("task_failed", result.status)
+            self.assertIn("controller_step_limit_exceeded", result.reason_codes)
+            self.assertFalse(result.valid_for_scoring)
+
+    def test_infinite_loop_model_is_bounded_by_step_limit(self) -> None:
+        """RED: a model that keeps requesting tools is properly bounded by max_steps."""
+        class InfiniteLoopController:
+            def __init__(self) -> None:
+                self.step = 0
+
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                return ControllerIdentity(
+                    adapter_name="test-infinite",
+                    adapter_version="1.0",
+                    adapter_sha256="sha256:" + "3" * 64,
+                    requested_route="test/infinite",
+                    returned_route="test/infinite",
+                    response_id="response-003",
+                    identity_source="provider_response",
+                )
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                self.step += 1
+                # Keep requesting tools forever (or until step limit)
+                return ToolRequest(f"req-{self.step}", "read_text", {"path": "input/value.txt"})
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            repository, spec, policy = self.make_spec(base)
+
+            # Even with max_steps=4, the infinite loop should hit the limit
+            result = run_strict_episode(
+                spec,
+                controller=InfiniteLoopController(),
+                tool_policy=policy,  # max_steps=4
+                repository_root=repository,
+                run_root=base / "episodes",
+                evidence_dir=base / "evidence",
+            )
+
+            self.assertEqual("task_failed", result.status)
+            self.assertIn("controller_step_limit_exceeded", result.reason_codes)
+            self.assertFalse(result.valid_for_scoring)
+
+
 class ControllerUsageSnapshotTests(unittest.TestCase):
     """Episode usage must carry every field the suite aggregator recomputes.
 
