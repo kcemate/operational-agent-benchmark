@@ -1257,7 +1257,7 @@ def classify_qualification(
         if isinstance(raw_known_cost, (int, float))
         and not isinstance(raw_known_cost, bool)
         and float(raw_known_cost) >= 0
-        else (observed_cost if observed_cost is not None else 0.0)
+        else observed_cost  # If known_cost_usd not provided, use total cost_usd if available, else None
     )
     raw_unknown_calls = usage_map.get("unknown_cost_api_calls")
     unknown_cost_api_calls = (

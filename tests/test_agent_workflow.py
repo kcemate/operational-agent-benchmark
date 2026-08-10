@@ -2414,6 +2414,86 @@ class AgentWorkflowContractTests(unittest.TestCase):
             # Verify state shows the qualification was processed
             self.assertIn(state["status"], ["qualifying", "awaiting_full_run_approval"])
 
+    def test_classification_uses_total_cost_when_known_cost_missing(self) -> None:
+        """GREEN: Missing known_cost_usd uses total cost_usd as conservative estimate."""
+        report = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 2,
+            "infrastructure_invalid_episodes": 0,
+            "identity_source": "provider_response",
+            "controller_usage": {
+                "api_calls": 8,
+                "cost_usd": 0.08,
+                # known_cost_usd is missing - should use cost_usd as fallback
+            },
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 2.5,
+            "observations": [],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        # When known_cost_usd is missing but cost_usd is provided, use cost_usd
+        self.assertEqual(0.08, result["observed_known_cost_usd"])
+        self.assertEqual(0.08, result["observed_cost_usd"])
+
+    def test_classification_truly_unknown_cost_is_null(self) -> None:
+        """GREEN: When both cost_usd and known_cost_usd are missing, result is None."""
+        report = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 2,
+            "infrastructure_invalid_episodes": 0,
+            "identity_source": "provider_response",
+            "controller_usage": {
+                "api_calls": 8,
+                # cost_usd is missing entirely
+                # known_cost_usd is missing
+            },
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 2.5,
+            "observations": [],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        # When both costs are missing, should be None (truly unknown)
+        self.assertIsNone(result["observed_known_cost_usd"])
+        self.assertIsNone(result["observed_cost_usd"])
+
+    def test_classification_unknown_cost_api_calls_null_when_unknown(self) -> None:
+        """GREEN: unknown_cost_api_calls is None when cost is unknown, not 0."""
+        report = {
+            "requested_route": "xai-oauth/grok-4.5",
+            "reasoning_effort": "high",
+            "scheduled_episodes": 2,
+            "infrastructure_valid_episodes": 2,
+            "infrastructure_invalid_episodes": 0,
+            "identity_source": "provider_response",
+            "controller_usage": {
+                "api_calls": 8,
+                "cost_usd": None,  # Unknown cost
+                # unknown_cost_api_calls is missing
+            },
+            "campaign_suite_verified": True,
+            "campaign_elapsed_seconds": 2.5,
+            "observations": [],
+        }
+        result = classify_qualification(
+            report,
+            requested_route="xai-oauth/grok-4.5",
+            reasoning_effort="high",
+        )
+        # When cost_usd is None and unknown_cost_api_calls is missing, it should be None
+        self.assertIsNone(result["unknown_cost_api_calls"])
+
     def test_decision_rejects_cross_platform_or_backend_comparison(self) -> None:
         baseline = {
             "requested_route": "openai-codex/gpt-current",
