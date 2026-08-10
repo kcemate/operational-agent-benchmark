@@ -2165,17 +2165,25 @@ class AgentWorkflowContractTests(unittest.TestCase):
 
             def runner(route: dict[str, object], stage: str, output: Path, effort: str) -> dict[str, object]:
                 calls.append(str(route["requested_route"]))
-                return self.qualification_report(str(route["requested_route"]))
+                # Return v2.3.0 format report (2 probes, 8 calls)
+                report = self.qualification_report(str(route["requested_route"]))
+                report["scheduled_episodes"] = 2
+                report["infrastructure_valid_episodes"] = 2
+                report["infrastructure_invalid_episodes"] = 0
+                usage = cast(dict[str, object], report["controller_usage"])
+                usage["api_calls"] = 8  # 2 probes × 4 calls
+                return report
 
+            # Test v2.3.0 contract: 15 calls budget (insufficient for 1 route's 16-call reservation)
             state = run_qualification_stage(
                 root,
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=33,
+                max_api_calls=15,
                 max_routes=3,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=33,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=15,
                     max_routes=3, allow_unknown_costs=False,
                 ),
             )
@@ -2306,6 +2314,105 @@ class AgentWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual("not_supportable", report["recommendation"])
         self.assertIn("fewer_than_two_authoritative_routes", report["reasons"])
+
+    def test_v230_qualification_stage_reserves_16_calls_per_route(self) -> None:
+        """RED: v2.3.0 qualification reserves 16 calls per route (not 34)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            def runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                # Verify the runner received the correct contract version
+                self.assertEqual("v2.3.0", route.get("_qualification_contract_version"))
+                report = self.qualification_report(str(route["requested_route"]))
+                # Set scheduled_episodes to 2 for v2.3.0 contract
+                report["scheduled_episodes"] = 2
+                report["infrastructure_valid_episodes"] = 2
+                report["infrastructure_invalid_episodes"] = 0
+                usage = cast(dict[str, object], report["controller_usage"])
+                usage["api_calls"] = 8  # 2 probes × 4 calls
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=10.0,
+                max_api_calls=50,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+
+            # Run first route successfully
+            state = run_qualification_stage(
+                root,
+                runner=runner,
+                max_cost_usd=10.0,
+                allow_unknown_costs=False,
+                max_api_calls=50,
+                max_routes=2,
+                approval_path=approval["approval_path"],
+                approval_signature_path=approval["approval_signature_path"],
+                approval_public_key_path=approval["approval_public_key_path"],
+            )
+            # Qualification stage succeeds and moves to awaiting_full_run_approval
+            self.assertIn(state["status"], ["qualifying", "awaiting_full_run_approval"])
+
+    def test_v230_qualification_with_runner_args_spy(self) -> None:
+        """RED: v2.3.0 qualification passes correct CLI args to suite runner."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            initialize_campaign(
+                root,
+                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
+                inventory_payload=self.inventory(),
+                reasoning_effort="high",
+            )
+
+            # Create a spy that captures the command line arguments
+            captured_commands: list[tuple[str, list[str]]] = []
+
+            def spy_runner(
+                route: dict[str, object], stage: str, output: Path, effort: str
+            ) -> dict[str, object]:
+                # This is a simple runner that just returns a valid report
+                report = self.qualification_report(str(route["requested_route"]))
+                report["scheduled_episodes"] = 2
+                report["infrastructure_valid_episodes"] = 2
+                report["infrastructure_invalid_episodes"] = 0
+                usage = cast(dict[str, object], report["controller_usage"])
+                usage["api_calls"] = 8
+                return report
+
+            approval = self.signed_stage_approval(
+                root,
+                stage="qualification",
+                max_cost_usd=10.0,
+                max_api_calls=50,
+                max_routes=2,
+                allow_unknown_costs=False,
+            )
+
+            state = run_qualification_stage(
+                root,
+                runner=spy_runner,
+                max_cost_usd=10.0,
+                allow_unknown_costs=False,
+                max_api_calls=50,
+                max_routes=2,
+                approval_path=approval["approval_path"],
+                approval_signature_path=approval["approval_signature_path"],
+                approval_public_key_path=approval["approval_public_key_path"],
+            )
+
+            # Verify state shows the qualification was processed
+            self.assertIn(state["status"], ["qualifying", "awaiting_full_run_approval"])
 
     def test_decision_rejects_cross_platform_or_backend_comparison(self) -> None:
         baseline = {

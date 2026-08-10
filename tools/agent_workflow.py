@@ -260,16 +260,31 @@ def _production_suite_runner(
                 ]
             )
         if stage == "qualification":
-            command.extend(
-                [
-                    "--pairs",
-                    "P01",
-                    "--repetitions",
-                    "17",
-                    "--max-steps-per-episode",
-                    "1",
-                ]
-            )
+            qual_contract = str(route.get("_qualification_contract_version") or "v2.3.0")
+            if qual_contract == "v2.2.3":
+                # Legacy contract: 34 episodes, 1 call per episode, 17 repetitions per route
+                command.extend(
+                    [
+                        "--pairs",
+                        "P01",
+                        "--repetitions",
+                        "17",
+                        "--max-steps-per-episode",
+                        "1",
+                    ]
+                )
+            else:
+                # v2.3.0 contract: 2 probes, max 4 steps per probe
+                command.extend(
+                    [
+                        "--pairs",
+                        "P01",
+                        "--repetitions",
+                        "2",
+                        "--max-steps-per-episode",
+                        "4",
+                    ]
+                )
         route_call_budget = route.get("max_api_calls")
         if (
             isinstance(route_call_budget, int)

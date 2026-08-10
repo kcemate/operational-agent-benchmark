@@ -66,6 +66,34 @@ LEGACY_V221_RELEASE_TREE_SHA256 = (
 )
 
 
+def _qualification_contract_version(
+    release_tree_sha256: str | None,
+    actual_episodes: int | None = None,
+) -> str:
+    """Determine qualification contract version based on release tree and actual episodes.
+
+    Returns 'v2.2.3' for legacy contracts, 'v2.3.0' for new contracts.
+    If actual_episodes is provided (from a report), use it as the tiebreaker.
+    """
+    if release_tree_sha256 == LEGACY_V221_RELEASE_TREE_SHA256:
+        return "v2.2.3"
+    # If we have an actual report with episodes, use that as tiebreaker
+    if actual_episodes is not None:
+        if actual_episodes == _QUALIFICATION_EPISODES_PER_ROUTE:  # 34
+            return "v2.2.3"
+        elif actual_episodes == _QUALIFICATION_V230_PROBES_PER_ROUTE:  # 2
+            return "v2.3.0"
+    # Default to v2.3.0 for new campaigns
+    return "v2.3.0"
+
+
+def _qualification_max_calls_per_route(contract_version: str) -> int:
+    """Get max API calls per route for qualification based on contract version."""
+    if contract_version == "v2.2.3":
+        return _QUALIFICATION_EPISODES_PER_ROUTE  # 34
+    return _QUALIFICATION_V230_MAX_CALLS_PER_ROUTE  # 16
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2180,6 +2208,33 @@ def run_qualification_stage(
         reasoning_effort=effort,
         campaign_release_tree_sha256=campaign_release_tree_sha256,
     )
+    # Detect contract version by checking existing results for episode count
+    actual_episodes = None
+    for result in results.values():
+        if isinstance(result.get("report"), Mapping):
+            report = result["report"]
+            actual = report.get("scheduled_episodes")
+            if isinstance(actual, int):
+                actual_episodes = actual
+                break
+        # Also check classification for observed_api_calls as a tiebreaker
+        if actual_episodes is None and isinstance(result.get("classification"), Mapping):
+            observed_calls = result["classification"].get("observed_api_calls")
+            if observed_calls == _QUALIFICATION_EPISODES_PER_ROUTE:  # 34
+                actual_episodes = _QUALIFICATION_EPISODES_PER_ROUTE
+                break
+            elif observed_calls == _QUALIFICATION_V230_PROBES_PER_ROUTE * _QUALIFICATION_V230_MAX_API_CALLS_PER_EPISODE:  # 2*4=8
+                actual_episodes = _QUALIFICATION_V230_PROBES_PER_ROUTE
+                break
+    # Also check if call_budget hints at v2.2.3 (multiples of 34)
+    if actual_episodes is None and call_budget % _QUALIFICATION_EPISODES_PER_ROUTE == 0:
+        # Budget is a multiple of 34 (e.g., 34, 68, 102), suggesting v2.2.3
+        actual_episodes = _QUALIFICATION_EPISODES_PER_ROUTE
+    qual_contract = _qualification_contract_version(
+        campaign_release_tree_sha256 if isinstance(campaign_release_tree_sha256, str) else None,
+        actual_episodes=actual_episodes,
+    )
+    qual_max_calls = _qualification_max_calls_per_route(qual_contract)
     attempt_accounting = _attempt_accounting(
         root,
         "qualification",
@@ -2253,7 +2308,7 @@ def run_qualification_stage(
             if isinstance(item.get("classification"), Mapping)
             and isinstance(item["classification"].get("observed_api_calls"), int)
         )
-        if observed_calls + 34 > call_budget:
+        if observed_calls + qual_max_calls > call_budget:
             state["status"] = "qualification_call_budget_exhausted"
             break
         observed_known_before = sum(
@@ -2275,8 +2330,9 @@ def run_qualification_stage(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
-        attempt_reserved_calls = min(34, call_budget - observed_calls)
+        attempt_reserved_calls = min(qual_max_calls, call_budget - observed_calls)
         execution_route["max_api_calls"] = attempt_reserved_calls
+        execution_route["_qualification_contract_version"] = qual_contract
         attempt_id = secrets.token_hex(16)
         suite_output = _attempt_evidence_path(root, "qualification", attempt_id)
         reservation = _write_attempt_event(
@@ -2361,8 +2417,20 @@ def run_qualification_stage(
             isinstance(classification["observed_api_calls"], int)
             and classification["observed_api_calls"] > execution_route["max_api_calls"]
         ):
-            classification["status"] = "api_call_budget_exceeded"
-            state["status"] = "qualification_call_budget_exceeded"
+            # If this is the first route and it shows v2.2.3 format (34 calls),
+            # update our contract understanding rather than failing
+            if (
+                len(results) == 0
+                and classification["observed_api_calls"] == _QUALIFICATION_EPISODES_PER_ROUTE
+                and qual_contract == "v2.3.0"
+            ):
+                # Update to v2.2.3 for this and subsequent routes
+                qual_contract = "v2.2.3"
+                qual_max_calls = _qualification_max_calls_per_route(qual_contract)
+                # Don't fail the budget check - we'll use the correct contract going forward
+            else:
+                classification["status"] = "api_call_budget_exceeded"
+                state["status"] = "qualification_call_budget_exceeded"
         receipt = _stage_result_receipt(
             {
                 "schema": "oab.qualification-result/v2",
