@@ -10,11 +10,21 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping, Sequence
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 
 from oab.aggregation import aggregate_suite_observations, format_headline
+from oab.campaign_authorization import verify_campaign_child_authorization
+from oab.full_stage_contract import (
+    AUTHORITATIVE_FULL_PAIR_IDS,
+    FULL_API_CALL_CEILING_PER_ROUTE,
+    FULL_MAX_API_CALLS_PER_EPISODE,
+    FULL_REPETITIONS,
+    build_authoritative_stage_binding,
+    validate_authoritative_full_stage_plan,
+)
 from oab.case_verifier import verify_case
 from oab.control import tool_policy_from_case
 from oab.hermes_controller import HermesCliController
@@ -25,6 +35,21 @@ from oab.runtime_profile import pinned_hermes_runtime
 from oab.strict_runner import ToolPolicy, run_strict_episode
 from oab.suite_seal import write_suite_seal
 from oab.paths import benchmark_root
+from oab.qualification_contract import (
+    ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+    MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
+    MAX_BROKER_STEPS_PER_PROBE,
+    QUALIFICATION_CHILD_RESULT_SCHEMA,
+    QUALIFICATION_PROBE_RESULT_SCHEMA,
+    aggregate_telemetry,
+    build_physical_attempt,
+    build_qualification_report,
+    qualification_probe_definitions,
+    retry_eligible,
+    telemetry_errors,
+    validate_child_result,
+    validate_qualification_contract,
+)
 if __package__:
     from .release_manifest import verify_release_manifest
 else:
@@ -90,6 +115,7 @@ def _run_observations(
     selected_cases: list[dict[str, object]],
     output_root: Path,
     runtime_home: Path,
+    authoritative_full: bool = False,
 ) -> list[dict[str, object]]:
     observations: list[dict[str, object]] = []
     observed_known_cost_usd = 0.0
@@ -117,9 +143,16 @@ def _run_observations(
                 reasoning_effort=args.reasoning_effort,
                 max_observed_cost_usd=remaining_observed_cost_usd,
                 max_api_calls=(
-                    max(0, args.max_api_calls - observed_api_calls)
-                    if args.max_api_calls is not None
-                    else None
+                    min(
+                        FULL_MAX_API_CALLS_PER_EPISODE,
+                        max(0, args.max_api_calls - observed_api_calls),
+                    )
+                    if authoritative_full and args.max_api_calls is not None
+                    else (
+                        max(0, args.max_api_calls - observed_api_calls)
+                        if args.max_api_calls is not None
+                        else None
+                    )
                 ),
                 allow_unknown_costs=args.allow_unknown_costs,
             )
@@ -182,6 +215,10 @@ def _run_observations(
             api_calls = usage.get("api_calls") if isinstance(usage, dict) else None
             if isinstance(api_calls, int) and not isinstance(api_calls, bool):
                 observed_api_calls += api_calls
+                if authoritative_full and not (0 <= api_calls <= FULL_MAX_API_CALLS_PER_EPISODE):
+                    raise ValueError("authoritative_full_episode_api_calls_invalid")
+            elif authoritative_full:
+                raise ValueError("authoritative_full_episode_api_calls_invalid")
             unknown_cost_api_calls = (
                 usage.get("unknown_cost_api_calls") if isinstance(usage, dict) else None
             )
@@ -200,7 +237,347 @@ def _run_observations(
     return observations
 
 
-def main() -> int:
+def _qualification_receipt(evidence: Path) -> dict[str, object]:
+    try:
+        value = json.loads((evidence / "result.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("qualification_attempt_evidence_invalid") from exc
+    if not isinstance(value, dict) or value.get("schema") != QUALIFICATION_PROBE_RESULT_SCHEMA:
+        raise ValueError("qualification_attempt_evidence_invalid")
+    return value
+
+
+def _append_attempt_reason(attempt: dict[str, object], reason: str) -> None:
+    current = attempt.get("reason_codes")
+    if not isinstance(current, list):
+        raise ValueError("qualification_attempt_evidence_invalid")
+    attempt["reason_codes"] = sorted({*current, reason})
+    attempt["readiness_evidence"] = False
+
+
+def _run_qualification_attempt(
+    *,
+    args: argparse.Namespace,
+    probe: dict[str, object],
+    attempt_number: int,
+    output_root: Path,
+    runtime_home: Path,
+    known_cost_so_far: float,
+) -> dict[str, object]:
+    case_id = str(probe["case_id"])
+    cases = load_registry(ROOT / "cases.json")["cases"]
+    case = next(
+        (
+            item
+            for item in cases
+            if isinstance(item, dict) and item.get("case_id") == case_id
+        ),
+        None,
+    )
+    if not isinstance(case, dict):
+        raise ValueError("qualification_case_registry_invalid")
+    fixture = ROOT / str(case["fixture_path"])
+    evidence = output_root / "evidence" / "rep-01" / case_id / f"attempt-{attempt_number:02d}"
+    run_root = output_root / "run-roots" / "rep-01" / case_id / f"attempt-{attempt_number:02d}"
+    remaining_observed_cost_usd = (
+        max(0.0, float(args.max_observed_cost_usd) - known_cost_so_far)
+        if args.max_observed_cost_usd is not None
+        else None
+    )
+    controller = HermesCliController(
+        model=args.model,
+        provider=args.provider,
+        timeout_seconds=args.timeout_seconds,
+        hermes_home=runtime_home,
+        reasoning_effort=args.reasoning_effort,
+        max_observed_cost_usd=remaining_observed_cost_usd,
+        max_api_calls=MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
+        allow_unknown_costs=args.allow_unknown_costs,
+    )
+    policy = _bounded_tool_policy(
+        tool_policy_from_case(case, fixture), MAX_BROKER_STEPS_PER_PROBE
+    )
+    result = run_strict_episode(
+        StrictEpisodeSpec(
+            case_id=case_id,
+            repetition=1,
+            task_bytes=(ROOT / str(case["task_path"])).read_bytes(),
+            input_tree=fixture,
+            timeout_seconds=args.episode_timeout_seconds,
+        ),
+        repository_root=ROOT,
+        run_root=run_root,
+        evidence_dir=evidence,
+        tool_policy=policy,
+        controller=controller,
+        artifact_profile="qualification_readiness",
+    )
+    receipt = _qualification_receipt(evidence)
+    gates = verify_case(case, fixture, evidence)
+    attempt = build_physical_attempt(
+        probe=probe,
+        attempt_number=attempt_number,
+        runner_status=receipt.get("status", result.status),
+        reason_codes=receipt.get("reason_codes", list(result.reason_codes)),
+        identity=receipt.get("controller_identity"),
+        telemetry=receipt.get("controller_usage"),
+        runtime=receipt.get("runtime"),
+        trace_sha256=receipt.get("trace_sha256", result.trace_sha256),
+        output_tree_sha256=receipt.get("output_tree_sha256", result.output_tree_sha256),
+        probe_contract_satisfied=all(gate.passed for gate in gates),
+        requested_route=f"{args.provider}/{args.model}",
+        reasoning_effort=args.reasoning_effort,
+    )
+    return attempt
+
+
+def _qualification_stop_reason(
+    attempt: dict[str, object],
+    *,
+    allow_unknown_costs: bool,
+) -> str | None:
+    telemetry = attempt.get("telemetry")
+    if telemetry_errors(telemetry, per_attempt=True):
+        return "qualification_stopped_invalid_telemetry"
+    unknown = telemetry.get("unknown_cost_api_calls") if isinstance(telemetry, dict) else None
+    if (
+        not allow_unknown_costs
+        and isinstance(unknown, int)
+        and not isinstance(unknown, bool)
+        and unknown > 0
+    ):
+        _append_attempt_reason(attempt, "controller_cost_telemetry_unknown")
+        return "qualification_stopped_unknown_cost"
+    return None
+
+
+def _known_cost(attempts: list[dict[str, object]]) -> float:
+    usage = aggregate_telemetry(attempts)
+    value = usage.get("known_cost_usd")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _run_qualification_readiness(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    runtime_home: Path,
+    release_tree_sha256: str | None,
+    controller_config_sha256: str | None,
+    qualification_contract: Mapping[str, object],
+) -> dict[str, object]:
+    """Run the dedicated, two-probe readiness state machine without aggregation."""
+    if (
+        args.pairs is not None
+        or args.repetitions is not None
+        or args.max_steps_per_episode is not None
+        or args.release_approval is not None
+        or args.expected_release_approval_sha256 is not None
+        or args.max_api_calls != ABSOLUTE_API_CALL_CEILING_PER_ROUTE
+    ):
+        raise ValueError("qualification_readiness_arguments_invalid")
+    try:
+        contract = validate_qualification_contract(qualification_contract)
+    except ValueError as exc:
+        raise ValueError("qualification_execution_contract_invalid") from exc
+    registry = load_registry(ROOT / "cases.json")
+    registry_cases = {
+        str(case.get("case_id")): case
+        for case in registry["cases"]
+        if isinstance(case, dict)
+    }
+    for probe in qualification_probe_definitions():
+        case = registry_cases.get(str(probe["case_id"]))
+        if not isinstance(case, dict) or (
+            case.get("pair_id") != probe["pair_id"]
+            or case.get("variant") != probe["variant"]
+        ):
+            raise ValueError("qualification_case_registry_invalid")
+
+    attempts: list[dict[str, object]] = []
+    stopped_before_probe: str | None = None
+    probes = qualification_probe_definitions()
+    # First-attempt phase is deliberately complete before retry selection.
+    for probe in probes:
+        attempt = _run_qualification_attempt(
+            args=args,
+            probe=probe,
+            attempt_number=1,
+            output_root=output_root,
+            runtime_home=runtime_home,
+            known_cost_so_far=_known_cost(attempts),
+        )
+        attempts.append(attempt)
+        stopped_before_probe = _qualification_stop_reason(
+            attempt, allow_unknown_costs=args.allow_unknown_costs
+        )
+        if stopped_before_probe is not None:
+            break
+    # Never revisit a completed/healthy probe. A second attempt is legal only
+    # when its own sealed first attempt has an exact typed transient reason.
+    if stopped_before_probe is None and len(attempts) == len(probes):
+        first_by_probe = {str(row["probe_id"]): row for row in attempts}
+        for probe in probes:
+            first = first_by_probe[str(probe["probe_id"])]
+            if not retry_eligible(first):
+                continue
+            retry = _run_qualification_attempt(
+                args=args,
+                probe=probe,
+                attempt_number=2,
+                output_root=output_root,
+                runtime_home=runtime_home,
+                known_cost_so_far=_known_cost(attempts),
+            )
+            attempts.append(retry)
+            stopped_before_probe = _qualification_stop_reason(
+                retry, allow_unknown_costs=args.allow_unknown_costs
+            )
+            if stopped_before_probe is not None:
+                break
+    report = build_qualification_report(
+        qualification_contract=contract,
+        requested_route=f"{args.provider}/{args.model}",
+        reasoning_effort=args.reasoning_effort,
+        release_tree_sha256=release_tree_sha256,
+        controller_config_sha256=controller_config_sha256,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        attempts=attempts,
+        stopped_before_probe=stopped_before_probe,
+    )
+    report_path = output_root / "suite-report.json"
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    headline_path = output_root / "HEADLINE.txt"
+    headline_path.write_text(str(report["headline"]) + "\n", encoding="utf-8")
+    seal_path, seal_sha256 = write_suite_seal(
+        output_root,
+        release_manifest=ROOT / "RELEASE_MANIFEST.json",
+    )
+    child_result: dict[str, object] = {
+        "schema": QUALIFICATION_CHILD_RESULT_SCHEMA,
+        "readiness": report["readiness"],
+        "reason_codes": report["reason_codes"],
+        "controller_usage": report["controller_usage"],
+        "suite_report_path": str(report_path),
+        "suite_seal_path": str(seal_path),
+        "suite_seal_sha256": seal_sha256,
+    }
+    return validate_child_result(child_result)
+
+
+def _run_authoritative_full_stage(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    runtime_home: Path,
+    release_tree_sha256: str,
+    release_approval_sha256: str,
+    authorization: Mapping[str, object],
+) -> int:
+    """Execute the sole full-stage authority tuple reconstructed from PLAN."""
+    if (
+        args.pairs is not None
+        or args.repetitions is not None
+        or args.max_steps_per_episode is not None
+        or args.max_api_calls != FULL_API_CALL_CEILING_PER_ROUTE
+    ):
+        raise ValueError("authoritative_full_arguments_invalid")
+    contract_value = authorization.get("contract")
+    if not isinstance(contract_value, Mapping):
+        raise ValueError("authoritative_full_execution_contract_invalid")
+    planned_count = contract_value.get("planned_route_count")
+    if not isinstance(planned_count, int) or isinstance(planned_count, bool):
+        raise ValueError("authoritative_full_execution_contract_invalid")
+    try:
+        full_plan = validate_authoritative_full_stage_plan(
+            contract_value, route_count=planned_count
+        )
+    except ValueError as exc:
+        raise ValueError("authoritative_full_execution_contract_invalid") from exc
+    registry = load_registry(ROOT / "cases.json")
+    all_cases = [case for case in registry["cases"] if isinstance(case, dict)]
+    selected_cases = [
+        case for case in all_cases if str(case.get("pair_id")) in AUTHORITATIVE_FULL_PAIR_IDS
+    ]
+    selected_cases.sort(
+        key=lambda case: (
+            AUTHORITATIVE_FULL_PAIR_IDS.index(str(case["pair_id"])),
+            0 if case["variant"] == "approved" else 1,
+            str(case["case_id"]),
+        )
+    )
+    expected_case_shape = [
+        (pair_id, variant)
+        for pair_id in AUTHORITATIVE_FULL_PAIR_IDS
+        for variant in ("approved", "prohibited")
+    ]
+    if [
+        (str(case.get("pair_id")), str(case.get("variant"))) for case in selected_cases
+    ] != expected_case_shape:
+        raise ValueError("authoritative_full_case_registry_invalid")
+    args.repetitions = FULL_REPETITIONS
+    observations = _run_observations(
+        args=args,
+        selected_cases=selected_cases,
+        output_root=output_root,
+        runtime_home=runtime_home,
+        authoritative_full=True,
+    )
+    route_id = authorization.get("route_id")
+    output_relative_path = authorization.get("output_relative_path")
+    plan_sha256 = authorization.get("plan_sha256")
+    stage_approval_sha256 = authorization.get("stage_approval_sha256")
+    if not all(
+        isinstance(value, str) and value
+        for value in (route_id, output_relative_path, plan_sha256, stage_approval_sha256)
+    ):
+        raise ValueError("authoritative_full_execution_contract_invalid")
+    binding = build_authoritative_stage_binding(
+        plan_sha256=str(plan_sha256),
+        stage_approval_sha256=str(stage_approval_sha256),
+        route_id=str(route_id),
+        output_relative_path=str(output_relative_path),
+        full_plan=full_plan,
+        route_count=planned_count,
+    )
+    report = aggregate_suite_observations(
+        observations,
+        requested_route=f"{args.provider}/{args.model}",
+        reasoning_effort=args.reasoning_effort,
+        controller_config_sha256=(
+            str(observations[0].get("controller_config_sha256")) if observations else None
+        ),
+        release_tree_sha256=release_tree_sha256,
+        release_approval_sha256=release_approval_sha256,
+        release_authorized=True,
+        repetitions=FULL_REPETITIONS,
+        pair_ids=list(AUTHORITATIVE_FULL_PAIR_IDS),
+        case_ids_by_pair=_case_ids_by_pair(selected_cases),
+        authoritative_stage=binding,
+    )
+    report["created_at"] = datetime.now(timezone.utc).isoformat()
+    report["output_root"] = str(output_root)
+    report_path = output_root / "suite-report.json"
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    (output_root / "HEADLINE.txt").write_text(str(report["headline"]) + "\n", encoding="utf-8")
+    seal_path, seal_sha256 = write_suite_seal(
+        output_root,
+        release_manifest=ROOT / "RELEASE_MANIFEST.json",
+    )
+    print(str(report_path), flush=True)
+    print(str(report["headline"]), flush=True)
+    print(f"SUITE_SEAL={seal_path}", flush=True)
+    print(f"SUITE_SEAL_SHA256={seal_sha256}", flush=True)
+    return 0 if len(observations) == 80 else 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run OAB v2 multi-rep matched-pair suite for one provider/model into an "
@@ -223,7 +600,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--pairs",
-        default="all",
+        default=None,
         help="Comma-separated pair ids (default: all registry pairs)",
     )
     parser.add_argument(
@@ -274,8 +651,73 @@ def main() -> int:
         default=None,
         help="Hard ceiling on provider calls across this suite",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--qualification-readiness-v1",
+        action="store_true",
+        help="Run the locked score-free oab.qualification-readiness/v1 child mode",
+    )
+    parser.add_argument(
+        "--qualification-contract-json",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--authoritative-full-v1", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--campaign-root-path", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--campaign-root-fd", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--campaign-authorization-fd", type=int, default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
 
+    protected_stage: str | None = None
+    if args.qualification_readiness_v1 and args.authoritative_full_v1:
+        raise SystemExit("campaign_child_mode_ambiguous")
+    if args.qualification_readiness_v1:
+        protected_stage = "qualification"
+    elif args.authoritative_full_v1:
+        protected_stage = "full"
+
+    if args.qualification_readiness_v1 and (
+        args.release_approval is not None
+        or args.expected_release_approval_sha256 is not None
+    ):
+        raise SystemExit("qualification readiness mode does not accept release approval")
+    if protected_stage is not None:
+        if args.qualification_contract_json is not None:
+            raise SystemExit("campaign_child_contract_argv_refused")
+        if (
+            args.campaign_root_path is None
+            or args.campaign_root_fd is None
+            or args.campaign_authorization_fd is None
+            or args.output_parent_fd is None
+            or args.output_name is None
+        ):
+            raise SystemExit("campaign_child_authorization_required")
+        if protected_stage == "full" and (
+            args.pairs is not None
+            or args.repetitions is not None
+            or args.max_steps_per_episode is not None
+        ):
+            raise SystemExit("authoritative_full_arguments_invalid")
+        try:
+            child_authorization = verify_campaign_child_authorization(
+                stage=protected_stage,
+                campaign_root_path=args.campaign_root_path,
+                campaign_root_fd=args.campaign_root_fd,
+                authorization_fd=args.campaign_authorization_fd,
+                requested_route=f"{args.provider}/{args.model}",
+                reasoning_effort=args.reasoning_effort,
+                output_name=str(args.output_name),
+                max_api_calls=args.max_api_calls,
+                max_observed_cost_usd=args.max_observed_cost_usd,
+                allow_unknown_costs=args.allow_unknown_costs,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    else:
+        child_authorization = None
+
+    # The protected child has now reconstructed its signed campaign authority.
+    # Only after that boundary may it inspect repository release state or create
+    # output directories; no controller/runtime is constructed above this point.
     release_manifest_path = ROOT / "RELEASE_MANIFEST.json"
     release_errors = verify_release_manifest(ROOT, release_manifest_path)
     if release_errors:
@@ -285,6 +727,11 @@ def main() -> int:
     release_tree_sha256 = json.loads(
         release_manifest_path.read_text(encoding="utf-8")
     ).get("tree_sha256")
+    if (
+        child_authorization is not None
+        and child_authorization.get("release_tree_sha256") != release_tree_sha256
+    ):
+        raise SystemExit("campaign_child_release_tree_invalid")
     approval_args = (
         args.release_approval is not None,
         args.expected_release_approval_sha256 is not None,
@@ -313,6 +760,8 @@ def main() -> int:
             raise SystemExit("release approval verification failed: " + rendered)
         release_approval_sha256 = str(approval["file_sha256"])
         release_authorized = True
+    if protected_stage == "full" and not release_authorized:
+        raise SystemExit("authoritative_full_release_approval_required")
 
     if (args.output_parent_fd is None) != (args.output_name is None):
         raise SystemExit("internal output descriptor and name are required together")
@@ -359,6 +808,57 @@ def main() -> int:
         output_root.mkdir(parents=True, exist_ok=False)
     if release_authorized and args.release_approval is not None:
         shutil.copyfile(args.release_approval, output_root / "RELEASE_APPROVAL.json")
+
+    if args.qualification_readiness_v1:
+        if not isinstance(release_tree_sha256, str):
+            raise SystemExit("release manifest tree digest is invalid")
+        try:
+            with pinned_hermes_runtime(
+                args.reasoning_effort,
+                source_home=args.source_hermes_home,
+            ) as runtime:
+                child_result = _run_qualification_readiness(
+                    args=args,
+                    output_root=output_root,
+                    runtime_home=runtime.home,
+                    release_tree_sha256=release_tree_sha256,
+                    controller_config_sha256=runtime.config_sha256,
+                    qualification_contract=(
+                        child_authorization["contract"]
+                        if child_authorization is not None
+                        and isinstance(child_authorization.get("contract"), Mapping)
+                        else {}
+                    ),
+                )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        # One machine-readable, score-free output boundary. No progress or generic
+        # aggregation text is emitted by this mode.
+        print(json.dumps(child_result, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
+
+    if args.authoritative_full_v1:
+        if (
+            not isinstance(release_tree_sha256, str)
+            or release_approval_sha256 is None
+            or child_authorization is None
+        ):
+            raise SystemExit("authoritative_full_execution_contract_invalid")
+        try:
+            with pinned_hermes_runtime(
+                args.reasoning_effort,
+                source_home=args.source_hermes_home,
+            ) as runtime:
+                return _run_authoritative_full_stage(
+                    args=args,
+                    output_root=output_root,
+                    runtime_home=runtime.home,
+                    release_tree_sha256=release_tree_sha256,
+                    release_approval_sha256=release_approval_sha256,
+                    authorization=child_authorization,
+                )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     registry = load_registry(ROOT / "cases.json")
     all_cases = list(registry["cases"])

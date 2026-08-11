@@ -1,7 +1,5 @@
 # Operational Agent Benchmark v2
 
-[![CI](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/kcemate/operational-agent-benchmark/actions/workflows/ci.yml)
-
 **A benchmark that measures whether a model can *finish a job*, not whether it sounds smart.**
 
 OAB gives a model a real operational task inside a network-denied OS sandbox — read these files, compute these totals, write this exact schema, and call the export tool *only* if the authority record permits it. Then it checks the result deterministically: right values, right shape, right authorization decision. No LLM judge, no partial credit.
@@ -45,11 +43,28 @@ separately controlled Ed25519 signer must also sign that exact stage request.
 Once both gates are present, the agent handles the benchmark mechanics.
 `AGENTS.md` is the runbook it follows.
 
+### Signed child boundary
+
+Spend approval is not a command-line capability. The campaign parent reconstructs
+the exact signed `PLAN.json`, calibration receipt, v5 stage approval, route,
+effort, cost posture, and planned evidence location, then passes a one-use
+authorization proof to its child through retained file descriptors. A public
+qualification or full child refuses mutable `--qualification-contract-json`
+input, an unsigned proof, or a route, effort, PLAN, public-key, cost-policy, or
+output-path mismatch **before** it constructs a controller. This is deliberate:
+conversation text and mutable CLI JSON are never public child authority.
+
+The full stage has a second immutable boundary. Only P01–P08 × approved/
+prohibited × five repetitions — 80 episodes per route, at most 17 calls each,
+and 1,360 calls per route — can carry full-stage authority. A partial or custom
+plan may be useful exploratory work, but it cannot become an authoritative
+comparison or a switch decision.
+
 ---
 
 ## Install
 
-Each release publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin. **That release-notes page is where a cold agent obtains its pin. If the version you want has no published release notes carrying both digests, no trusted pin exists: stop rather than installing an unpinned artifact.**
+Each *published release* publishes its wheel and release-tree digests in its [GitHub release notes](https://github.com/kcemate/operational-agent-benchmark/releases). They aren't repeated in this file on purpose — the README is inside the hashed tree, so any digest printed here could never match the tree it claims to pin. **That release-notes page is where a cold agent obtains its pin. If the version you want has no published release notes carrying both digests, no trusted pin exists: stop rather than installing an unpinned artifact.** A source checkout (especially a dirty or unreleased release candidate) is not a published wheel, does not inherit a historical CI result, and must never be represented as one.
 
 ```bash
 gh release list --repo kcemate/operational-agent-benchmark   # pick a published version
@@ -116,7 +131,7 @@ deterministic_contract_completion_rate: 0.0% (0/80)
 matched_pair_completion_rate: 0.0% | pair_stability_min: 0.0% (P01)
 ```
 
-That is an actual published run. An 8B local model executed all 80 episodes without a single infrastructure failure — and completed zero contracts. It computed every number correctly and nested the totals under one key instead of two.
+That is a historical published-run example, not evidence that the checkout you are reading has been published or hosted-CI validated. In that run, an 8B local model executed all 80 episodes without a single infrastructure failure — and completed zero contracts. It computed every number correctly and nested the totals under one key instead of two.
 
 A leaderboard would record that as "0%, model is bad." OAB tells you it was one key away, and `oab explain` shows you which key. **That distinction is the entire point of this tool.**
 
@@ -200,7 +215,7 @@ Cost control is a first-class feature, not a footnote.
 - Before any paid stage, `oab approval-preview` prints exactly what will run — ordered routes, episode counts, call ceilings, cost stop, and unknown-cost posture — with **no provider calls**.
 - Nothing runs until you approve those exact values. Approval is bound to the plan and calibration digests, so a receipt can't be reused for a different run.
 - Qualification is a **plumbing-only** check: two bounded multi-turn probes per route (up to four provider calls each; absolute reserve 16 calls/route including one infrastructure-only retry per probe). It reports READY / NOT READY / INCOMPATIBLE and never a model-quality score. A full comparison is a **separate** approval.
-- If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing. Continuing requires a fresh preview and a new approval carrying `--allow-unknown-costs`.
+- If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing. Continuing requires a fresh preview and a new approval carrying `--allow-unknown-costs`. There is no named-provider exception: unknown dollar cost fails closed unless that exact signed policy permits it.
 
 To compare just your current route against one candidate, pass a two-route inventory instead of letting discovery enumerate everything. Both `oab discover` and `oab benchmark` accept `--inventory-json`:
 
@@ -295,10 +310,10 @@ Requires Python 3.11+. Run the tests with:
 python3 -m unittest discover -s tests -v
 ```
 
-CI covers Linux (Bubblewrap, Python 3.11/3.12/3.13) and macOS (`sandbox-exec`, Python 3.11/3.13).
+The release policy requires hosted CI coverage on Linux (Bubblewrap, Python 3.11/3.12/3.13) and macOS (`sandbox-exec`, Python 3.11/3.13). A historical green workflow attests only its recorded commit/tag; a local checkout remains unverified until that exact clean tree has its own required release evidence.
 
 See `BENCHMARK_CARD.md` for the construct card, `AGENTS.md` for the agent runbook, and `CONTRIBUTING.md` to add a pair.
 
 ## Status
 
-Public beta, under active hardening. The harness, containment, and evidence chain are tested and CI-verified. Model-selection claims stay provisional until the identity and approval gates above are satisfied.
+Public beta, under active hardening. Published release artifacts carry their own pinned test/CI evidence; this source checkout must not be called published, released, or CI-verified unless its exact clean tree has those artifacts. The runtime containment and evidence requirements above remain mandatory. Model-selection claims stay provisional until the identity and approval gates above are satisfied.

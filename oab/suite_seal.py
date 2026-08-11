@@ -15,6 +15,22 @@ from .case_verifier import verify_case
 from .evidence import verify_sealed_evidence
 from .manifest import ManifestError, build_tree_manifest
 from .paths import benchmark_root
+from .qualification_contract import (
+    PROBE_RESULT_FIELDS,
+    QUALIFICATION_EXECUTION_MODE,
+    QUALIFICATION_PROBE_RESULT_SCHEMA,
+    QUALIFICATION_REPORT_SCHEMA,
+    QUALIFICATION_SEAL_FIELDS,
+    attempt_readiness,
+    build_physical_attempt,
+    build_qualification_report,
+    evidence_dir_for,
+    identity_projection,
+    runtime_projection,
+    telemetry_errors,
+    telemetry_projection,
+    validate_qualification_report,
+)
 from .release_approval import verify_release_approval
 from .registry import load_registry
 from .runner import _cleanup_snapshot_name, _copy_snapshot_tree_fd
@@ -643,6 +659,11 @@ def _recomputed_report(
         repetitions=repetitions,
         pair_ids=[str(pair_id) for pair_id in pair_ids],
         case_ids_by_pair=case_map,
+        authoritative_stage=(
+            report.get("authoritative_stage")
+            if isinstance(report.get("authoritative_stage"), Mapping)
+            else None
+        ),
     )
 
 
@@ -683,6 +704,281 @@ def _verify_report_claims(
         raise ValueError("suite_headline_mismatch")
 
 
+@contextmanager
+def _trusted_qualification_attempt_directories(
+    root_fd: int,
+    report: Mapping[str, object],
+) -> Iterator[dict[str, int]]:
+    """Bind exactly the declared readiness attempt directories without following links."""
+    attempts = report.get("attempts")
+    if not isinstance(attempts, list):
+        raise ValueError("qualification_attempt_grid_invalid")
+    descriptors: list[int] = []
+    links: list[_DirectoryLink] = []
+
+    def names(directory_fd: int) -> set[str]:
+        try:
+            entries = list(os.scandir(directory_fd))
+        except OSError as exc:
+            raise ValueError("qualification_evidence_path_unsafe") from exc
+        result: set[str] = set()
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("qualification_evidence_path_unsafe") from exc
+            if not stat.S_ISDIR(info.st_mode) or entry.name in result:
+                raise ValueError("qualification_evidence_path_unsafe")
+            result.add(entry.name)
+        return result
+
+    def open_child(parent_fd: int, name: str) -> int:
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            child = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise ValueError("qualification_evidence_path_unsafe") from exc
+        descriptors.append(child)
+        opened = os.fstat(child)
+        if not _same_directory(expected, opened):
+            raise ValueError("qualification_evidence_path_unsafe")
+        links.append((parent_fd, name, child, _directory_binding(opened)))
+        return child
+
+    try:
+        evidence_fd = open_child(root_fd, "evidence")
+        if names(evidence_fd) != {"rep-01"}:
+            raise ValueError("qualification_evidence_grid_invalid")
+        repetition_fd = open_child(evidence_fd, "rep-01")
+        by_case: dict[str, list[dict[str, object]]] = {}
+        for raw in attempts:
+            if not isinstance(raw, Mapping):
+                raise ValueError("qualification_attempt_grid_invalid")
+            case_id = raw.get("evidence_dir")
+            attempt_id = raw.get("attempt_id")
+            if not isinstance(case_id, str) or not isinstance(attempt_id, str):
+                raise ValueError("qualification_attempt_grid_invalid")
+            parts = Path(case_id).parts
+            if len(parts) != 4 or parts[:2] != ("evidence", "rep-01"):
+                raise ValueError("qualification_attempt_grid_invalid")
+            by_case.setdefault(parts[2], []).append(dict(raw))
+        if names(repetition_fd) != set(by_case):
+            raise ValueError("qualification_evidence_grid_invalid")
+        bound: dict[str, int] = {}
+        for case_id in sorted(by_case):
+            case_fd = open_child(repetition_fd, case_id)
+            expected_attempt_names = {
+                Path(str(row["evidence_dir"])).name for row in by_case[case_id]
+            }
+            if names(case_fd) != expected_attempt_names:
+                raise ValueError("qualification_evidence_grid_invalid")
+            for row in by_case[case_id]:
+                attempt_name = Path(str(row["evidence_dir"])).name
+                attempt_id = str(row["attempt_id"])
+                if attempt_id in bound:
+                    raise ValueError("qualification_attempt_duplicate")
+                bound[attempt_id] = open_child(case_fd, attempt_name)
+        yield bound
+        _revalidate_directory_links(links, error="qualification_evidence_path_unsafe")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _qualification_case(case_id: str) -> dict[str, object]:
+    registry = load_registry(benchmark_root() / "cases.json")
+    matches = [
+        dict(case)
+        for case in registry["cases"]
+        if isinstance(case, Mapping) and case.get("case_id") == case_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("qualification_case_registry_invalid")
+    return matches[0]
+
+
+def _recompute_qualification_attempt(
+    declared: Mapping[str, object],
+    *,
+    report: Mapping[str, object],
+    evidence: Path,
+) -> dict[str, object]:
+    receipt = _load_object(evidence / "result.json")
+    if (
+        receipt.get("schema") != QUALIFICATION_PROBE_RESULT_SCHEMA
+        or set(receipt) != PROBE_RESULT_FIELDS
+        or receipt.get("case_id") not in {"oab2-data-rollup-a", "oab2-data-rollup-p"}
+        or receipt.get("repetition") != 1
+        or not isinstance(receipt.get("status"), str)
+        or not isinstance(receipt.get("readiness_evidence"), bool)
+    ):
+        raise ValueError("qualification_attempt_evidence_invalid")
+    raw_reasons = receipt.get("reason_codes")
+    if (
+        not isinstance(raw_reasons, list)
+        or any(not isinstance(reason, str) or not reason for reason in raw_reasons)
+        or raw_reasons != sorted(set(raw_reasons))
+    ):
+        raise ValueError("qualification_attempt_evidence_invalid")
+    case = _qualification_case(str(receipt["case_id"]))
+    gates = verify_case(case, benchmark_root() / str(case["fixture_path"]), evidence)
+    probe_satisfied = all(gate.passed for gate in gates)
+    probe = {
+        "probe_id": declared.get("probe_id"),
+        "pair_id": case.get("pair_id"),
+        "case_id": case.get("case_id"),
+        "variant": case.get("variant"),
+        "repetition": 1,
+    }
+    actual = build_physical_attempt(
+        probe=probe,
+        attempt_number=int(declared.get("attempt_number", 0)),
+        runner_status=receipt["status"],
+        reason_codes=raw_reasons,
+        identity=receipt.get("controller_identity"),
+        telemetry=receipt.get("controller_usage"),
+        runtime=receipt.get("runtime"),
+        trace_sha256=receipt.get("trace_sha256"),
+        output_tree_sha256=receipt.get("output_tree_sha256"),
+        probe_contract_satisfied=probe_satisfied,
+        requested_route=str(report["requested_route"]),
+        reasoning_effort=str(report["reasoning_effort"]),
+    )
+    if actual.get("evidence_dir") != declared.get("evidence_dir"):
+        raise ValueError("qualification_attempt_evidence_invalid")
+    return actual
+
+
+def _build_qualification_suite_seal(
+    output_root: Path,
+    *,
+    root_fd: int,
+    report: Mapping[str, object],
+    report_payload: bytes,
+    headline_payload: bytes,
+    release_manifest: Path | None,
+) -> dict[str, Any]:
+    validated_report = validate_qualification_report(report)
+    headline = headline_payload.decode("utf-8")
+    if headline != str(validated_report["headline"]) + "\n":
+        raise ValueError("qualification_headline_mismatch")
+    attempts_value = validated_report["attempts"]
+    assert isinstance(attempts_value, list)
+    recomputed_attempts: list[dict[str, object]] = []
+    physical_attempts: list[dict[str, object]] = []
+    with _trusted_qualification_attempt_directories(root_fd, validated_report) as descriptors:
+        source_states = {
+            attempt_id: _tree_state_fd(descriptor)
+            for attempt_id, descriptor in descriptors.items()
+        }
+        for declared in attempts_value:
+            assert isinstance(declared, Mapping)
+            attempt_id = str(declared["attempt_id"])
+            descriptor = descriptors.get(attempt_id)
+            if descriptor is None:
+                raise ValueError("qualification_attempt_missing")
+            relative = Path(str(declared["evidence_dir"]))
+            with _trusted_evidence_snapshot(descriptor, relative) as evidence:
+                verification = verify_sealed_evidence(evidence)
+                if verification.get("valid") is not True:
+                    rendered = ",".join(str(item) for item in verification.get("errors", []))
+                    raise ValueError(
+                        f"qualification_attempt_unsealed:{relative.as_posix()}:{rendered}"
+                    )
+                try:
+                    manifest = build_tree_manifest(
+                        evidence,
+                        max_files=1024,
+                        max_total_bytes=128 * 1024 * 1024,
+                    )
+                except ManifestError as exc:
+                    raise ValueError(
+                        f"qualification_attempt_evidence_invalid:{relative.as_posix()}:{exc}"
+                    ) from None
+                actual = _recompute_qualification_attempt(
+                    declared, report=validated_report, evidence=evidence
+                )
+            recomputed_attempts.append(actual)
+            physical_attempts.append(
+                {
+                    "attempt_id": attempt_id,
+                    "probe_id": declared["probe_id"],
+                    "attempt_number": declared["attempt_number"],
+                    "path": relative.as_posix(),
+                    "tree_sha256": manifest["tree_sha256"],
+                    "file_count": manifest["file_count"],
+                    "total_bytes": manifest["total_bytes"],
+                }
+            )
+        for attempt_id, descriptor in descriptors.items():
+            if _tree_state_fd(descriptor) != source_states[attempt_id]:
+                raise ValueError("qualification_evidence_path_unsafe")
+
+    stopped_before_probe: str | None = None
+    probes_value = validated_report["probes"]
+    assert isinstance(probes_value, list)
+    for probe in probes_value:
+        if isinstance(probe, Mapping) and probe.get("selected_attempt") is None:
+            reasons = probe.get("reason_codes")
+            if isinstance(reasons, list) and len(reasons) == 1 and isinstance(reasons[0], str):
+                stopped_before_probe = reasons[0]
+    actual_report = build_qualification_report(
+        qualification_contract=validated_report["qualification_contract"],
+        requested_route=str(validated_report["requested_route"]),
+        reasoning_effort=str(validated_report["reasoning_effort"]),
+        release_tree_sha256=(
+            validated_report["release_tree_sha256"]
+            if isinstance(validated_report["release_tree_sha256"], str)
+            else None
+        ),
+        controller_config_sha256=(
+            validated_report["controller_config_sha256"]
+            if isinstance(validated_report["controller_config_sha256"], str)
+            else None
+        ),
+        created_at=str(validated_report["created_at"]),
+        attempts=recomputed_attempts,
+        stopped_before_probe=stopped_before_probe,
+    )
+    if _canonical_bytes(actual_report) != _canonical_bytes(validated_report):
+        raise ValueError("qualification_report_recomputation_mismatch")
+    release_tree_sha256 = validated_report.get("release_tree_sha256")
+    if release_manifest is not None:
+        with _trusted_external_file_bytes(
+            release_manifest, error="release_manifest_unreadable"
+        ) as release_payload:
+            release_value = _load_object_bytes(release_payload, name=release_manifest.name)
+            release_tree_sha256 = release_value.get("tree_sha256")
+            if not isinstance(release_tree_sha256, str):
+                raise ValueError("release_manifest_tree_digest_invalid")
+            if validated_report.get("release_tree_sha256") != release_tree_sha256:
+                raise ValueError("suite_release_tree_mismatch")
+    selected_attempts = [
+        {
+            "probe_id": probe["probe_id"],
+            "attempt_id": probe["selected_attempt"],
+        }
+        for probe in probes_value
+        if isinstance(probe, Mapping)
+    ]
+    body: dict[str, Any] = {
+        "schema": _SCHEMA,
+        "execution_mode": QUALIFICATION_EXECUTION_MODE,
+        "suite_report_sha256": _sha256_bytes(report_payload),
+        "headline_sha256": _sha256_bytes(headline_payload),
+        "release_tree_sha256": release_tree_sha256,
+        "qualification_contract": validated_report["qualification_contract"],
+        "requested_route": validated_report["requested_route"],
+        "reasoning_effort": validated_report["reasoning_effort"],
+        "physical_attempts": physical_attempts,
+        "selected_attempts": selected_attempts,
+    }
+    body["content_sha256"] = _sha256_bytes(_canonical_bytes(body))
+    if set(body) != QUALIFICATION_SEAL_FIELDS:
+        raise ValueError("qualification_seal_fields_invalid")
+    return body
+
+
 def build_suite_seal(
     output_root: Path,
     *,
@@ -695,6 +991,16 @@ def build_suite_seal(
             if report_bytes is not None and report_bytes != report_payload:
                 raise ValueError("suite_metadata_file_unsafe")
             report = _load_object_bytes(report_payload, name="suite-report.json")
+            if report.get("schema") == QUALIFICATION_REPORT_SCHEMA:
+                with _trusted_metadata_bytes(root_fd, "HEADLINE.txt") as headline_payload:
+                    return _build_qualification_suite_seal(
+                        output_root,
+                        root_fd=root_fd,
+                        report=report,
+                        report_payload=report_payload,
+                        headline_payload=headline_payload,
+                        release_manifest=release_manifest,
+                    )
             grid, case_map = _suite_grid(report)
             with _trusted_metadata_bytes(root_fd, "HEADLINE.txt") as headline_payload:
                 episodes: list[dict[str, object]] = []
@@ -947,6 +1253,11 @@ def verify_suite_seal(
                     errors.append("suite_external_seal_digest_mismatch")
                 if recorded.get("schema") != _SCHEMA:
                     errors.append("suite_seal_schema_invalid")
+                if recorded.get("execution_mode") == QUALIFICATION_EXECUTION_MODE:
+                    if set(recorded) != QUALIFICATION_SEAL_FIELDS:
+                        errors.append("qualification_seal_fields_invalid")
+                    if not isinstance(recorded.get("qualification_contract"), Mapping):
+                        errors.append("qualification_seal_contract_invalid")
                 recorded_content_digest = recorded.get("content_sha256")
                 unsigned = dict(recorded)
                 unsigned.pop("content_sha256", None)

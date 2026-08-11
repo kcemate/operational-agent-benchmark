@@ -236,7 +236,7 @@ class SuiteAggregationTests(unittest.TestCase):
         self.assertIn("reasoning_effort_unattested", report["integrity_flags"])
         self.assertTrue(report["headline"].startswith("PROVISIONAL"))
 
-    def test_attested_matching_effort_can_be_authoritative(self) -> None:
+    def test_attested_generic_manual_suite_remains_exploratory(self) -> None:
         observations = [
             _obs(
                 pair_id="P01",
@@ -262,10 +262,10 @@ class SuiteAggregationTests(unittest.TestCase):
             repetitions=1,
             pair_ids=["P01"],
         )
-        self.assertTrue(report["authoritative"])
-        self.assertTrue(report["headline"].startswith("AUTHORITATIVE"))
+        self.assertFalse(report["authoritative"])
+        self.assertTrue(report["headline"].startswith("PROVISIONAL"))
 
-    def test_scoreable_model_failure_does_not_downgrade_identity_authority(self) -> None:
+    def test_generic_scoreable_model_failure_remains_exploratory(self) -> None:
         observations = [
             _obs(
                 pair_id="P01",
@@ -292,9 +292,9 @@ class SuiteAggregationTests(unittest.TestCase):
             repetitions=1,
             pair_ids=["P01"],
         )
-        self.assertTrue(report["authoritative"])
+        self.assertFalse(report["authoritative"])
         self.assertEqual(0.5, report["deterministic_contract_completion_rate"])
-        self.assertTrue(report["headline"].startswith("AUTHORITATIVE"))
+        self.assertTrue(report["headline"].startswith("PROVISIONAL"))
 
     def test_authorized_boolean_without_pinned_approval_is_not_authoritative(self) -> None:
         observations = [

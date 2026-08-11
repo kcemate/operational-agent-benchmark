@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
-from oab.strict_runner import ToolPolicy
+from oab.evidence import verify_sealed_evidence
+from oab.qualification_contract import qualification_contract_for_route_count
+from oab.strict_runner import StrictEpisodeResult, ToolPolicy
+from oab.suite_seal import verify_suite_seal
+from qualification_fixtures import write_probe_evidence
+from tools import run_suite
 from tools.run_suite import _bounded_tool_policy, _run_observations
 
 
@@ -173,6 +183,626 @@ class RunSuiteQualificationBoundsTests(unittest.TestCase):
                 )
 
             self.assertEqual(3, observations[0]["protocol_normalized_turns"])
+
+
+class QualificationReadinessModeTests(unittest.TestCase):
+    def _authorized_output(self, root: Path) -> Path:
+        parent = root / "outputs"
+        parent.mkdir(mode=0o700, exist_ok=True)
+        return parent / ("a" * 32 + ".evidence")
+
+    @contextlib.contextmanager
+    def _authorized_qualification_command(
+        self,
+        *,
+        root: Path,
+        output: Path,
+        route: str,
+        allow_unknown_costs: bool = False,
+    ):
+        provider, model = route.split("/", 1)
+        output_parent = output.parent
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        output_parent_fd = os.open(output_parent, os.O_RDONLY | os.O_DIRECTORY)
+        transport_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        manifest = json.loads((run_suite.ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
+        authorization = {
+            "stage": "qualification",
+            "contract": qualification_contract_for_route_count(1),
+            "release_tree_sha256": manifest["tree_sha256"],
+        }
+        command = [
+            "run_suite",
+            "--provider", provider,
+            "--model", model,
+            "--reasoning-effort", "high",
+            "--output-root", str(output),
+            "--output-parent-fd", str(output_parent_fd),
+            "--output-name", output.name,
+            "--qualification-readiness-v1",
+            "--campaign-root-path", str(root),
+            "--campaign-root-fd", str(root_fd),
+            "--campaign-authorization-fd", str(transport_fd),
+            "--max-api-calls", "16",
+            "--max-observed-cost-usd", "1.0",
+        ]
+        if allow_unknown_costs:
+            command.append("--allow-unknown-costs")
+        try:
+            with patch("tools.run_suite.verify_campaign_child_authorization", return_value=authorization):
+                yield command
+        finally:
+            os.close(transport_fd)
+            os.close(output_parent_fd)
+            os.close(root_fd)
+
+    def _write_probe_evidence(
+        self,
+        evidence: Path,
+        *,
+        case_id: str,
+        repetition: int,
+        route: str,
+        usage: dict[str, object],
+        status: str = "completed",
+        reason_codes: list[str] | None = None,
+    ) -> StrictEpisodeResult:
+        receipt = write_probe_evidence(
+            evidence,
+            case_id=case_id,
+            repetition=repetition,
+            route=route,
+            status=status,
+            reason_codes=reason_codes or [],
+            telemetry=usage,
+        )
+        return StrictEpisodeResult(
+            case_id=str(receipt["case_id"]),
+            repetition=cast(int, receipt["repetition"]),
+            status=str(receipt["status"]),
+            valid_for_scoring=bool(receipt["readiness_evidence"]),
+            reason_codes=tuple(
+                str(code) for code in cast(list[object], receipt["reason_codes"])
+            ),
+            evidence_dir=evidence,
+            trace_sha256=str(receipt["trace_sha256"]),
+            output_tree_sha256=str(receipt["output_tree_sha256"]),
+        )
+
+    def test_v230_unknown_cost_primary_is_never_retried_even_when_disclosed(self) -> None:
+        """Unknown dollars stay disclosed; they cannot open a retry spend hole."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            output = self._authorized_output(root)
+            route = "offline/unknown-cost"
+            invocations: list[tuple[str, int]] = []
+
+            class OfflineController:
+                controller_config_sha256 = "sha256:" + "b" * 64
+
+                def __init__(self, **_kwargs: object) -> None:
+                    return None
+
+            class OfflineRuntime:
+                home = root
+                config_sha256 = "sha256:" + "b" * 64
+
+                def __enter__(self) -> "OfflineRuntime":
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+            def fake_episode(
+                spec: object,
+                *,
+                evidence_dir: Path,
+                artifact_profile: str = "standard",
+                **_kwargs: object,
+            ) -> StrictEpisodeResult:
+                case_id = str(getattr(spec, "case_id"))
+                attempt_number = len(
+                    [item for item in invocations if item[0] == case_id]
+                ) + 1
+                invocations.append((case_id, attempt_number))
+                self.assertEqual("qualification_readiness", artifact_profile)
+                if case_id == "oab2-data-rollup-a":
+                    return self._write_probe_evidence(
+                        evidence_dir,
+                        case_id=case_id,
+                        repetition=1,
+                        route=route,
+                        status="runner_invalid",
+                        reason_codes=["provider_unavailable"],
+                        usage={
+                            "api_calls": 2,
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "latency_ms": 1.0,
+                            "cost_usd": None,
+                            "known_cost_usd": 0.0,
+                            "unknown_cost_api_calls": 2,
+                        },
+                    )
+                return self._write_probe_evidence(
+                    evidence_dir,
+                    case_id=case_id,
+                    repetition=1,
+                    route=route,
+                    usage={
+                        "api_calls": 2,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "latency_ms": 1.0,
+                        "cost_usd": 0.0,
+                        "known_cost_usd": 0.0,
+                        "unknown_cost_api_calls": 0,
+                    },
+                )
+
+            with (
+                self._authorized_qualification_command(
+                    root=root,
+                    output=output,
+                    route=route,
+                    allow_unknown_costs=True,
+                ) as command,
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=OfflineRuntime()),
+                patch("tools.run_suite.HermesCliController", OfflineController),
+                patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("oab.suite_seal.verify_case", return_value=[]),
+            ):
+                self.assertEqual(0, run_suite.main())
+
+            self.assertEqual(
+                [("oab2-data-rollup-a", 1), ("oab2-data-rollup-p", 1)], invocations
+            )
+            report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+            self.assertEqual(2, len(report["attempts"]))
+            self.assertIsNone(report["controller_usage"]["cost_usd"])
+            self.assertEqual(2, report["controller_usage"]["unknown_cost_api_calls"])
+
+    def test_v230_malformed_and_nonretryable_primary_receipts_never_open_retry(self) -> None:
+        """Malformed telemetry and non-transient failures remain terminal child outcomes."""
+        scenarios: tuple[
+            tuple[str, str, list[str], dict[str, object], list[tuple[str, int]]], ...
+        ] = (
+            (
+                "malformed-telemetry",
+                "completed",
+                [],
+                {
+                    "api_calls": None,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "latency_ms": 1.0,
+                    "cost_usd": 0.0,
+                    "known_cost_usd": 0.0,
+                    "unknown_cost_api_calls": 0,
+                },
+                [("oab2-data-rollup-a", 1)],
+            ),
+            (
+                "nonretryable-auth",
+                "runner_invalid",
+                ["provider_authentication_invalid"],
+                {
+                    "api_calls": 2,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "latency_ms": 1.0,
+                    "cost_usd": 0.0,
+                    "known_cost_usd": 0.0,
+                    "unknown_cost_api_calls": 0,
+                },
+                [("oab2-data-rollup-a", 1), ("oab2-data-rollup-p", 1)],
+            ),
+        )
+        for label, first_status, first_reasons, first_usage, expected in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                output = self._authorized_output(root)
+                route = f"offline/{label}"
+                invocations: list[tuple[str, int]] = []
+                controller_budgets: list[object] = []
+
+                class OfflineController:
+                    controller_config_sha256 = "sha256:" + "b" * 64
+
+                    def __init__(self, **kwargs: object) -> None:
+                        controller_budgets.append(kwargs.get("max_api_calls"))
+
+                class OfflineRuntime:
+                    home = root
+                    config_sha256 = "sha256:" + "b" * 64
+
+                    def __enter__(self) -> "OfflineRuntime":
+                        return self
+
+                    def __exit__(self, *_args: object) -> None:
+                        return None
+
+                def fake_episode(
+                    spec: object,
+                    *,
+                    evidence_dir: Path,
+                    artifact_profile: str = "standard",
+                    **_kwargs: object,
+                ) -> StrictEpisodeResult:
+                    case_id = str(getattr(spec, "case_id"))
+                    attempt_number = len(
+                        [item for item in invocations if item[0] == case_id]
+                    ) + 1
+                    invocations.append((case_id, attempt_number))
+                    self.assertEqual("qualification_readiness", artifact_profile)
+                    if case_id == "oab2-data-rollup-a":
+                        return self._write_probe_evidence(
+                            evidence_dir,
+                            case_id=case_id,
+                            repetition=int(getattr(spec, "repetition")),
+                            route=route,
+                            status=first_status,
+                            reason_codes=first_reasons,
+                            usage=first_usage,
+                        )
+                    return self._write_probe_evidence(
+                        evidence_dir,
+                        case_id=case_id,
+                        repetition=int(getattr(spec, "repetition")),
+                        route=route,
+                        usage={
+                            "api_calls": 2,
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "latency_ms": 1.0,
+                            "cost_usd": 0.0,
+                            "known_cost_usd": 0.0,
+                            "unknown_cost_api_calls": 0,
+                        },
+                    )
+
+                with (
+                    self._authorized_qualification_command(
+                        root=root,
+                        output=output,
+                        route=route,
+                    ) as command,
+                    patch.object(sys, "argv", command),
+                    patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                    patch("tools.run_suite.pinned_hermes_runtime", return_value=OfflineRuntime()),
+                    patch("tools.run_suite.HermesCliController", OfflineController),
+                    patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                    patch("tools.run_suite.verify_case", return_value=[]),
+                    patch("oab.suite_seal.verify_case", return_value=[]),
+                ):
+                    self.assertEqual(0, run_suite.main())
+
+                self.assertEqual(expected, invocations)
+                self.assertEqual([4] * len(expected), controller_budgets)
+                report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+                self.assertEqual("NOT_READY", report["readiness"])
+                self.assertEqual(len(expected), len(report["attempts"]))
+                self.assertFalse(
+                    any(attempt["attempt_number"] == 2 for attempt in report["attempts"])
+                )
+                self.assertEqual([], verify_suite_seal(output))
+
+    def test_v230_no_retry_child_runs_exactly_two_first_attempts_and_seals_them(self) -> None:
+        """A healthy readiness child executes the two first probes once, then seals both."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            output = self._authorized_output(root)
+            route = "offline/no-retry"
+            invocations: list[tuple[str, int]] = []
+            controller_budgets: list[object] = []
+
+            class OfflineController:
+                controller_config_sha256 = "sha256:" + "b" * 64
+
+                def __init__(self, **kwargs: object) -> None:
+                    controller_budgets.append(kwargs.get("max_api_calls"))
+
+            class OfflineRuntime:
+                home = root
+                config_sha256 = "sha256:" + "b" * 64
+
+                def __enter__(self) -> "OfflineRuntime":
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+            def fake_episode(
+                spec: object,
+                *,
+                evidence_dir: Path,
+                artifact_profile: str = "standard",
+                **_kwargs: object,
+            ) -> StrictEpisodeResult:
+                case_id = str(getattr(spec, "case_id"))
+                attempt_number = len(
+                    [item for item in invocations if item[0] == case_id]
+                ) + 1
+                invocations.append((case_id, attempt_number))
+                self.assertEqual("qualification_readiness", artifact_profile)
+                return self._write_probe_evidence(
+                    evidence_dir,
+                    case_id=case_id,
+                    repetition=int(getattr(spec, "repetition")),
+                    route=route,
+                    usage={
+                        "api_calls": 4,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "latency_ms": 1.0,
+                        "cost_usd": 0.0,
+                        "known_cost_usd": 0.0,
+                        "unknown_cost_api_calls": 0,
+                    },
+                )
+
+            with (
+                self._authorized_qualification_command(
+                    root=root,
+                    output=output,
+                    route=route,
+                ) as command,
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=OfflineRuntime()),
+                patch("tools.run_suite.HermesCliController", OfflineController),
+                patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("oab.suite_seal.verify_case", return_value=[]),
+            ):
+                self.assertEqual(0, run_suite.main())
+
+            self.assertEqual(
+                [("oab2-data-rollup-a", 1), ("oab2-data-rollup-p", 1)], invocations
+            )
+            self.assertEqual([4, 4], controller_budgets)
+            report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+            self.assertEqual("READY", report["readiness"])
+            self.assertEqual(2, len(report["attempts"]))
+            self.assertEqual(8, report["controller_usage"]["api_calls"])
+            self.assertLessEqual(report["controller_usage"]["api_calls"], 8)
+            for attempt in report["attempts"]:
+                evidence = output / str(attempt["evidence_dir"])
+                self.assertTrue(verify_sealed_evidence(evidence)["valid"])
+            self.assertEqual([], verify_suite_seal(output))
+
+    def test_v230_selective_transient_retry_runs_only_affected_probe_and_seals_usage(self) -> None:
+        """One typed transient first failure gets one charged retry after both primaries."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            output = self._authorized_output(root)
+            route = "offline/selective-retry"
+            invocations: list[tuple[str, int]] = []
+            controller_budgets: list[object] = []
+
+            class OfflineController:
+                controller_config_sha256 = "sha256:" + "b" * 64
+
+                def __init__(self, **kwargs: object) -> None:
+                    controller_budgets.append(kwargs.get("max_api_calls"))
+
+            class OfflineRuntime:
+                home = root
+                config_sha256 = "sha256:" + "b" * 64
+
+                def __enter__(self) -> "OfflineRuntime":
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+            def fake_episode(
+                spec: object,
+                *,
+                evidence_dir: Path,
+                artifact_profile: str = "standard",
+                **_kwargs: object,
+            ) -> StrictEpisodeResult:
+                case_id = str(getattr(spec, "case_id"))
+                attempt_number = len(
+                    [item for item in invocations if item[0] == case_id]
+                ) + 1
+                invocations.append((case_id, attempt_number))
+                self.assertEqual("qualification_readiness", artifact_profile)
+                status = "completed"
+                reasons: list[str] = []
+                if case_id == "oab2-data-rollup-a" and attempt_number == 1:
+                    status = "runner_invalid"
+                    reasons = ["provider_unavailable"]
+                return self._write_probe_evidence(
+                    evidence_dir,
+                    case_id=case_id,
+                    repetition=int(getattr(spec, "repetition")),
+                    route=route,
+                    status=status,
+                    reason_codes=reasons,
+                    usage={
+                        "api_calls": 2,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "latency_ms": 1.0,
+                        "cost_usd": 0.01,
+                        "known_cost_usd": 0.01,
+                        "unknown_cost_api_calls": 0,
+                    },
+                )
+
+            with (
+                self._authorized_qualification_command(
+                    root=root,
+                    output=output,
+                    route=route,
+                ) as command,
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=OfflineRuntime()),
+                patch("tools.run_suite.HermesCliController", OfflineController),
+                patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("oab.suite_seal.verify_case", return_value=[]),
+            ):
+                self.assertEqual(0, run_suite.main())
+
+            self.assertEqual(
+                [
+                    ("oab2-data-rollup-a", 1),
+                    ("oab2-data-rollup-p", 1),
+                    ("oab2-data-rollup-a", 2),
+                ],
+                invocations,
+            )
+            self.assertEqual([4, 4, 4], controller_budgets)
+            report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+            self.assertEqual("READY", report["readiness"])
+            self.assertEqual(3, len(report["attempts"]))
+            self.assertEqual(6, report["controller_usage"]["api_calls"])
+            self.assertEqual(0.03, report["controller_usage"]["known_cost_usd"])
+            self.assertEqual(
+                ["P01-approved-attempt-02", "P01-prohibited-attempt-01"],
+                [probe["selected_attempt"] for probe in report["probes"]],
+            )
+            for attempt in report["attempts"]:
+                evidence = output / str(attempt["evidence_dir"])
+                self.assertTrue(verify_sealed_evidence(evidence)["valid"])
+            seal = json.loads((output / "SUITE_SEAL.json").read_text(encoding="utf-8"))
+            self.assertEqual(3, len(seal["physical_attempts"]))
+            self.assertEqual(2, len(seal["selected_attempts"]))
+            self.assertEqual([], verify_suite_seal(output))
+
+    def test_v230_qualification_child_stdout_report_and_seal_are_quality_free(self) -> None:
+        """The production-safe child has one score-free output boundary, not redaction."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            output = self._authorized_output(root)
+            route = "offline/qualification-probe"
+            created_controller_budgets: list[object] = []
+
+            class OfflineController:
+                controller_config_sha256 = "sha256:" + "b" * 64
+                protocol_normalized_turns = 0
+
+                def __init__(self, **kwargs: object) -> None:
+                    created_controller_budgets.append(kwargs.get("max_api_calls"))
+
+            class OfflineRuntime:
+                home = root
+                config_sha256 = "sha256:" + "b" * 64
+
+                def __enter__(self) -> "OfflineRuntime":
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+            def fake_episode(
+                spec: object,
+                *,
+                evidence_dir: Path,
+                tool_policy: ToolPolicy,
+                artifact_profile: str = "standard",
+                **_kwargs: object,
+            ) -> StrictEpisodeResult:
+                self.assertEqual("qualification_readiness", artifact_profile)
+                self.assertEqual(4, tool_policy.max_steps)
+                return self._write_probe_evidence(
+                    evidence_dir,
+                    case_id=str(getattr(spec, "case_id")),
+                    repetition=int(getattr(spec, "repetition")),
+                    route=route,
+                    usage={
+                        "api_calls": 4,
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "latency_ms": 1.0,
+                        "cost_usd": 0.0,
+                        "known_cost_usd": 0.0,
+                        "unknown_cost_api_calls": 0,
+                    },
+                )
+
+            with (
+                self._authorized_qualification_command(
+                    root=root,
+                    output=output,
+                    route=route,
+                ) as command,
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=OfflineRuntime()),
+                patch("tools.run_suite.HermesCliController", OfflineController),
+                patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("oab.suite_seal.verify_case", return_value=[]),
+                patch("tools.run_suite.aggregate_suite_observations") as aggregate,
+            ):
+                from io import StringIO
+
+                with patch("sys.stdout", new_callable=StringIO) as stdout:
+                    self.assertEqual(0, run_suite.main())
+                lines = [line for line in stdout.getvalue().splitlines() if line]
+            aggregate.assert_not_called()
+            self.assertEqual(1, len(lines))
+            child = json.loads(lines[0])
+            self.assertEqual(
+                {
+                    "schema",
+                    "readiness",
+                    "reason_codes",
+                    "controller_usage",
+                    "suite_report_path",
+                    "suite_seal_path",
+                    "suite_seal_sha256",
+                },
+                set(child),
+            )
+            report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+            seal = json.loads((output / "SUITE_SEAL.json").read_text(encoding="utf-8"))
+
+            def assert_quality_free(value: object) -> None:
+                if isinstance(value, dict):
+                    for key, nested in value.items():
+                        lowered = str(key).lower()
+                        for forbidden in (
+                            "score",
+                            "rate",
+                            "percentage",
+                            "pair_stability",
+                            "valid_for_scoring",
+                            "valid_for_calibration",
+                            "switch",
+                            "_rate",
+                        ):
+                            self.assertNotIn(forbidden, lowered)
+                        assert_quality_free(nested)
+                elif isinstance(value, list):
+                    for nested in value:
+                        assert_quality_free(nested)
+
+            assert_quality_free(report)
+            assert_quality_free(seal)
+            assert_quality_free(child)
+            headline = (output / "HEADLINE.txt").read_text(encoding="utf-8")
+            for forbidden in (
+                "score",
+                "rate",
+                "percentage",
+                "pair_stability",
+                "valid_for_scoring",
+                "valid_for_calibration",
+                "switch",
+            ):
+                self.assertNotIn(forbidden, headline.lower())
+            self.assertNotIn("%", headline)
+            self.assertNotIn("/", headline.split("route=", 1)[0])
+            self.assertEqual([4, 4], created_controller_budgets)
 
 
 if __name__ == "__main__":

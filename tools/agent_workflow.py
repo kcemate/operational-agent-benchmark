@@ -45,8 +45,18 @@ from oab.agent_workflow import (
     verify_campaign_plan,
     verify_stage_approval,
 )
+from oab.full_stage_contract import validate_authoritative_full_stage_plan
+from oab.campaign_authorization import encode_child_authorization_envelope
 from oab.explain import explain_episode, format_explanation
 from oab.paths import benchmark_root
+from oab.qualification_contract import (
+    ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+    QUALIFICATION_CONTRACT_ID,
+    QUALIFICATION_REPORT_SCHEMA,
+    canonical_bytes as qualification_canonical_bytes,
+    validate_qualification_contract,
+    validate_qualification_report,
+)
 from oab.suite_seal import verify_suite_seal
 if __package__:
     from .run_calibration import run_calibration
@@ -227,6 +237,28 @@ def _production_suite_runner(
         model = str(route.get("model") or "")
         if output.name in {"", ".", ".."} or "/" in output.name or "\\" in output.name:
             raise ValueError("campaign_suite_output_invalid")
+        route_call_budget = route.get("max_api_calls")
+        qualification_contract: dict[str, object] | None = None
+        if stage == "qualification":
+            tuple_value = route.get("_qualification_contract")
+            if (
+                route.get("_qualification_contract_version") != QUALIFICATION_CONTRACT_ID
+                or not isinstance(route_call_budget, int)
+                or isinstance(route_call_budget, bool)
+                or route_call_budget != ABSOLUTE_API_CALL_CEILING_PER_ROUTE
+            ):
+                raise ValueError("qualification_execution_contract_invalid")
+            try:
+                qualification_contract = validate_qualification_contract(tuple_value)
+            except ValueError as exc:
+                raise ValueError("qualification_execution_contract_invalid") from exc
+        elif stage == "full":
+            if (
+                not isinstance(route_call_budget, int)
+                or isinstance(route_call_budget, bool)
+                or route_call_budget != 1360
+            ):
+                raise ValueError("authoritative_full_execution_contract_invalid")
         try:
             output_parent_fd = _open_directory_fd(output.parent.expanduser().absolute())
         except (OSError, ValueError) as exc:
@@ -259,33 +291,73 @@ def _production_suite_runner(
                     output.name,
                 ]
             )
+        child_authorization_fd = -1
+        campaign_root_fd = -1
+        child_authorization_stream: tempfile.TemporaryFile[bytes] | None = None
+        if stage in {"qualification", "full"}:
+            root_value = route.get("_campaign_root_path")
+            approval_path_value = route.get("_campaign_approval_path")
+            signature_path_value = route.get("_campaign_approval_signature_path")
+            public_key_path_value = route.get("_campaign_approval_public_key_path")
+            if not all(
+                isinstance(value, str) and value
+                for value in (
+                    root_value,
+                    approval_path_value,
+                    signature_path_value,
+                    public_key_path_value,
+                )
+            ):
+                os.close(output_parent_fd)
+                raise ValueError("campaign_child_authorization_missing")
+            campaign_root = Path(cast(str, root_value)).expanduser().resolve()
+            approval_path = Path(cast(str, approval_path_value)).expanduser().resolve()
+            signature_path = Path(cast(str, signature_path_value)).expanduser().resolve()
+            public_key_path = Path(cast(str, public_key_path_value)).expanduser().resolve()
+            try:
+                approval = _load_json_object(approval_path)
+                signature_parent_fd = _open_directory_fd(signature_path.parent)
+                public_parent_fd = _open_directory_fd(public_key_path.parent)
+                try:
+                    signature = _read_regular_bytes_at(signature_parent_fd, signature_path.name)
+                    public_bytes = _read_regular_bytes_at(public_parent_fd, public_key_path.name)
+                finally:
+                    os.close(signature_parent_fd)
+                    os.close(public_parent_fd)
+                child_authorization_stream = tempfile.TemporaryFile()
+                child_authorization_stream.write(
+                    encode_child_authorization_envelope(
+                        approval_receipt=approval,
+                        signature=signature,
+                        public_key_pem=public_bytes,
+                    )
+                )
+                child_authorization_stream.flush()
+                child_authorization_stream.seek(0)
+                child_authorization_fd = child_authorization_stream.fileno()
+                campaign_root_fd = _open_directory_fd(campaign_root)
+            except Exception:
+                if child_authorization_stream is not None:
+                    child_authorization_stream.close()
+                os.close(output_parent_fd)
+                raise ValueError("campaign_child_authorization_missing") from None
+            command.extend(
+                [
+                    "--campaign-root-path",
+                    str(campaign_root),
+                    "--campaign-root-fd",
+                    str(campaign_root_fd),
+                    "--campaign-authorization-fd",
+                    str(child_authorization_fd),
+                ]
+            )
         if stage == "qualification":
-            qual_contract = str(route.get("_qualification_contract_version") or "v2.3.0")
-            if qual_contract == "v2.2.3":
-                # Legacy contract: 34 episodes, 1 call per episode, 17 repetitions per route
-                command.extend(
-                    [
-                        "--pairs",
-                        "P01",
-                        "--repetitions",
-                        "17",
-                        "--max-steps-per-episode",
-                        "1",
-                    ]
-                )
-            else:
-                # v2.3.0 contract: 2 probes, max 4 steps per probe
-                command.extend(
-                    [
-                        "--pairs",
-                        "P01",
-                        "--repetitions",
-                        "2",
-                        "--max-steps-per-episode",
-                        "4",
-                    ]
-                )
-        route_call_budget = route.get("max_api_calls")
+            # The child owns the exact P01 approved/prohibited first-attempt phase
+            # and any typed retry. Generic pair/repetition/step selectors are never
+            # passed to qualification readiness mode.
+            command.append("--qualification-readiness-v1")
+        elif stage == "full":
+            command.append("--authoritative-full-v1")
         if (
             isinstance(route_call_budget, int)
             and not isinstance(route_call_budget, bool)
@@ -303,7 +375,11 @@ def _production_suite_runner(
             command.extend(["--max-observed-cost-usd", str(float(max_observed_cost))])
         if route.get("allow_unknown_costs") is True:
             command.append("--allow-unknown-costs")
-        if release_approval is not None and expected_release_approval_sha256 is not None:
+        if (
+            stage != "qualification"
+            and release_approval is not None
+            and expected_release_approval_sha256 is not None
+        ):
             command.extend(
                 [
                     "--release-approval",
@@ -319,7 +395,15 @@ def _production_suite_runner(
             execution = _run_route_process(
                 command,
                 timeout_seconds=timeout_seconds,
-                pass_fds=(output_parent_fd,),
+                pass_fds=tuple(
+                    descriptor
+                    for descriptor in (
+                        output_parent_fd,
+                        campaign_root_fd,
+                        child_authorization_fd,
+                    )
+                    if descriptor >= 0
+                ),
             )
             if execution["timed_out"] is True:
                 raise RuntimeError("campaign_route_timeout")
@@ -352,6 +436,13 @@ def _production_suite_runner(
                 raise RuntimeError("campaign_suite_verification_failed") from exc
             if not isinstance(report_value, dict):
                 raise RuntimeError("campaign_suite_verification_failed")
+            if stage == "qualification":
+                try:
+                    validated = validate_qualification_report(report_value)
+                except ValueError as exc:
+                    raise RuntimeError("campaign_suite_verification_failed") from exc
+                if validated.get("qualification_contract") != qualification_contract:
+                    raise RuntimeError("campaign_suite_verification_failed")
             report = report_value
         finally:
             if saved_cwd_fd >= 0:
@@ -359,6 +450,10 @@ def _production_suite_runner(
                 os.close(saved_cwd_fd)
             if output_fd >= 0:
                 os.close(output_fd)
+            if campaign_root_fd >= 0:
+                os.close(campaign_root_fd)
+            if child_authorization_stream is not None:
+                child_authorization_stream.close()
             os.close(output_parent_fd)
         report["campaign_suite_verified"] = True
         report["campaign_elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -394,6 +489,12 @@ def _parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--inventory-json", type=Path, default=None)
     benchmark.add_argument("--expected-release-tree-sha256", default=None)
     benchmark.add_argument("--hermes-api-url", default=None)
+    benchmark.add_argument(
+        "--approval-public-key",
+        type=Path,
+        required=True,
+        help="Ed25519 approval authority pinned into PLAN before calibration",
+    )
 
     preview = subparsers.add_parser(
         "approval-preview",
@@ -638,6 +739,8 @@ def _verify_campaign(
                     expected_allow_unknown_costs=checked_allow_unknown,
                     public_key_path=public_key_path,
                     signature_path=signature_path,
+                    campaign_root=root,
+                    expected_plan=plan,
                 )
                 checked_approvals += 1
                 errors.extend(f"{stage}:{code}" for code in approval_errors)
@@ -833,28 +936,37 @@ def _verify_campaign(
             errors.append("decision_report_missing_or_invalid")
         else:
             decision_for_posture = stored_decision
-            full_plan = plan.get("full_run")
+            raw_full_plan = plan.get("full_run")
             baseline_route = plan.get("baseline_route")
             release_tree_sha256 = plan.get("release_tree_sha256")
-            if (
-                not isinstance(full_plan, Mapping)
-                or not isinstance(full_plan.get("pair_ids"), list)
-                or not isinstance(full_plan.get("repetitions"), int)
-                or isinstance(full_plan.get("repetitions"), bool)
-                or not isinstance(baseline_route, str)
-                or not baseline_route
-                or not isinstance(release_tree_sha256, str)
-                or not release_tree_sha256
-            ):
-                errors.append("decision_plan_binding_invalid")
-            else:
+            route_count = plan.get("route_count")
+            stage_approval_sha256 = spend_map.get("full_run_approval_sha256")
+            try:
+                if (
+                    not isinstance(baseline_route, str)
+                    or not baseline_route
+                    or not isinstance(release_tree_sha256, str)
+                    or not release_tree_sha256
+                    or not isinstance(route_count, int)
+                    or isinstance(route_count, bool)
+                    or not isinstance(stage_approval_sha256, str)
+                    or not stage_approval_sha256
+                ):
+                    raise ValueError("decision_plan_binding_invalid")
+                full_plan = validate_authoritative_full_stage_plan(
+                    raw_full_plan, route_count=route_count
+                )
                 recomputed = build_decision_report(
                     current_route=baseline_route,
-                    expected_pair_ids=[str(item) for item in full_plan["pair_ids"]],
-                    expected_repetitions=int(full_plan["repetitions"]),
                     expected_release_tree_sha256=release_tree_sha256,
                     suite_reports=full_reports,
+                    authoritative_full_plan=full_plan,
+                    expected_plan_sha256=str(plan_sha256),
+                    expected_stage_approval_sha256=stage_approval_sha256,
                 )
+            except (TypeError, ValueError):
+                errors.append("decision_plan_binding_invalid")
+            else:
                 if _decision_semantics(stored_decision) != _decision_semantics(recomputed):
                     errors.append("decision_report_recomputation_mismatch")
 
@@ -939,6 +1051,7 @@ def main(
                 doctor=doctor_report,
                 inventory_payload=inventory,
                 reasoning_effort=args.reasoning_effort,
+                approval_authority_public_key_path=args.approval_public_key,
             )
             if doctor_report.get("ready") is True:
                 calibration = calibration_runner(args.output_root.resolve() / "calibration")

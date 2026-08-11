@@ -37,20 +37,20 @@ class QualificationAcceptanceTests(unittest.TestCase):
 
     def test_acceptance_gate_covers_every_required_scenario(self) -> None:
         required = {
-            "two_turn_success",
-            "denial_recovery",
-            "loop_exhaustion",
-            "direct_answer_agent_loop_incompatible",
-            "route_mismatch",
-            "telemetry_known_cost",
-            "telemetry_unknown_cost",
-            "telemetry_missing_api_calls",
+            "strict_runner_two_turn_success",
+            "strict_runner_denial_recovery",
+            "strict_runner_loop_exhaustion",
+            "readiness_child_no_retry",
+            "readiness_child_selective_transient_retry",
+            "readiness_child_malformed_telemetry_stops",
+            "readiness_child_signed_tuple_rejected",
         }
         self.assertEqual(required, set(SCENARIOS))
 
     def test_acceptance_gate_declares_the_v230_plumbing_bounds(self) -> None:
         report = run_acceptance()
         self.assertEqual("v2.3.0", report["contract"])
+        self.assertEqual("oab.qualification-readiness/v1", report["execution_contract"])
         self.assertEqual(2, PROBES_PER_ROUTE)
         self.assertEqual(4, MAX_STEPS_PER_EPISODE)
         self.assertEqual(16, ABSOLUTE_CALLS_PER_ROUTE)
@@ -58,7 +58,15 @@ class QualificationAcceptanceTests(unittest.TestCase):
 
     def test_acceptance_report_contains_no_quality_percentage(self) -> None:
         serialized = json.dumps(run_acceptance())
-        for banned in ("completion_rate", "pair_stability", "gate_pass_rate", "%"):
+        for banned in (
+            "completion_rate",
+            "pair_stability",
+            "gate_pass_rate",
+            "valid_for_scoring",
+            "valid_for_calibration",
+            "switch",
+            "%",
+        ):
             self.assertNotIn(banned, serialized)
 
     def test_acceptance_cli_exits_zero_and_writes_json(self) -> None:
@@ -78,7 +86,7 @@ class QualificationAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(0, process.returncode, process.stderr)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual("oab.qualification-acceptance/v1", payload["schema"])
+            self.assertEqual("oab.qualification-acceptance/v2", payload["schema"])
             self.assertTrue(payload["passed"])
 
 

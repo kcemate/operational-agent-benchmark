@@ -20,6 +20,7 @@ from oab.registry import load_registry
 from oab.suite_seal import verify_suite_seal, write_suite_seal
 import oab.suite_seal as suite_seal
 from oab.trace import CanonicalTrace
+from qualification_fixtures import write_qualification_suite
 
 ROOT = benchmark_root()
 CONFIG_DIGEST = "sha256:" + "3" * 64
@@ -168,6 +169,91 @@ class SuiteSealTests(unittest.TestCase):
             output = self._suite(Path(td))
             _path, digest = write_suite_seal(output)
             self.assertEqual([], verify_suite_seal(output, expected_seal_sha256=digest))
+
+    def test_generic_full_quality_aggregation_and_seal_remain_intact(self) -> None:
+        """The protected full-suite aggregate remains distinct from readiness mode."""
+        with tempfile.TemporaryDirectory() as td:
+            output = self._suite(Path(td))
+            report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+            self.assertEqual("oab.suite-report/v1", report["schema"])
+            self.assertIn("deterministic_contract_completion_rate", report)
+            self.assertIn("matched_pair_completion_rate", report)
+            self.assertIn("pair_stability", report)
+            self.assertEqual(
+                format_headline(report) + "\n",
+                (output / "HEADLINE.txt").read_text(encoding="utf-8"),
+            )
+            _path, digest = write_suite_seal(output)
+            self.assertEqual([], verify_suite_seal(output, expected_seal_sha256=digest))
+
+    def test_qualification_seal_rejects_tamper_extra_duplicate_illegal_retry_and_selection(self) -> None:
+        """Every readiness seal is reconstructed, not trusted as a caller summary."""
+        scenarios = (
+            ("tampered-evidence", "qualification_attempt_unsealed"),
+            ("extra-attempt", "qualification_evidence_grid_invalid"),
+            ("duplicate-attempt", "qualification_retry_illegal"),
+            ("illegal-retry", "qualification_retry_illegal"),
+            ("selected-attempt-mismatch", "qualification_probe_selection_invalid"),
+        )
+        for label, expected_error in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                output = Path(td) / "qualification"
+                write_qualification_suite(output, route="offline/qualification-seal")
+                report_path = output / "suite-report.json"
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+
+                if label == "tampered-evidence":
+                    receipt_path = (
+                        output
+                        / "evidence"
+                        / "rep-01"
+                        / "oab2-data-rollup-a"
+                        / "attempt-01"
+                        / "result.json"
+                    )
+                    receipt_path.write_text("{}\n", encoding="utf-8")
+                elif label == "extra-attempt":
+                    (
+                        output
+                        / "evidence"
+                        / "rep-01"
+                        / "oab2-data-rollup-a"
+                        / "attempt-99"
+                    ).mkdir()
+                elif label == "duplicate-attempt":
+                    report["attempts"].append(dict(report["attempts"][0]))
+                    report_path.write_text(
+                        json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                elif label == "illegal-retry":
+                    retry = dict(report["attempts"][0])
+                    retry.update(
+                        {
+                            "attempt_id": "P01-approved-attempt-02",
+                            "attempt_number": 2,
+                            "attempt_kind": "infrastructure_retry",
+                            "retry_trigger": "P01-approved-attempt-01",
+                            "evidence_dir": "evidence/rep-01/oab2-data-rollup-a/attempt-02",
+                        }
+                    )
+                    report["attempts"].append(retry)
+                    report_path.write_text(
+                        json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                else:
+                    report["probes"][0]["selected_attempt"] = (
+                        "P01-prohibited-attempt-01"
+                    )
+                    report_path.write_text(
+                        json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+
+                errors = verify_suite_seal(output)
+                self.assertTrue(errors, errors)
+                self.assertTrue(
+                    any(expected_error in error for error in errors),
+                    (label, errors),
+                )
 
     def test_relative_evidence_paths_match_descriptor_bound_suite_output(self) -> None:
         with tempfile.TemporaryDirectory() as td:

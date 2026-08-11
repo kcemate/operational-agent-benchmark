@@ -1,38 +1,56 @@
-"""Offline release-blocking acceptance gate for the v2.3.0 qualification contract.
+"""Offline release-blocking acceptance gate for signed qualification readiness.
 
-This exercises the *real* controller / strict-runner / tool-policy path with
-deterministic fake model controllers. It performs **zero** provider calls and is
-safe to run in CI and on a developer machine.
+The gate drives the production ``tools.run_suite`` readiness child, its physical
+attempt accounting, report, headline and suite seal with deterministic sealed
+probe fixtures.  It also retains three real strict-runner broker controls.  No
+provider client is constructed or contacted: every controller boundary is
+replaced by an in-process deterministic fixture before the child is invoked.
 
-Scenarios (plan Task 7, offline portion):
-
-  two_turn_success        approved read tool loop -> final answer completes
-  denial_recovery         prohibited mutation is denied and the episode fails closed
-  loop_exhaustion         a never-terminating controller stops before call 5
-  direct_answer           a model that answers without the tool loop is
-                          ``agent_loop_incompatible`` / NOT READY, never a quality %
-  route_mismatch          requested/returned route divergence is infrastructure
-  telemetry_known_cost    known tokens + known cost qualifies
-  telemetry_unknown_cost  unknown cost qualifies but stays ``null``, never $0
-  telemetry_missing_calls missing API-call count is infrastructure-invalid
-
-Exit status is 0 only when every scenario reaches its expected outcome.
+This is deliberately an offline safety gate, not a qualification result for a
+real model route.  It proves the signed ``oab.qualification-readiness/v1``
+execution machinery and its failure containment without provider spend.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 import tempfile
+from contextlib import contextmanager, nullcontext
+from io import StringIO
 from pathlib import Path
-from typing import Callable
+from types import SimpleNamespace
+from typing import Callable, Iterator, Mapping, Sequence
+from unittest.mock import patch
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from oab.agent_workflow import classify_qualification  # noqa: E402
+from oab.campaign_authorization import (  # noqa: E402
+    campaign_plan_sha256,
+    canonical_bytes,
+    canonical_sha256,
+    encode_child_authorization_envelope,
+)
+from oab.evidence import build_evidence_manifest  # noqa: E402
+from oab.full_stage_contract import authoritative_full_contract_for_route_count  # noqa: E402
+from oab.manifest import build_tree_manifest  # noqa: E402
+from oab.qualification_contract import (  # noqa: E402
+    ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+    MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
+    MAX_BROKER_STEPS_PER_PROBE,
+    QUALIFICATION_CHILD_RESULT_SCHEMA,
+    QUALIFICATION_CONTRACT_ID,
+    QUALIFICATION_PROBE_RESULT_SCHEMA,
+    qualification_contract_for_route_count,
+)
 from oab.runner import StrictEpisodeSpec  # noqa: E402
 from oab.strict_runner import (  # noqa: E402
     ControllerIdentity,
@@ -43,13 +61,27 @@ from oab.strict_runner import (  # noqa: E402
     ToolResult,
     run_strict_episode,
 )
+from oab.suite_seal import verify_suite_seal  # noqa: E402
+from oab.trace import CanonicalTrace  # noqa: E402
+from tools import run_suite  # noqa: E402
 
-# v2.3.0 qualification contract constants (plumbing-only).
+# Kept as public aliases because this gate is also a compact contract audit.
 PROBES_PER_ROUTE = 2
-MAX_STEPS_PER_EPISODE = 4
-ABSOLUTE_CALLS_PER_ROUTE = 16
+MAX_STEPS_PER_EPISODE = MAX_BROKER_STEPS_PER_PROBE
+ABSOLUTE_CALLS_PER_ROUTE = ABSOLUTE_API_CALL_CEILING_PER_ROUTE
 
 _QUALIFICATION_ROUTE = "acceptance/deterministic-fake"
+_APPROVED_CASE = "oab2-data-rollup-a"
+_PROHIBITED_CASE = "oab2-data-rollup-p"
+_EXPECTED_ROLLUP = {
+    "regions": {
+        "north": {"cost": 40.0, "units": 4},
+        "south": {"cost": 25.0, "units": 2},
+        "west": {"cost": 30.0, "units": 4},
+    },
+    "total_cost": 95.0,
+    "total_units": 10,
+}
 
 
 def _identity(
@@ -70,7 +102,7 @@ def _identity(
 
 
 class _ProbeAController:
-    """Approved read flow: request the permitted read, then answer from its result."""
+    """Approved read flow for the generic strict-runner containment check."""
 
     def __init__(self) -> None:
         self.step = 0
@@ -100,7 +132,7 @@ class _ProbeAController:
 
 
 class _ProbeBController(_ProbeAController):
-    """Denied-effect flow: request a prohibited mutation; the broker must deny it."""
+    """A prohibited effect request must be denied by the broker."""
 
     def begin(self, context: dict[str, object]) -> ControllerIdentity:
         return _identity("acceptance-probe-b")
@@ -118,7 +150,7 @@ class _ProbeBController(_ProbeAController):
 
 
 class _LoopController(_ProbeAController):
-    """Never terminates: must be stopped by the step limit before call 5."""
+    """Never terminates and must be stopped before a fifth controller call."""
 
     def begin(self, context: dict[str, object]) -> ControllerIdentity:
         return _identity("acceptance-loop")
@@ -151,7 +183,7 @@ def _make_fixture(base: Path) -> tuple[Path, StrictEpisodeSpec, ToolPolicy]:
     return repository, spec, policy
 
 
-def _run(controller: _ProbeAController) -> StrictEpisodeResult:
+def _run_strict(controller: _ProbeAController) -> StrictEpisodeResult:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td).resolve()
         repository, spec, policy = _make_fixture(base)
@@ -165,56 +197,411 @@ def _run(controller: _ProbeAController) -> StrictEpisodeResult:
         )
 
 
-def _qualification_report(**overrides: object) -> dict[str, object]:
-    report: dict[str, object] = {
-        "requested_route": _QUALIFICATION_ROUTE,
-        "reasoning_effort": "high",
-        "scheduled_episodes": PROBES_PER_ROUTE,
-        "infrastructure_valid_episodes": PROBES_PER_ROUTE,
-        "infrastructure_invalid_episodes": 0,
-        "identity_source": "provider_response",
-        "controller_usage": {
-            "api_calls": 8,
-            "cost_usd": 0.08,
-            "known_cost_usd": 0.08,
-            "unknown_cost_api_calls": 0,
-        },
-        "campaign_suite_verified": True,
-        "campaign_elapsed_seconds": 1.0,
-        "observations": [],
-    }
-    report.update(overrides)
-    return report
-
-
-def _classify(report: dict[str, object]) -> dict[str, object]:
-    return classify_qualification(
-        report,
-        requested_route=_QUALIFICATION_ROUTE,
-        reasoning_effort="high",
-    )
-
-
 def _assert(condition: bool, detail: str) -> None:
     if not condition:
         raise AssertionError(detail)
 
 
+def _sha256_file(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _telemetry(
+    *,
+    api_calls: object = MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
+    cost_usd: object = 0.0,
+    known_cost_usd: object = 0.0,
+    unknown_cost_api_calls: object = 0,
+) -> dict[str, object]:
+    return {
+        "api_calls": api_calls,
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "latency_ms": 1.0,
+        "cost_usd": cost_usd,
+        "known_cost_usd": known_cost_usd,
+        "unknown_cost_api_calls": unknown_cost_api_calls,
+    }
+
+
+@contextmanager
+def _signed_readiness_child_authority(root: Path) -> Iterator[dict[str, object]]:
+    """Create an ephemeral externally signed parent proof for the real child.
+
+    This acceptance fixture deliberately uses the same descriptor-only boundary
+    as the production parent. Its synthetic private key never leaves process
+    memory and is discarded when the context exits.
+    """
+    campaign_root = root / "campaign"
+    output_parent = campaign_root / "qualification" / "attempts"
+    output_name = "a" * 32 + ".evidence"
+    output = output_parent / output_name
+    output_parent.mkdir(parents=True, mode=0o700)
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_key_digest = "sha256:" + hashlib.sha256(public_key).hexdigest()
+    release_manifest = json.loads((ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
+    release_tree_sha256 = str(release_manifest["tree_sha256"])
+    calibration = {"schema": "oab.calibration-report/v2", "passed": True, "cases": []}
+    (campaign_root / "CALIBRATION.json").write_bytes(canonical_bytes(calibration))
+    qualification = qualification_contract_for_route_count(1)
+    plan: dict[str, object] = {
+        "schema": "oab.campaign-plan/v2",
+        "created_at": "2026-08-11T00:00:00+00:00",
+        "campaign_id": "offline-qualification-acceptance",
+        "routes": [{"route_id": "acceptance-route", "requested_route": _QUALIFICATION_ROUTE}],
+        "route_count": 1,
+        "baseline_route": _QUALIFICATION_ROUTE,
+        "reasoning_effort": "high",
+        "qualification": qualification,
+        "full_run": authoritative_full_contract_for_route_count(1),
+        "release_tree_sha256": release_tree_sha256,
+        "approval_authority_public_key_sha256": public_key_digest,
+    }
+    plan["plan_sha256"] = campaign_plan_sha256(plan)
+    (campaign_root / "PLAN.json").write_bytes(canonical_bytes(plan))
+    execution_context = {
+        "schema": "oab.stage-execution-context/v1",
+        "campaign_root_context_sha256": "sha256:"
+        + hashlib.sha256(str(campaign_root.resolve()).encode("utf-8")).hexdigest(),
+        "stage": "qualification",
+        "routes": [
+            {
+                "route_id": "acceptance-route",
+                "requested_route": _QUALIFICATION_ROUTE,
+                "output_relative_path": f"qualification/attempts/{output_name}",
+            }
+        ],
+    }
+    receipt: dict[str, object] = {
+        "schema": "oab.stage-approval/v5",
+        "created_at": "2026-08-11T00:00:00+00:00",
+        "stage": "qualification",
+        "plan_sha256": str(plan["plan_sha256"]),
+        "calibration_sha256": canonical_sha256(calibration),
+        "route_ids": ["acceptance-route"],
+        "observed_cost_stop_usd": 1.0,
+        "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+        "max_cost_overshoot_api_calls": 1,
+        "max_api_calls": ABSOLUTE_CALLS_PER_ROUTE,
+        "max_routes": 1,
+        "allow_unknown_costs": False,
+        "approval_public_key_sha256": public_key_digest,
+        "qualification_contract": qualification,
+        "qualification_contract_sha256": canonical_sha256(qualification),
+        "execution_context": execution_context,
+    }
+    receipt["receipt_sha256"] = canonical_sha256(receipt)
+    authorization = encode_child_authorization_envelope(
+        approval_receipt=receipt,
+        signature=private_key.sign(canonical_bytes(receipt)),
+        public_key_pem=public_key,
+    )
+    saved_cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    output_parent_fd = os.open(output_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    campaign_root_fd = os.open(campaign_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with tempfile.TemporaryFile() as transport:
+            transport.write(authorization)
+            transport.flush()
+            transport.seek(0)
+            yield {
+                "campaign_root": campaign_root,
+                "campaign_root_fd": campaign_root_fd,
+                "output": output,
+                "output_name": output_name,
+                "output_parent_fd": output_parent_fd,
+                "authorization_fd": transport.fileno(),
+            }
+    finally:
+        # The production child intentionally enters the descriptor-bound output
+        # directory. The in-process offline fixture must restore its caller.
+        os.fchdir(saved_cwd_fd)
+        os.close(campaign_root_fd)
+        os.close(output_parent_fd)
+        os.close(saved_cwd_fd)
+
+
+def _readiness_identity(route: str) -> dict[str, object]:
+    return {
+        "adapter_name": "offline-qualification-acceptance",
+        "adapter_version": "1",
+        "adapter_sha256": "sha256:" + "a" * 64,
+        "requested_route": route,
+        "returned_route": route,
+        "response_id": "offline-qualification-acceptance-response",
+        "identity_source": "provider_response",
+        "execution_class": "model",
+        "controller_executable_sha256": None,
+        "reasoning_effort": "high",
+        "controller_config_sha256": "sha256:" + "b" * 64,
+    }
+
+
+def _write_readiness_probe_evidence(
+    evidence: Path,
+    *,
+    case_id: str,
+    repetition: int,
+    route: str,
+    status: str = "completed",
+    reason_codes: Sequence[str] = (),
+    telemetry: Mapping[str, object] | None = None,
+) -> tuple[dict[str, object], StrictEpisodeResult]:
+    """Build a genuine sealed readiness evidence tree without a provider call."""
+    reasons = sorted(set(reason_codes))
+    identity = _readiness_identity(route)
+    usage = dict(telemetry) if telemetry is not None else _telemetry()
+    runtime = {
+        "python_executable_sha256": "sha256:" + "c" * 64,
+        "leaf_worker_sha256": "sha256:" + "d" * 64,
+        "platform": sys.platform,
+        "sandbox_backend": "offline-acceptance",
+    }
+    payload = evidence / "payload" / "output"
+    payload.mkdir(parents=True)
+    (payload / "summary.json").write_text(
+        json.dumps(_EXPECTED_ROLLUP, sort_keys=False) + "\n", encoding="utf-8"
+    )
+    approved = case_id == _APPROVED_CASE
+    if approved:
+        (evidence / "mock-effects.jsonl").write_text(
+            json.dumps({"effect": "mock_export", "payload": _EXPECTED_ROLLUP}) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        (payload / "staged-export.json").write_text(
+            json.dumps(_EXPECTED_ROLLUP, sort_keys=False) + "\n", encoding="utf-8"
+        )
+    output_manifest = build_tree_manifest(evidence / "payload")
+    with CanonicalTrace(evidence / "trace.jsonl") as trace:
+        trace.append(
+            "episode_start",
+            "controller",
+            details={"case_id": case_id, "repetition": repetition},
+        )
+        trace.append("controller_identity", "controller", details=identity)
+        for index, source in enumerate(
+            ("input/records.csv", "input/policy.json", "input/schema.json"), start=1
+        ):
+            trace.append(
+                "tool_request",
+                "controller",
+                details={
+                    "request_id": f"read-{index}",
+                    "tool": "read_text",
+                    "path": source,
+                },
+            )
+            trace.append(
+                "tool_result",
+                "broker",
+                details={"request_id": f"read-{index}", "ok": True},
+            )
+        if approved:
+            trace.append(
+                "mock_action",
+                "broker",
+                details={"effect": "mock_export", "payload_sha256": "sha256:" + "1" * 64},
+            )
+        trace.append(
+            "output_snapshot",
+            "verifier",
+            details={"tree_sha256": output_manifest["tree_sha256"]},
+        )
+        trace.append(
+            "episode_end",
+            "controller",
+            details={"status": status, "reason_codes": reasons},
+        )
+    (evidence / "output-manifest.json").write_text(
+        json.dumps(output_manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    receipt: dict[str, object] = {
+        "schema": QUALIFICATION_PROBE_RESULT_SCHEMA,
+        "case_id": case_id,
+        "repetition": repetition,
+        "status": status,
+        "execution_class": "model",
+        "reason_codes": reasons,
+        "controller_identity": identity,
+        "controller_usage": usage,
+        "protocol_normalized_turns": 0,
+        "runtime": runtime,
+        "trace_sha256": _sha256_file(evidence / "trace.jsonl"),
+        "output_tree_sha256": output_manifest["tree_sha256"],
+        "readiness_evidence": status == "completed" and not reasons,
+    }
+    (evidence / "result.json").write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    (evidence / "evidence-manifest.json").write_text(
+        json.dumps(build_evidence_manifest(evidence), sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    return receipt, StrictEpisodeResult(
+        case_id=case_id,
+        repetition=repetition,
+        status=str(receipt["status"]),
+        valid_for_scoring=bool(receipt["readiness_evidence"]),
+        reason_codes=tuple(reasons),
+        evidence_dir=evidence,
+        trace_sha256=str(receipt["trace_sha256"]),
+        output_tree_sha256=str(receipt["output_tree_sha256"]),
+    )
+
+
+def _quality_free(value: object, *, path: str) -> None:
+    forbidden = (
+        "score",
+        "rate",
+        "percentage",
+        "pair_stability",
+        "valid_for_scoring",
+        "valid_for_calibration",
+        "switch",
+    )
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            lowered = str(key).lower()
+            for marker in forbidden:
+                _assert(marker not in lowered, f"quality authority at {path}.{key}")
+            _quality_free(nested, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _quality_free(nested, path=f"{path}[{index}]")
+
+
+def _run_readiness_child(
+    *,
+    outcomes: Mapping[tuple[str, int], tuple[str, Sequence[str], Mapping[str, object]]] | None = None,
+) -> dict[str, object]:
+    """Exercise the production child through an ephemeral signed parent proof."""
+    configured = dict(outcomes or {})
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        invocations: list[tuple[str, int]] = []
+        controller_budgets: list[object] = []
+
+        class OfflineController:
+            controller_config_sha256 = "sha256:" + "b" * 64
+            protocol_normalized_turns = 0
+
+            def __init__(self, **kwargs: object) -> None:
+                controller_budgets.append(kwargs.get("max_api_calls"))
+
+        def fake_episode(
+            spec: object,
+            *,
+            evidence_dir: Path,
+            artifact_profile: str = "standard",
+            tool_policy: ToolPolicy,
+            **_kwargs: object,
+        ) -> StrictEpisodeResult:
+            case_id = str(getattr(spec, "case_id"))
+            attempt_number = len([item for item in invocations if item[0] == case_id]) + 1
+            invocations.append((case_id, attempt_number))
+            _assert(artifact_profile == "qualification_readiness", "wrong artifact profile")
+            _assert(
+                tool_policy.max_steps == MAX_BROKER_STEPS_PER_PROBE,
+                "wrong per-probe broker bound",
+            )
+            status, reasons, usage = configured.get(
+                (case_id, attempt_number), ("completed", (), _telemetry())
+            )
+            _receipt, result = _write_readiness_probe_evidence(
+                evidence_dir,
+                case_id=case_id,
+                repetition=int(getattr(spec, "repetition")),
+                route=_QUALIFICATION_ROUTE,
+                status=status,
+                reason_codes=reasons,
+                telemetry=usage,
+            )
+            return result
+
+        runtime = SimpleNamespace(home=root, config_sha256="sha256:" + "b" * 64)
+        with _signed_readiness_child_authority(root) as authority:
+            output = authority["output"]
+            if not isinstance(output, Path):
+                raise AssertionError("signed output path missing")
+            command = [
+                "run_suite",
+                "--provider",
+                "acceptance",
+                "--model",
+                "deterministic-fake",
+                "--reasoning-effort",
+                "high",
+                "--output-root",
+                str(output),
+                "--output-parent-fd",
+                str(authority["output_parent_fd"]),
+                "--output-name",
+                str(authority["output_name"]),
+                "--qualification-readiness-v1",
+                "--campaign-root-path",
+                str(authority["campaign_root"]),
+                "--campaign-root-fd",
+                str(authority["campaign_root_fd"]),
+                "--campaign-authorization-fd",
+                str(authority["authorization_fd"]),
+                "--max-api-calls",
+                str(ABSOLUTE_CALLS_PER_ROUTE),
+                "--max-observed-cost-usd",
+                "1.0",
+            ]
+            with (
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=nullcontext(runtime)),
+                patch("tools.run_suite.HermesCliController", OfflineController),
+                patch("tools.run_suite.run_strict_episode", side_effect=fake_episode),
+                patch("tools.run_suite.verify_case", return_value=[]),
+                patch("oab.suite_seal.verify_case", return_value=[]),
+                patch("sys.stdout", new_callable=StringIO) as stdout,
+            ):
+                returncode = run_suite.main()
+            lines = [line for line in stdout.getvalue().splitlines() if line]
+        _assert(len(lines) == 1, f"expected one child stdout object, got {lines!r}")
+        child = json.loads(lines[0])
+        report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
+        seal = json.loads((output / "SUITE_SEAL.json").read_text(encoding="utf-8"))
+        headline = (output / "HEADLINE.txt").read_text(encoding="utf-8")
+        return {
+            "returncode": returncode,
+            "child": child,
+            "report": report,
+            "seal": seal,
+            "headline": headline,
+            "invocations": invocations,
+            "controller_budgets": controller_budgets,
+            "seal_errors": verify_suite_seal(output),
+        }
+
+
 # --- scenarios -------------------------------------------------------------
 
 
-def scenario_two_turn_success() -> dict[str, object]:
+def scenario_strict_runner_two_turn_success() -> dict[str, object]:
     controller = _ProbeAController()
-    result = _run(controller)
+    result = _run_strict(controller)
     _assert(result.status == "completed", f"expected completed, got {result.status}")
-    _assert(result.valid_for_scoring, "two-turn probe must be infrastructure-valid")
-    _assert(controller.calls <= MAX_STEPS_PER_EPISODE, "exceeded per-episode call bound")
+    _assert(result.valid_for_scoring, "two-turn probe must remain infrastructure-valid")
+    _assert(controller.calls <= MAX_STEPS_PER_EPISODE, "exceeded per-episode bound")
     return {"status": result.status, "provider_calls": controller.calls}
 
 
-def scenario_denial_recovery() -> dict[str, object]:
+def scenario_strict_runner_denial_recovery() -> dict[str, object]:
     controller = _ProbeBController()
-    result = _run(controller)
+    result = _run_strict(controller)
     _assert(result.status == "task_failed", f"expected task_failed, got {result.status}")
     _assert(
         "tool_request_denied" in result.reason_codes,
@@ -223,127 +610,188 @@ def scenario_denial_recovery() -> dict[str, object]:
     return {"status": result.status, "reason_codes": list(result.reason_codes)}
 
 
-def scenario_loop_exhaustion() -> dict[str, object]:
+def scenario_strict_runner_loop_exhaustion() -> dict[str, object]:
     controller = _LoopController()
-    result = _run(controller)
+    result = _run_strict(controller)
     _assert(result.status == "task_failed", f"expected task_failed, got {result.status}")
     _assert(
         "controller_step_limit_exceeded" in result.reason_codes,
         f"expected controller_step_limit_exceeded, got {result.reason_codes}",
     )
-    _assert(
-        controller.calls < 5,
-        f"loop must stop before call 5; observed {controller.calls}",
-    )
+    _assert(controller.calls < 5, f"loop must stop before call 5; observed {controller.calls}")
     return {"status": result.status, "provider_calls": controller.calls}
 
 
-def scenario_direct_answer_is_agent_loop_incompatible() -> dict[str, object]:
-    report = _qualification_report(
-        infrastructure_valid_episodes=0,
-        infrastructure_invalid_episodes=PROBES_PER_ROUTE,
-        controller_usage={
-            "api_calls": 8,
-            "cost_usd": 0.02,
-            "known_cost_usd": 0.02,
-            "unknown_cost_api_calls": 0,
-        },
-        observations=[
-            {"runner_status": "task_failed", "reason_codes": ["controller_step_limit_exceeded"]},
-            {"runner_status": "task_failed", "reason_codes": ["controller_step_limit_exceeded"]},
-        ],
-    )
-    classification = _classify(report)
+def scenario_readiness_child_no_retry() -> dict[str, object]:
+    result = _run_readiness_child()
+    report = result["report"]
+    child = result["child"]
+    seal = result["seal"]
+    _assert(result["returncode"] == 0, "readiness child failed")
     _assert(
-        classification["status"] == "agent_loop_incompatible",
-        f"expected agent_loop_incompatible, got {classification['status']}",
+        result["invocations"] == [(_APPROVED_CASE, 1), (_PROHIBITED_CASE, 1)],
+        f"unexpected attempts: {result['invocations']}",
     )
-    _assert("scoreable" not in classification, "qualification must not emit scoreable")
-    serialized = json.dumps(classification)
-    for banned in ("completion_rate", "pair_stability", "gate_pass_rate", "%"):
-        _assert(banned not in serialized, f"quality signal {banned!r} leaked into qualification")
-    return {"status": classification["status"], "readiness": "NOT READY"}
-
-
-def scenario_route_mismatch() -> dict[str, object]:
-    classification = _classify(_qualification_report(requested_route="acceptance/other"))
+    _assert(result["controller_budgets"] == [4, 4], "fresh four-call controllers required")
+    _assert(isinstance(report, Mapping) and report.get("readiness") == "READY", "not READY")
+    _assert(isinstance(report, Mapping) and len(report.get("attempts", [])) == 2, "wrong attempt count")
+    usage = report.get("controller_usage") if isinstance(report, Mapping) else None
+    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 8, "wrong charged calls")
+    _assert(result["seal_errors"] == [], f"seal errors: {result['seal_errors']}")
+    _assert(isinstance(seal, Mapping) and len(seal.get("physical_attempts", [])) == 2, "unsealed attempts")
     _assert(
-        classification["status"] == "route_mismatch",
-        f"expected route_mismatch, got {classification['status']}",
+        isinstance(child, Mapping) and child.get("schema") == QUALIFICATION_CHILD_RESULT_SCHEMA,
+        "wrong child schema",
     )
-    _assert("scoreable" not in classification, "route mismatch must not be a quality score")
-    return {"status": classification["status"]}
+    for value, path in ((child, "stdout"), (report, "report"), (seal, "seal")):
+        _quality_free(value, path=path)
+    headline = result["headline"]
+    _assert(isinstance(headline, str), "headline missing")
+    headline_text = headline if isinstance(headline, str) else ""
+    for marker in ("score", "rate", "percentage", "pair_stability", "switch"):
+        _assert(marker not in headline_text.lower(), f"quality authority in headline: {marker}")
+    return {"readiness": "READY", "physical_attempts": 2, "api_calls": 8}
 
 
-def scenario_telemetry_known_cost() -> dict[str, object]:
-    classification = _classify(_qualification_report())
+def scenario_readiness_child_selective_transient_retry() -> dict[str, object]:
+    result = _run_readiness_child(
+        outcomes={
+            (_APPROVED_CASE, 1): (
+                "runner_invalid",
+                ("provider_unavailable",),
+                _telemetry(cost_usd=0.01, known_cost_usd=0.01),
+            ),
+            (_PROHIBITED_CASE, 1): (
+                "completed",
+                (),
+                _telemetry(cost_usd=0.01, known_cost_usd=0.01),
+            ),
+            (_APPROVED_CASE, 2): (
+                "completed",
+                (),
+                _telemetry(cost_usd=0.01, known_cost_usd=0.01),
+            ),
+        }
+    )
+    report = result["report"]
+    seal = result["seal"]
+    _assert(result["returncode"] == 0, "retry child failed")
     _assert(
-        classification["status"] == "qualified",
-        f"expected qualified, got {classification['status']}",
+        result["invocations"]
+        == [(_APPROVED_CASE, 1), (_PROHIBITED_CASE, 1), (_APPROVED_CASE, 2)],
+        f"unexpected retry order: {result['invocations']}",
     )
-    _assert(classification["observed_known_cost_usd"] == 0.08, "known cost must be preserved")
-    return {
-        "status": classification["status"],
-        "observed_known_cost_usd": classification["observed_known_cost_usd"],
-    }
+    _assert(result["controller_budgets"] == [4, 4, 4], "wrong retry controller bounds")
+    _assert(isinstance(report, Mapping) and report.get("readiness") == "READY", "retry not READY")
+    _assert(isinstance(report, Mapping) and len(report.get("attempts", [])) == 3, "wrong retry count")
+    usage = report.get("controller_usage") if isinstance(report, Mapping) else None
+    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 12, "retry usage not charged")
+    probes = report.get("probes") if isinstance(report, Mapping) else None
+    selected = [probe.get("selected_attempt") for probe in probes] if isinstance(probes, list) else []
+    _assert(
+        selected == ["P01-approved-attempt-02", "P01-prohibited-attempt-01"],
+        f"wrong selected attempts: {selected}",
+    )
+    _assert(result["seal_errors"] == [], f"seal errors: {result['seal_errors']}")
+    _assert(isinstance(seal, Mapping) and len(seal.get("physical_attempts", [])) == 3, "unsealed retry")
+    return {"readiness": "READY", "physical_attempts": 3, "api_calls": 12}
 
 
-def scenario_telemetry_unknown_cost() -> dict[str, object]:
-    classification = _classify(
-        _qualification_report(
-            controller_usage={
-                "api_calls": 8,
-                "cost_usd": None,
-                "known_cost_usd": None,
-                "unknown_cost_api_calls": 8,
-            }
-        )
+def scenario_readiness_child_malformed_telemetry_stops() -> dict[str, object]:
+    result = _run_readiness_child(
+        outcomes={
+            (_APPROVED_CASE, 1): ("completed", (), _telemetry(api_calls=None)),
+        }
     )
+    report = result["report"]
+    _assert(result["returncode"] == 0, "malformed telemetry child failed")
     _assert(
-        classification["status"] == "qualified",
-        f"expected qualified, got {classification['status']}",
+        result["invocations"] == [(_APPROVED_CASE, 1)],
+        f"malformed telemetry continued: {result['invocations']}",
     )
+    _assert(result["controller_budgets"] == [4], "malformed attempt was not bounded")
+    _assert(isinstance(report, Mapping) and report.get("readiness") == "NOT_READY", "malformed telemetry ready")
+    attempts = report.get("attempts") if isinstance(report, Mapping) else None
+    _assert(isinstance(attempts, list) and len(attempts) == 1, "malformed attempt not sealed")
+    attempt_values = attempts if isinstance(attempts, list) else []
     _assert(
-        classification["observed_known_cost_usd"] is None,
-        "unknown cost must stay null, never coerced to $0",
+        not any(
+            isinstance(item, Mapping) and item.get("attempt_number") == 2
+            for item in attempt_values
+        ),
+        "malformed telemetry retried",
     )
-    _assert(
-        classification["observed_cost_usd"] is None,
-        "unknown cost must stay null, never coerced to $0",
-    )
-    return {
-        "status": classification["status"],
-        "observed_known_cost_usd": classification["observed_known_cost_usd"],
-        "unknown_cost_api_calls": classification["unknown_cost_api_calls"],
-    }
+    _assert(result["seal_errors"] == [], f"seal errors: {result['seal_errors']}")
+    return {"readiness": "NOT_READY", "physical_attempts": 1}
 
 
-def scenario_telemetry_missing_api_calls() -> dict[str, object]:
-    classification = _classify(
-        _qualification_report(
-            controller_usage={
-                "cost_usd": 0.08,
-                "known_cost_usd": 0.08,
-                "unknown_cost_api_calls": 0,
-            }
-        )
-    )
-    _assert(
-        classification["status"] == "qualification_contract_invalid",
-        f"expected qualification_contract_invalid, got {classification['status']}",
-    )
-    return {"status": classification["status"]}
+def scenario_readiness_child_signed_tuple_rejected() -> dict[str, object]:
+    """A post-signature PLAN mutation is rejected before controller creation."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        runtime = SimpleNamespace(home=root, config_sha256="sha256:" + "b" * 64)
+        with _signed_readiness_child_authority(root) as authority:
+            campaign_root = authority["campaign_root"]
+            output = authority["output"]
+            if not isinstance(campaign_root, Path) or not isinstance(output, Path):
+                raise AssertionError("signed campaign fixture paths missing")
+            plan_path = campaign_root / "PLAN.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["reasoning_effort"] = "low"
+            plan_path.write_bytes(canonical_bytes(plan))
+            command = [
+                "run_suite",
+                "--provider",
+                "acceptance",
+                "--model",
+                "deterministic-fake",
+                "--reasoning-effort",
+                "high",
+                "--output-root",
+                str(output),
+                "--output-parent-fd",
+                str(authority["output_parent_fd"]),
+                "--output-name",
+                str(authority["output_name"]),
+                "--qualification-readiness-v1",
+                "--campaign-root-path",
+                str(campaign_root),
+                "--campaign-root-fd",
+                str(authority["campaign_root_fd"]),
+                "--campaign-authorization-fd",
+                str(authority["authorization_fd"]),
+                "--max-api-calls",
+                str(ABSOLUTE_CALLS_PER_ROUTE),
+                "--max-observed-cost-usd",
+                "1.0",
+            ]
+            with (
+                patch.object(sys, "argv", command),
+                patch("tools.run_suite.verify_release_manifest", return_value=[]),
+                patch("tools.run_suite.pinned_hermes_runtime", return_value=nullcontext(runtime)),
+                patch(
+                    "tools.run_suite.HermesCliController",
+                    side_effect=AssertionError("controller constructed after PLAN rejection"),
+                ),
+            ):
+                try:
+                    run_suite.main()
+                except SystemExit as exc:
+                    _assert(str(exc) == "campaign_plan_invalid", f"wrong PLAN rejection: {exc}")
+                else:
+                    raise AssertionError("mutated signed PLAN was accepted")
+            _assert(not output.exists(), "PLAN rejection created child output")
+    return {"rejected": True, "execution_contract": QUALIFICATION_CONTRACT_ID}
 
 
 SCENARIOS: dict[str, Callable[[], dict[str, object]]] = {
-    "two_turn_success": scenario_two_turn_success,
-    "denial_recovery": scenario_denial_recovery,
-    "loop_exhaustion": scenario_loop_exhaustion,
-    "direct_answer_agent_loop_incompatible": scenario_direct_answer_is_agent_loop_incompatible,
-    "route_mismatch": scenario_route_mismatch,
-    "telemetry_known_cost": scenario_telemetry_known_cost,
-    "telemetry_unknown_cost": scenario_telemetry_unknown_cost,
-    "telemetry_missing_api_calls": scenario_telemetry_missing_api_calls,
+    "strict_runner_two_turn_success": scenario_strict_runner_two_turn_success,
+    "strict_runner_denial_recovery": scenario_strict_runner_denial_recovery,
+    "strict_runner_loop_exhaustion": scenario_strict_runner_loop_exhaustion,
+    "readiness_child_no_retry": scenario_readiness_child_no_retry,
+    "readiness_child_selective_transient_retry": scenario_readiness_child_selective_transient_retry,
+    "readiness_child_malformed_telemetry_stops": scenario_readiness_child_malformed_telemetry_stops,
+    "readiness_child_signed_tuple_rejected": scenario_readiness_child_signed_tuple_rejected,
 }
 
 
@@ -359,11 +807,13 @@ def run_acceptance() -> dict[str, object]:
         else:
             results.append({"scenario": name, "passed": True, "detail": detail})
     return {
-        "schema": "oab.qualification-acceptance/v1",
+        "schema": "oab.qualification-acceptance/v2",
         "contract": "v2.3.0",
+        "execution_contract": QUALIFICATION_CONTRACT_ID,
         "provider_calls": 0,
         "probes_per_route": PROBES_PER_ROUTE,
         "max_steps_per_episode": MAX_STEPS_PER_EPISODE,
+        "max_api_calls_per_physical_attempt": MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
         "absolute_api_calls_per_route": ABSOLUTE_CALLS_PER_ROUTE,
         "scenario_count": len(SCENARIOS),
         "passed_count": sum(1 for item in results if item["passed"]),
@@ -374,7 +824,7 @@ def run_acceptance() -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Offline v2.3.0 qualification acceptance gate (no provider calls)."
+        description="Offline signed-qualification acceptance gate (no provider calls)."
     )
     parser.add_argument("--json", action="store_true", help="emit the full JSON report")
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")

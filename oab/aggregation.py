@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from .full_stage_contract import (
+    AUTHORITATIVE_FULL_PAIR_IDS,
+    FULL_EPISODES_PER_ROUTE,
+    FULL_MAX_API_CALLS_PER_EPISODE,
+    FULL_REPETITIONS,
+    validate_authoritative_stage_binding,
+)
+
 SUITE_REPORT_SCHEMA = "oab.suite-report/v1"
 _SHA256_LENGTH = len("sha256:") + 64
 _ALLOWED_IDENTITY_SOURCES = {"adapter_runtime", "provider_response", "deterministic_control"}
@@ -221,6 +229,7 @@ def aggregate_suite_observations(
     repetitions: int,
     pair_ids: list[str],
     case_ids_by_pair: Mapping[str, Mapping[str, str]] | None = None,
+    authoritative_stage: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     if repetitions < 1:
         raise ValueError("repetitions must be >= 1")
@@ -229,6 +238,16 @@ def aggregate_suite_observations(
     if not requested_route or "/" not in requested_route:
         raise ValueError("requested_route must look like provider/model")
 
+    stage_binding: dict[str, object] | None = None
+    if authoritative_stage is None:
+        stage_binding_error = "authoritative_stage_missing"
+    else:
+        try:
+            stage_binding = validate_authoritative_stage_binding(authoritative_stage)
+        except ValueError:
+            stage_binding_error = "authoritative_stage_invalid"
+        else:
+            stage_binding_error = None
     rows = [dict(item) for item in observations]
     case_map = _pair_case_map(rows, case_ids_by_pair)
     integrity_flags: list[str] = []
@@ -245,6 +264,13 @@ def aggregate_suite_observations(
         integrity_flags.append("release_approval_unpinned")
     if release_authorized is not True:
         integrity_flags.append("release_not_authorized")
+    if stage_binding_error is not None:
+        integrity_flags.append(stage_binding_error)
+    if stage_binding is not None and (
+        pair_ids != list(AUTHORITATIVE_FULL_PAIR_IDS)
+        or repetitions != FULL_REPETITIONS
+    ):
+        integrity_flags.append("authoritative_full_tuple_mismatch")
 
     indexed: dict[tuple[str, str, int], dict[str, object]] = {}
     for row in rows:
@@ -290,6 +316,10 @@ def aggregate_suite_observations(
             integrity_flags.append("provider_returned_route_mismatch")
         if not isinstance(row.get("response_id"), str) or not row.get("response_id"):
             integrity_flags.append("provider_response_id_missing")
+        if stage_binding is not None:
+            api_calls = _usage_api_calls(row)
+            if api_calls is None or api_calls > FULL_MAX_API_CALLS_PER_EPISODE:
+                integrity_flags.append("authoritative_full_episode_api_calls_invalid")
 
     scheduled = 0
     infrastructure_valid = 0
@@ -482,12 +512,18 @@ def aggregate_suite_observations(
         "runtime_platform_mixed",
         "sandbox_backend_missing",
         "sandbox_backend_mixed",
+        "authoritative_stage_missing",
+        "authoritative_stage_invalid",
+        "authoritative_full_tuple_mismatch",
+        "authoritative_full_episode_api_calls_invalid",
     }
     # Authority describes provenance and coverage, not whether the model scored well.
     authoritative = (
-        identity_source == "provider_response"
+        stage_binding is not None
+        and identity_source == "provider_response"
         and not authority_blocking_flags.intersection(integrity_flags)
         and infrastructure_valid == scheduled
+        and scheduled == FULL_EPISODES_PER_ROUTE
     )
 
     integrity_flags = sorted(set(integrity_flags))
@@ -525,6 +561,7 @@ def aggregate_suite_observations(
         "release_authorized": release_authorized,
         "repetitions": repetitions,
         "pair_ids": list(pair_ids),
+        "authoritative_stage": stage_binding,
         "authoritative": authoritative,
         "identity_source": identity_source,
         "execution_environment": execution_environment,
