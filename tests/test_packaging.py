@@ -94,6 +94,20 @@ class PackagingContractTests(unittest.TestCase):
             self.assertIn('python3 -m venv "$HOME/.local/share/oab-<version>"', document)
             self.assertIn('export PATH="$HOME/.local/share/oab-<version>/bin:$PATH"', document)
 
+    def test_release_docs_describe_provider_neutral_inventory_and_p01_semantics(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        release_docs = [
+            agents,
+            (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
+            (ROOT / "LIMITATIONS.md").read_text(encoding="utf-8"),
+        ]
+
+        self.assertNotIn("slug is `moa` is dropped", agents)
+        self.assertIn("no provider slug receives special treatment", agents)
+        for document in release_docs:
+            self.assertNotIn("denied-effect recovery", document)
+            self.assertIn("prohibited-effect/no-effect compliance", document)
+
     def test_calibration_help_describes_all_deterministic_pairs(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(ROOT / "tools/run_calibration.py"), "--help"],

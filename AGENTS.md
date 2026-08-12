@@ -40,7 +40,7 @@ The common request is conversational: *"Run OAB on this new model and tell me if
 
 The file must be a JSON object. OAB sanitizes it and discards every field not listed here, so extras are pointless and risk leaking secrets:
 
-- `providers[]` — candidate rows (max 256). Each row uses `slug` (provider name; a row whose slug is `moa` is dropped), `models` (array of model names, max 2048), optional `authenticated` (a row is dropped only when this is exactly `false`), and optional `capabilities` mapping model name to `{"reasoning": bool}`.
+- `providers[]` — candidate rows (max 256). Each row uses `slug` (provider name; no provider slug receives special treatment), `models` (array of model names, max 2048), optional `authenticated` (a row is dropped only when this is exactly `false`), and optional `capabilities` mapping model name to `{"reasoning": bool}`.
 - `provider` and `model` — the **current** route. These become `current_route` only if that pair also appears in `providers`; otherwise `current_route` is silently `null`. Always list the baseline in `providers` too.
 
 ```json
@@ -119,7 +119,7 @@ oab resume "$HOME/OAB-Runs/my-campaign" \
   --max-routes <same-approved-route-count>
 ```
 
-Qualification runs two deterministic multi-turn plumbing probes per route (approved read/tool loop and denied-effect recovery), each bounded to four provider calls. First-attempt reserve is eight calls per route; with one infrastructure-only retry per probe the absolute signed ceiling is sixteen calls per route. Qualification reports only READY / NOT READY / INCOMPATIBLE plus failure reasons — never a completion rate, pair stability, or “0% model” quality headline. It is not a substitute for the 80-episode full comparison. Authentication, route, provider, controller, containment, effort-attestation, and missing API-call-count failures remain infrastructure exclusions, never model scores.
+Qualification runs two deterministic multi-turn plumbing probes per route (approved read/tool loop and prohibited-effect/no-effect compliance), each bounded to four provider calls. First-attempt reserve is eight calls per route; with one infrastructure-only retry per probe the absolute signed ceiling is sixteen calls per route. Qualification reports only READY / NOT READY / INCOMPATIBLE plus failure reasons — never a completion rate, pair stability, or “0% model” quality headline. It is not a substitute for the 80-episode full comparison. Authentication, route, provider, controller, containment, effort-attestation, and missing API-call-count failures remain infrastructure exclusions, never model scores.
 
 Two accounting rules follow from that. A route whose telemetry omits the API-call count is infrastructure-invalid, because OAB cannot enforce its own spend ceiling without it. Unknown dollar cost is recorded as `null` with an `unknown_cost_api_calls` count — never `$0` — and can proceed only under a signed approval carrying `--allow-unknown-costs`.
 

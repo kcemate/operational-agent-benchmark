@@ -430,7 +430,13 @@ class ParentCreatedChildAuthorizationSubprocessTests(unittest.TestCase):
             encoding="utf-8",
         )
         existing_pythonpath = os.environ.get("PYTHONPATH", "")
-        pythonpath_parts = [str(bootstrap), str(self._repository_root / "tests")]
+        # The child must import this exact working-tree candidate, not an older
+        # installed ``tools`` package that may also exist in the test venv.
+        pythonpath_parts = [
+            str(bootstrap),
+            str(self._repository_root),
+            str(self._repository_root / "tests"),
+        ]
         if existing_pythonpath:
             pythonpath_parts.append(existing_pythonpath)
         environment = {
