@@ -26,6 +26,22 @@ This repository provides an agent-native workflow for answering a bounded questi
 
 ## Conversational "candidate vs current" workflow
 
+**This is an engine integration contract for a future host; no production
+Approval Broker or protected-host adapter exists in this repository.** A future
+protected host integration should enter this graph with
+`oab test-model <provider/model>`. That public intent infers the current route,
+selects exactly two routes, creates the campaign in `~/OAB-Runs`, calibrates,
+and emits one compact qualification approval card without model inference. The
+host—not the user or calling agent—must inject the independently published
+release-tree pin and separately controlled approval authority. Direct CLI launch
+without that protected context fails closed. The legacy commands below remain
+the expert/internal API used by the host for signed qualification, a separate
+signed full stage, verification, and the final plain-English verdict. After each future host action, `oab test-model-status <campaign-root>` projects the internals into
+exactly one broker-facing engine state: `qualification_approval_required`,
+`full_approval_required`, `complete`, or `blocked`; the broker does not infer
+transitions by scraping campaign files. These projections do not approve, sign,
+resume, verify, or complete a campaign by themselves.
+
 The common request is conversational: *"Run OAB on this new model and tell me if it beats our current model."* Treat that as a **two-route comparison**, not a spend authorization.
 
 1. **Infer and confirm the pair.** The baseline is `current_route` from `DISCOVERY.json`; the candidate is the model the user named. If `current_route` is null, or the wording is ambiguous about which route is current, ask **one** concise question before creating a campaign. A campaign with a null `baseline_route` fails later at `campaign_plan_baseline_invalid`.

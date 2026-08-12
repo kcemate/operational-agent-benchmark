@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from typing import Mapping, cast
 
-from oab.agent_workflow import sanitize_hermes_inventory
+from oab.agent_workflow import (
+    sanitize_hermes_inventory,
+    select_model_comparison_inventory,
+)
 
 
 class ProviderGenericityTests(unittest.TestCase):
@@ -21,6 +25,28 @@ class ProviderGenericityTests(unittest.TestCase):
 
         self.assertEqual({"moa/virtual-model", "ordinary-provider/ordinary-model"}, routes)
         self.assertEqual("moa/virtual-model", discovery["current_route"])
+
+    def test_model_comparison_selection_is_provider_neutral(self) -> None:
+        inventory = {
+            "provider": "ordinary-provider",
+            "model": "baseline",
+            "providers": [
+                {"slug": "ordinary-provider", "models": ["baseline"]},
+                {"slug": "moa", "models": ["candidate"]},
+            ],
+        }
+
+        selected = select_model_comparison_inventory(
+            inventory, candidate_route="moa/candidate"
+        )
+        discovery = sanitize_hermes_inventory(selected)
+        routes = cast(list[Mapping[str, object]], discovery["routes"])
+
+        self.assertEqual("ordinary-provider/baseline", discovery["current_route"])
+        self.assertEqual(
+            {"ordinary-provider/baseline", "moa/candidate"},
+            {route["requested_route"] for route in routes},
+        )
 
 
 if __name__ == "__main__":

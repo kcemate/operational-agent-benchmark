@@ -55,6 +55,7 @@ class AgentWorkflowCliTests(unittest.TestCase):
                 serialization.PublicFormat.SubjectPublicKeyInfo,
             )
         )
+
         self._main_patch = patch(__name__ + ".main", side_effect=self._main_with_pinned_test_key)
         self._main_patch.start()
         self.addCleanup(self._main_patch.stop)
@@ -70,6 +71,16 @@ class AgentWorkflowCliTests(unittest.TestCase):
         )
         if needs_pinned_key and "--approval-public-key" not in forwarded:
             forwarded.extend(["--approval-public-key", str(self._approval_public_path)])
+        if forwarded and forwarded[0] == "test-model":
+            kwargs.setdefault(
+                "trusted_test_model_context_loader",
+                lambda: {
+                    "release_tree_sha256": json.loads(
+                        (run_suite.ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8")
+                    )["tree_sha256"],
+                    "approval_public_key_path": self._approval_public_path,
+                },
+            )
         return _REAL_CLI_MAIN(forwarded, **kwargs)
 
     def benchmark_campaign(self, root: Path) -> None:
@@ -805,6 +816,214 @@ class AgentWorkflowCliTests(unittest.TestCase):
             state = json.loads((root / "CAMPAIGN.json").read_text(encoding="utf-8"))
             self.assertEqual("awaiting_qualification_approval", state["status"])
             self.assertTrue((root / "CALIBRATION.json").is_file())
+
+    def test_test_model_builds_two_route_campaign_and_compact_approval_card(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            runner_calls: list[str] = []
+
+            def suite_runner(*args: object, **kwargs: object) -> dict[str, object]:
+                runner_calls.append("unexpected")
+                raise AssertionError("test-model must not call a provider before approval")
+
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(
+                    [
+                        "test-model",
+                        "openai-codex/candidate",
+                        "--output-root",
+                        str(root),
+                        "--reasoning-effort",
+                        "high",
+                        "--qualification-cost-stop-usd",
+                        "5",
+                    ],
+                    doctor_fn=self.doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
+                    suite_runner=suite_runner,
+                )
+
+            self.assertEqual(0, code)
+            self.assertEqual([], runner_calls)
+            card = json.loads(stdout.getvalue())
+            self.assertEqual("oab.test-model-approval-card/v1", card["schema"])
+            self.assertEqual("openai-codex/current", card["baseline"])
+            self.assertEqual("openai-codex/candidate", card["candidate"])
+            self.assertEqual("qualification", card["stage"])
+            self.assertEqual(4, card["episodes"])
+            self.assertEqual(32, card["maximum_api_calls"])
+            self.assertEqual(5.0, card["observed_known_billed_cost_stop_usd"])
+            self.assertEqual(0, card["model_inference_calls_performed"])
+            self.assertEqual("exploratory_by_default", card["evidence_posture"])
+            self.assertIn("qualification provider calls only", card["approval_authorizes"])
+            self.assertEqual("approval_required", card["next_action"])
+            self.assertEqual(str(root.resolve()), card["campaign_root"])
+            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
+            self.assertEqual(2, plan["route_count"])
+            self.assertEqual("openai-codex/current", plan["baseline_route"])
+
+    def test_test_model_needs_only_the_candidate_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "automatic-campaign"
+            with patch(
+                "tools.agent_workflow._default_test_model_output_root",
+                return_value=root,
+            ):
+                with patch("sys.stdout", new_callable=StringIO) as stdout:
+                    code = main(
+                        ["test-model", "openai-codex/candidate"],
+                        doctor_fn=self.doctor,
+                        inventory_loader=self.inventory,
+                        calibration_runner=self.calibration,
+                    )
+            self.assertEqual(0, code)
+            card = json.loads(stdout.getvalue())
+            self.assertEqual(str(root.resolve()), card["campaign_root"])
+            self.assertEqual(5.0, card["observed_known_billed_cost_stop_usd"])
+            self.assertEqual("high", json.loads((root / "PLAN.json").read_text())["reasoning_effort"])
+
+    def test_test_model_card_uses_canonical_candidate_route(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(
+                    [
+                        "test-model",
+                        "  openai-codex/candidate  ",
+                        "--output-root",
+                        str(root),
+                    ],
+                    doctor_fn=self.doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
+                )
+            self.assertEqual(0, code)
+            card = json.loads(stdout.getvalue())
+            self.assertEqual("openai-codex/candidate", card["candidate"])
+            self.assertEqual(
+                ["openai-codex/current", "openai-codex/candidate"],
+                card["routes"],
+            )
+
+    def test_test_model_status_projects_next_host_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            with patch("sys.stdout", new_callable=StringIO):
+                self.assertEqual(
+                    0,
+                    main(
+                        ["test-model", "openai-codex/candidate", "--output-root", str(root)],
+                        doctor_fn=self.doctor,
+                        inventory_loader=self.inventory,
+                        calibration_runner=self.calibration,
+                    ),
+                )
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(["test-model-status", str(root)])
+            self.assertEqual(0, code)
+            projected = json.loads(stdout.getvalue())
+            self.assertEqual("qualification_approval_required", projected["state"])
+            self.assertEqual("awaiting_qualification_approval", projected["campaign_status"])
+
+    def test_test_model_rejects_unknown_candidate_before_campaign_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = main(
+                    [
+                        "test-model",
+                        "openai-codex/missing",
+                        "--output-root",
+                        str(root),
+                        "--reasoning-effort",
+                        "high",
+                        "--qualification-cost-stop-usd",
+                        "5",
+                    ],
+                    doctor_fn=self.doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
+                )
+            self.assertEqual(2, code)
+            self.assertEqual(
+                "model_comparison_candidate_unavailable",
+                json.loads(stdout.getvalue())["error"],
+            )
+            self.assertFalse(root.exists())
+
+    def test_test_model_requires_host_approval_authority_without_user_key_ceremony(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = _REAL_CLI_MAIN(
+                        [
+                            "test-model",
+                            "openai-codex/candidate",
+                            "--output-root",
+                            str(root),
+                            "--qualification-cost-stop-usd",
+                            "5",
+                        ],
+                        doctor_fn=self.doctor,
+                        inventory_loader=self.inventory,
+                        calibration_runner=self.calibration,
+                    )
+            self.assertEqual(2, code)
+            self.assertEqual("trusted_test_model_context_unavailable", json.loads(stdout.getvalue())["error"])
+            self.assertFalse(root.exists())
+
+    def test_test_model_ignores_caller_signer_and_release_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            with patch.dict(
+                os.environ,
+                {
+                    "OAB_APPROVAL_PUBLIC_KEY": "/tmp/caller-controlled.pem",
+                    "OAB_TREE_SHA256": "sha256:" + "b" * 64,
+                },
+                clear=True,
+            ):
+                with patch("sys.stdout", new_callable=StringIO) as stdout:
+                    code = _REAL_CLI_MAIN(
+                        ["test-model", "openai-codex/candidate", "--output-root", str(root)],
+                        doctor_fn=self.doctor,
+                        inventory_loader=self.inventory,
+                        calibration_runner=self.calibration,
+                    )
+            self.assertEqual(2, code)
+            self.assertEqual("trusted_test_model_context_unavailable", json.loads(stdout.getvalue())["error"])
+            self.assertFalse(root.exists())
+
+    def test_test_model_rejects_doctor_substitution_of_trusted_release_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            trusted_pin = "sha256:" + "a" * 64
+
+            def substituted_doctor(**_: object) -> dict[str, object]:
+                return {
+                    "schema": "oab.doctor/v1",
+                    "ready": True,
+                    "platform": "darwin",
+                    "sandbox_backend": "macos-sandbox-exec",
+                    "release_tree_sha256": "sha256:" + "b" * 64,
+                    "checks": [],
+                }
+
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                code = _REAL_CLI_MAIN(
+                    ["test-model", "openai-codex/candidate", "--output-root", str(root)],
+                    doctor_fn=substituted_doctor,
+                    inventory_loader=self.inventory,
+                    calibration_runner=self.calibration,
+                    trusted_test_model_context_loader=lambda: {
+                        "release_tree_sha256": trusted_pin,
+                        "approval_public_key_path": self._approval_public_path,
+                    },
+                )
+            self.assertEqual(2, code)
+            self.assertEqual("trusted_release_pin_mismatch", json.loads(stdout.getvalue())["error"])
+            self.assertFalse(root.exists())
 
     def test_benchmark_failed_doctor_stops_before_inventory_or_campaign_creation(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -35,6 +35,8 @@ from oab.agent_workflow import (
     run_full_stage,
     run_qualification_stage,
     sanitize_hermes_inventory,
+    select_model_comparison_inventory,
+    project_test_model_state,
     verify_stage_approval,
 )
 from oab.qualification_contract import (
@@ -3547,6 +3549,69 @@ class AgentWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual("not_supportable", report["recommendation"])
         self.assertIn("fewer_than_two_authoritative_routes", report["reasons"])
+
+
+    def test_model_comparison_inventory_selects_current_and_candidate_only(self) -> None:
+        inventory = self.inventory()
+
+        selected = select_model_comparison_inventory(
+            inventory,
+            candidate_route="openai-codex/gpt-next",
+        )
+        discovery = sanitize_hermes_inventory(selected)
+        routes = cast(list[Mapping[str, object]], discovery["routes"])
+
+        self.assertEqual("openai-codex/gpt-current", discovery["current_route"])
+        self.assertEqual(
+            ["openai-codex/gpt-current", "openai-codex/gpt-next"],
+            [route["requested_route"] for route in routes],
+        )
+        self.assertEqual(2, discovery["route_count"])
+
+    def test_model_comparison_inventory_rejects_missing_or_same_candidate(self) -> None:
+        inventory = self.inventory()
+
+        with self.assertRaisesRegex(ValueError, "model_comparison_candidate_unavailable"):
+            select_model_comparison_inventory(
+                inventory,
+                candidate_route="openai-codex/not-configured",
+            )
+        with self.assertRaisesRegex(ValueError, "model_comparison_routes_must_differ"):
+            select_model_comparison_inventory(
+                inventory,
+                candidate_route="openai-codex/gpt-current",
+            )
+
+    def test_test_model_state_projection_exposes_only_next_user_boundary(self) -> None:
+        qualification = project_test_model_state(
+            {"status": "awaiting_qualification_approval", "campaign_id": "campaign-1"}
+        )
+        self.assertEqual("qualification_approval_required", qualification["state"])
+
+        full = project_test_model_state(
+            {"status": "awaiting_full_run_approval", "campaign_id": "campaign-1"},
+            qualification={
+                "projected_full_run_cost_usd": 12.5,
+                "projected_full_run_duration_seconds": 900.0,
+            },
+        )
+        self.assertEqual("full_approval_required", full["state"])
+        self.assertEqual(12.5, full["projected_full_run_cost_usd"])
+
+        complete = project_test_model_state(
+            {
+                "status": "completed",
+                "campaign_id": "campaign-1",
+                "evidence_posture": "exploratory",
+            },
+            decision={"recommendation": "stay", "recommended_route": None},
+        )
+        self.assertEqual("complete", complete["state"])
+        self.assertEqual("stay", complete["recommendation"])
+
+    def test_test_model_state_projection_fails_closed_on_unknown_state(self) -> None:
+        with self.assertRaisesRegex(ValueError, "test_model_campaign_state_invalid"):
+            project_test_model_state({"status": "invented"})
 
 
 if __name__ == "__main__":

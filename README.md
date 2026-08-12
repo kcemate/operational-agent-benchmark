@@ -11,6 +11,13 @@ The output is a decision: whether the evidence justifies switching the model you
 > [!IMPORTANT]
 > **Requires a Hermes agent installation.** OAB drives models through the Hermes agent harness and reads its configured model routes; the active `hermes` command must remain on `PATH`. It is not a standalone model-evaluation harness today, and there is no adapter for other frameworks yet.
 
+> [!WARNING]
+> **Engine-only integration preview.** This release contains the fail-closed
+> candidate-preparation and broker-facing state-machine primitives. The Hermes
+> Approval Broker, production protected-host adapter, user-presence signing UI,
+> and automatic approval/resume loop do **not** exist yet. The commands below are
+> integration primitives, not a finished “just ask Hermes” product experience.
+
 ### What you get
 
 | | |
@@ -23,13 +30,16 @@ The output is a decision: whether the evidence justifies switching the model you
 
 ---
 
-## Just ask Hermes
+## Target Hermes experience — requires a future Approval Broker
 
-OAB is built to be driven by the agent, not by you. Point Hermes at it:
+The intended product experience is:
 
 > "Run OAB on this new model and tell me if it beats our current model."
 
-Hermes confirms which route is your current one and which is the candidate, verifies the release digests, installs the wheel, pins the campaign to those **two** routes, calibrates the harness, **stops and asks you to approve exact spend ceilings**, runs the bounded comparison, resumes anything that failed, verifies the seals, and hands you a decision report.
+A future protected Hermes integration will confirm the pair, verify the release
+digests, install the wheel, pin exactly two routes, calibrate, obtain separately
+signed stage approvals, run and resume the bounded comparison, verify the seals,
+and return a decision report. That integration is not implemented in this tree.
 
 Qualification and the full comparison are **separate** approvals. Neither is implied by asking the question.
 
@@ -40,7 +50,8 @@ Two honest caveats, stated before you spend anything:
 
 You approve the disclosed call and cost limits. Before a paid stage can run, a
 separately controlled Ed25519 signer must also sign that exact stage request.
-Once both gates are present, the agent handles the benchmark mechanics.
+Once both gates are present, the existing engine can handle the benchmark
+mechanics; the future Approval Broker must supply the protected product loop.
 `AGENTS.md` is the runbook it follows.
 
 ### Signed child boundary
@@ -90,6 +101,37 @@ The isolated OAB environment avoids package collisions while `oab doctor` safely
 ---
 
 ## Run it free first
+
+## Prepare a candidate test from a protected host
+
+The engine integration begins with one intent: name the candidate route. OAB
+discovers the current Hermes route, selects exactly those two routes, checks the
+trusted release and containment environment, calibrates the harness, and returns
+one compact qualification approval card without calling either model:
+
+```bash
+oab test-model example-provider/candidate-model
+```
+
+When invoked by a future production protected host, the candidate route is the
+only user-supplied argument. OAB creates a campaign under `~/OAB-Runs`, uses
+high reasoning, and proposes (but does not authorize) a $5 known-cost stop for
+the plumbing-only qualification stage. Advanced callers can override those
+no-spend preparation defaults before approving anything.
+
+No production protected-host adapter or Approval Broker is included today. A
+future adapter must supply both an independently published release-tree
+pin and its approval authority. Direct CLI launch without that adapter fails
+closed; CLI flags and ambient environment variables cannot replace either trust
+root. The
+person asking to “test this model” should not manage manifests, route IDs,
+receipts, signing payloads, or key files. OAB still stops before provider calls
+until the exact compact card is approved and signed by the separately controlled
+host authority. Qualification is plumbing only, not a quality score. A separate
+full-stage approval remains necessary if both routes qualify. A future protected host
+uses `oab test-model-status <campaign-root>` after each action to receive one
+stable next state—qualification approval, full approval, completion, or a
+terminal blocker—without exposing the user to the internal resume/report steps.
 
 You don't need to spend anything to see this work. Local Ollama routes run the full suite at **$0.00**.
 
@@ -316,4 +358,15 @@ See `BENCHMARK_CARD.md` for the construct card, `AGENTS.md` for the agent runboo
 
 ## Status
 
-Public beta, under active hardening. Published release artifacts carry their own pinned test/CI evidence; this source checkout must not be called published, released, or CI-verified unless its exact clean tree has those artifacts. The runtime containment and evidence requirements above remain mandatory. Model-selection claims stay provisional until the identity and approval gates above are satisfied.
+**Engine status:** public beta, under active hardening. Candidate-only
+preparation and broker-facing state projection are implemented.
+
+**Product status:** incomplete. The Hermes Approval Broker, production
+protected-host adapter, protected signing UX, and automated continuation loop
+are not implemented.
+
+Published release artifacts carry their own pinned test/CI evidence; this source
+checkout must not be called published, released, or CI-verified unless its exact
+clean tree has those artifacts. The runtime containment and evidence requirements
+above remain mandatory. Model-selection claims stay provisional until the
+identity and approval gates above are satisfied.

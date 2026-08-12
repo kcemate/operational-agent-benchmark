@@ -1047,6 +1047,106 @@ def sanitize_hermes_inventory(payload: Mapping[str, object]) -> dict[str, object
     }
 
 
+def select_model_comparison_inventory(
+    payload: Mapping[str, object], *, candidate_route: str
+) -> dict[str, object]:
+    """Return a secret-free inventory containing current + candidate only."""
+
+    discovery = sanitize_hermes_inventory(payload)
+    current = discovery.get("current_route")
+    if not isinstance(current, str) or not current:
+        raise ValueError("model_comparison_baseline_unavailable")
+    candidate = str(candidate_route or "").strip()
+    if candidate == current:
+        raise ValueError("model_comparison_routes_must_differ")
+    raw_routes = discovery.get("routes")
+    routes = raw_routes if isinstance(raw_routes, list) else []
+    by_requested = {
+        str(route.get("requested_route")): route
+        for route in routes
+        if isinstance(route, Mapping)
+    }
+    if candidate not in by_requested:
+        raise ValueError("model_comparison_candidate_unavailable")
+    if current not in by_requested:
+        raise ValueError("model_comparison_baseline_unavailable")
+
+    providers: dict[str, dict[str, object]] = {}
+    for requested in (current, candidate):
+        route = by_requested[requested]
+        provider = str(route["provider"])
+        model = str(route["model"])
+        row = providers.setdefault(
+            provider,
+            {"slug": provider, "authenticated": True, "models": [], "capabilities": {}},
+        )
+        models = row["models"]
+        assert isinstance(models, list)
+        models.append(model)
+        reasoning = route.get("reasoning_capability_catalogued")
+        if isinstance(reasoning, bool):
+            capabilities = row["capabilities"]
+            assert isinstance(capabilities, dict)
+            capabilities[model] = {"reasoning": reasoning}
+    return {
+        "provider": str(by_requested[current]["provider"]),
+        "model": str(by_requested[current]["model"]),
+        "providers": list(providers.values()),
+    }
+
+
+def project_test_model_state(
+    campaign: Mapping[str, object],
+    *,
+    qualification: Mapping[str, object] | None = None,
+    decision: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Project campaign internals into one protected-host continuation state."""
+
+    status = campaign.get("status")
+    base: dict[str, object] = {
+        "schema": "oab.test-model-state/v1",
+        "campaign_id": campaign.get("campaign_id"),
+        "campaign_status": status,
+    }
+    if status == "awaiting_qualification_approval":
+        return {**base, "state": "qualification_approval_required"}
+    if status == "awaiting_full_run_approval":
+        summary = qualification or {}
+        return {
+            **base,
+            "state": "full_approval_required",
+            "projected_full_run_cost_usd": summary.get("projected_full_run_cost_usd"),
+            "projected_full_run_duration_seconds": summary.get(
+                "projected_full_run_duration_seconds"
+            ),
+        }
+    if status == "completed":
+        report = decision or {}
+        return {
+            **base,
+            "state": "complete",
+            "recommendation": report.get("recommendation"),
+            "recommended_route": report.get("recommended_route"),
+            "evidence_posture": campaign.get("evidence_posture"),
+        }
+    terminal = {
+        "comparison_not_supportable",
+        "blocked_calibration",
+        "blocked_unknown_qualification_cost",
+        "blocked_unknown_qualification_api_calls",
+        "qualification_budget_exhausted",
+        "qualification_call_budget_exhausted",
+        "blocked_unknown_full_cost",
+        "blocked_unknown_full_api_calls",
+        "full_budget_exhausted",
+        "full_call_budget_exhausted",
+    }
+    if isinstance(status, str) and status in terminal:
+        return {**base, "state": "blocked", "blocker": status}
+    raise ValueError("test_model_campaign_state_invalid")
+
+
 def build_campaign_plan(
     discovery: Mapping[str, object],
     *,

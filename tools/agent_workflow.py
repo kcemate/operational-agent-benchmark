@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -37,10 +38,12 @@ from oab.agent_workflow import (
     initialize_campaign,
     load_campaign,
     load_hermes_inventory,
+    project_test_model_state,
     record_calibration,
     run_full_stage,
     run_qualification_stage,
     sanitize_hermes_inventory,
+    select_model_comparison_inventory,
     stage_approval_signing_payload,
     verify_campaign_plan,
     verify_stage_approval,
@@ -64,6 +67,10 @@ else:
     from tools.run_calibration import run_calibration
 
 ROOT = benchmark_root()
+
+
+def _default_test_model_output_root() -> Path:
+    return Path.home() / "OAB-Runs" / f"oab-test-{int(time.time())}-{secrets.token_hex(4)}"
 
 
 def _json_print(payload: Mapping[str, object]) -> None:
@@ -495,6 +502,27 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Ed25519 approval authority pinned into PLAN before calibration",
     )
+
+    test_model = subparsers.add_parser(
+        "test-model",
+        help="Prepare a two-route candidate-vs-current test and print one approval card",
+    )
+    test_model.add_argument("candidate_route")
+    test_model.add_argument("--output-root", type=Path, default=None)
+    test_model.add_argument(
+        "--reasoning-effort",
+        default="high",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+    )
+    test_model.add_argument("--qualification-cost-stop-usd", type=float, default=5.0)
+    test_model.add_argument("--allow-unknown-costs", action="store_true")
+    test_model.add_argument("--hermes-api-url", default=None)
+
+    test_model_status = subparsers.add_parser(
+        "test-model-status",
+        help="Project a campaign into the next protected-host approval or verdict state",
+    )
+    test_model_status.add_argument("output_root", type=Path)
 
     preview = subparsers.add_parser(
         "approval-preview",
@@ -1004,6 +1032,7 @@ def main(
     calibration_runner: Any = None,
     suite_runner: Any = None,
     suite_verifier: Any = None,
+    trusted_test_model_context_loader: Any = None,
 ) -> int:
     args = _parser().parse_args(argv)
     doctor_fn = doctor_fn or doctor_environment
@@ -1058,6 +1087,108 @@ def main(
                 state = record_calibration(args.output_root, calibration)
             _json_print(state)
             return _campaign_exit_code(state)
+
+        if args.command == "test-model":
+            output_root = args.output_root or _default_test_model_output_root()
+            if trusted_test_model_context_loader is None:
+                raise ValueError("trusted_test_model_context_unavailable")
+            trusted_context = trusted_test_model_context_loader()
+            release_tree_sha256 = trusted_context.get("release_tree_sha256")
+            approval_public_key = trusted_context.get("approval_public_key_path")
+            if not isinstance(release_tree_sha256, str) or not release_tree_sha256:
+                raise ValueError("trusted_release_pin_unavailable")
+            if not isinstance(approval_public_key, Path):
+                raise ValueError("trusted_approval_authority_unavailable")
+            doctor_kwargs = {
+                "benchmark_root": ROOT,
+                "expected_release_tree_sha256": release_tree_sha256,
+            }
+            doctor_report = doctor_fn(**doctor_kwargs)
+            if doctor_report.get("ready") is not True:
+                _json_print(doctor_report)
+                return 2
+            if doctor_report.get("release_tree_sha256") != release_tree_sha256:
+                raise ValueError("trusted_release_pin_mismatch")
+            inventory = (
+                inventory_loader(api_base_url=args.hermes_api_url)
+                if args.hermes_api_url
+                else inventory_loader()
+            )
+            selected_inventory = select_model_comparison_inventory(
+                inventory, candidate_route=args.candidate_route
+            )
+            initialize_campaign(
+                output_root,
+                doctor=doctor_report,
+                inventory_payload=selected_inventory,
+                reasoning_effort=args.reasoning_effort,
+                approval_authority_public_key_path=approval_public_key,
+            )
+            calibration = calibration_runner(output_root.resolve() / "calibration")
+            record_calibration(output_root, calibration)
+            preview = build_approval_preview(
+                output_root,
+                stage="qualification",
+                max_cost_usd=args.qualification_cost_stop_usd,
+                max_api_calls=2 * ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+                max_routes=2,
+                allow_unknown_costs=args.allow_unknown_costs,
+            )
+            raw_preview_routes = preview.get("routes")
+            preview_routes = raw_preview_routes if isinstance(raw_preview_routes, list) else []
+            routes = [
+                str(route.get("requested_route"))
+                for route in preview_routes
+                if isinstance(route, Mapping)
+            ]
+            baseline = sanitize_hermes_inventory(selected_inventory)["current_route"]
+            candidate = next(route for route in routes if route != baseline)
+            _json_print(
+                {
+                    "schema": "oab.test-model-approval-card/v1",
+                    "campaign_root": str(output_root.resolve()),
+                    "baseline": baseline,
+                    "candidate": candidate,
+                    "stage": "qualification",
+                    "purpose": preview["stage_purpose"],
+                    "episodes": preview["scheduled_episodes"],
+                    "maximum_api_calls": preview["absolute_reserved_api_calls"],
+                    "observed_known_billed_cost_stop_usd": preview["observed_cost_stop_usd"],
+                    "cost_stop_may_cross_by_calls": preview["max_cost_overshoot_api_calls"],
+                    "cost_stop_note": (
+                        "Provider cost arrives after each call; the first crossing call may "
+                        "take observed cost above this stop."
+                    ),
+                    "allow_unknown_costs": preview["allow_unknown_costs"],
+                    "evidence_posture": preview["intended_evidence_posture"],
+                    "authority_note": preview["authority_note"],
+                    "approval_authorizes": (
+                        "qualification provider calls only; not the full comparison or a model switch"
+                    ),
+                    "routes": routes,
+                    "model_inference_calls_performed": 0,
+                    "next_action": "approval_required",
+                }
+            )
+            return 0
+
+        if args.command == "test-model-status":
+            root = args.output_root.resolve()
+            campaign = load_campaign(root)
+            qualification_path = root / "QUALIFICATION.json"
+            decision_path = root / "DECISION_REPORT.json"
+            qualification = (
+                _load_json_object(qualification_path) if qualification_path.is_file() else None
+            )
+            decision = _load_json_object(decision_path) if decision_path.is_file() else None
+            _json_print(
+                project_test_model_state(
+                    campaign,
+                    qualification=qualification,
+                    decision=decision,
+                )
+            )
+            return 0
 
         if args.command == "approval-preview":
             preview = build_approval_preview(
