@@ -703,6 +703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 campaign_root_path=args.campaign_root_path,
                 campaign_root_fd=args.campaign_root_fd,
                 authorization_fd=args.campaign_authorization_fd,
+                output_parent_fd=args.output_parent_fd,
                 requested_route=f"{args.provider}/{args.model}",
                 reasoning_effort=args.reasoning_effort,
                 output_name=str(args.output_name),

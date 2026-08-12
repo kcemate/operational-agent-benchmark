@@ -42,8 +42,10 @@ class CampaignChildAuthorizationTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name) / "campaign"
         self.root.mkdir(mode=0o700)
-        self.output_parent = Path(self.tempdir.name) / "outputs"
-        self.output_parent.mkdir(mode=0o700)
+        self.output_parent = self.root / "qualification" / "attempts"
+        self.output_parent.mkdir(mode=0o700, parents=True)
+        self.redirected_output_parent = Path(self.tempdir.name) / "redirected-outputs"
+        self.redirected_output_parent.mkdir(mode=0o700)
         self.output_name = "a" * 32 + ".evidence"
         manifest = json.loads((run_suite.ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
         self.release_tree = str(manifest["tree_sha256"])
@@ -128,9 +130,11 @@ class CampaignChildAuthorizationTests(unittest.TestCase):
         max_cost: float = 1.0,
         allow_unknown_costs: bool = False,
         output_name: str | None = None,
+        output_parent: Path | None = None,
     ) -> tuple[int, list[str]]:
         saved_cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        output_fd = os.open(self.output_parent, os.O_RDONLY | os.O_DIRECTORY)
+        selected_output_parent = output_parent or self.output_parent
+        output_fd = os.open(selected_output_parent, os.O_RDONLY | os.O_DIRECTORY)
         root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
         calls: list[str] = []
         with tempfile.TemporaryFile() as transport:
@@ -142,7 +146,7 @@ class CampaignChildAuthorizationTests(unittest.TestCase):
                 "--provider", provider,
                 "--model", model,
                 "--reasoning-effort", effort,
-                "--output-root", str(self.output_parent / str(output_name or self.output_name)),
+                "--output-root", str(selected_output_parent / str(output_name or self.output_name)),
                 "--output-parent-fd", str(output_fd),
                 "--output-name", str(output_name or self.output_name),
                 "--qualification-readiness-v1",
@@ -179,6 +183,14 @@ class CampaignChildAuthorizationTests(unittest.TestCase):
 
         self.assertEqual(0, status)
         self.assertEqual(["controller"], calls)
+
+    def test_signed_output_name_cannot_be_redirected_through_another_parent_fd(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "campaign_child_output_parent_invalid"):
+            self._invoke(
+                envelope=self.envelope,
+                output_parent=self.redirected_output_parent,
+            )
+        self.assertFalse((self.redirected_output_parent / self.output_name).exists())
 
     def test_tampered_route_effort_plan_key_cost_or_output_is_rejected_before_controller(self) -> None:
         alternate_private = Ed25519PrivateKey.generate()

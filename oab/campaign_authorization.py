@@ -487,12 +487,54 @@ def _verified_root(root_path: Path, root_fd: int) -> Path:
     return resolved
 
 
+def _open_child_directory(parent_fd: int, name: str) -> int:
+    """Open one ordinary child directory without following a substituted link."""
+
+    if name in {"", ".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("campaign_child_output_parent_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+        child_info = os.fstat(child_fd)
+    except OSError as exc:
+        raise ValueError("campaign_child_output_parent_invalid") from exc
+    if not stat.S_ISDIR(child_info.st_mode):
+        os.close(child_fd)
+        raise ValueError("campaign_child_output_parent_invalid")
+    return child_fd
+
+
+def _verify_output_parent_fd(campaign_root_fd: int, output_parent_fd: int, stage: str) -> None:
+    """Bind the inherited output descriptor to signed ``<stage>/attempts``."""
+
+    stage_fd = -1
+    attempts_fd = -1
+    try:
+        stage_fd = _open_child_directory(campaign_root_fd, stage)
+        attempts_fd = _open_child_directory(stage_fd, "attempts")
+        expected = os.fstat(attempts_fd)
+        supplied = os.fstat(output_parent_fd)
+    except OSError as exc:
+        raise ValueError("campaign_child_output_parent_invalid") from exc
+    finally:
+        if attempts_fd >= 0:
+            os.close(attempts_fd)
+        if stage_fd >= 0:
+            os.close(stage_fd)
+    if (
+        not stat.S_ISDIR(supplied.st_mode)
+        or (expected.st_dev, expected.st_ino) != (supplied.st_dev, supplied.st_ino)
+    ):
+        raise ValueError("campaign_child_output_parent_invalid")
+
+
 def verify_campaign_child_authorization(
     *,
     stage: str,
     campaign_root_path: Path,
     campaign_root_fd: int,
     authorization_fd: int,
+    output_parent_fd: int,
     requested_route: str,
     reasoning_effort: str,
     output_name: str,
@@ -508,6 +550,7 @@ def verify_campaign_child_authorization(
     if stage not in {"qualification", "full"} or _OUTPUT_NAME_RE.fullmatch(output_name) is None:
         raise ValueError("campaign_child_authorization_invalid")
     root = _verified_root(campaign_root_path, campaign_root_fd)
+    _verify_output_parent_fd(campaign_root_fd, output_parent_fd, stage)
     plan = validate_campaign_plan_document(_json_object(_read_regular_bytes_at(campaign_root_fd, "PLAN.json")))
     calibration = _json_object(_read_regular_bytes_at(campaign_root_fd, "CALIBRATION.json"))
     calibration_digest = canonical_sha256(calibration)
