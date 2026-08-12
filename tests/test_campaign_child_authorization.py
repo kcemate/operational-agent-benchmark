@@ -16,6 +16,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from oab import campaign_authorization
 from oab.campaign_authorization import (
     campaign_plan_sha256,
     canonical_bytes,
@@ -220,6 +221,87 @@ class CampaignChildAuthorizationTests(unittest.TestCase):
         (self.root / "PLAN.json").write_bytes(canonical_bytes(plan))
         with self.assertRaises(SystemExit):
             self._invoke(envelope=self.envelope)
+
+
+class OutputParentDescriptorBindingTests(unittest.TestCase):
+    def test_concurrent_attempts_entry_substitution_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "campaign"
+            attempts = root / "qualification" / "attempts"
+            attempts.mkdir(parents=True)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            output_parent_fd = os.open(attempts, os.O_RDONLY | os.O_DIRECTORY)
+            real_fstat = os.fstat
+            fstat_calls = 0
+
+            def substitute_after_snapshot(descriptor: int):
+                nonlocal fstat_calls
+                info = real_fstat(descriptor)
+                fstat_calls += 1
+                if fstat_calls == 3:
+                    attempts.rename(attempts.with_name("attempts-displaced"))
+                    attempts.mkdir()
+                return info
+
+            try:
+                with patch.object(
+                    campaign_authorization.os,
+                    "fstat",
+                    side_effect=substitute_after_snapshot,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "campaign_child_output_parent_invalid",
+                    ):
+                        campaign_authorization._verify_output_parent_fd(
+                            root_fd,
+                            output_parent_fd,
+                            "qualification",
+                        )
+            finally:
+                os.close(output_parent_fd)
+                os.close(root_fd)
+
+    def test_child_directory_fd_closes_when_fstat_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "child").mkdir()
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            real_open = os.open
+            opened_fd: int | None = None
+
+            def capture_open(*args: object, **kwargs: object) -> int:
+                nonlocal opened_fd
+                opened_fd = real_open(*args, **kwargs)
+                return opened_fd
+
+            try:
+                with patch.object(
+                    campaign_authorization.os,
+                    "open",
+                    side_effect=capture_open,
+                ), patch.object(
+                    campaign_authorization.os,
+                    "fstat",
+                    side_effect=OSError("injected fstat failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "campaign_child_output_parent_invalid",
+                    ):
+                        campaign_authorization._open_child_directory(root_fd, "child")
+                self.assertIsNotNone(opened_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(cast(int, opened_fd))
+            finally:
+                if opened_fd is not None:
+                    try:
+                        os.close(opened_fd)
+                    except OSError:
+                        pass
+                os.close(root_fd)
+
+
 class ParentCreatedChildAuthorizationSubprocessTests(unittest.TestCase):
     """Exercise the real parent subprocess and descriptor proof boundary offline."""
 

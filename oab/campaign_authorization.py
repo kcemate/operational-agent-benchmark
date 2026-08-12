@@ -493,10 +493,13 @@ def _open_child_directory(parent_fd: int, name: str) -> int:
     if name in {"", ".", ".."} or "/" in name or "\\" in name:
         raise ValueError("campaign_child_output_parent_invalid")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    child_fd = -1
     try:
         child_fd = os.open(name, flags, dir_fd=parent_fd)
         child_info = os.fstat(child_fd)
     except OSError as exc:
+        if child_fd >= 0:
+            os.close(child_fd)
         raise ValueError("campaign_child_output_parent_invalid") from exc
     if not stat.S_ISDIR(child_info.st_mode):
         os.close(child_fd)
@@ -514,6 +517,7 @@ def _verify_output_parent_fd(campaign_root_fd: int, output_parent_fd: int, stage
         attempts_fd = _open_child_directory(stage_fd, "attempts")
         expected = os.fstat(attempts_fd)
         supplied = os.fstat(output_parent_fd)
+        current = os.stat("attempts", dir_fd=stage_fd, follow_symlinks=False)
     except OSError as exc:
         raise ValueError("campaign_child_output_parent_invalid") from exc
     finally:
@@ -524,6 +528,8 @@ def _verify_output_parent_fd(campaign_root_fd: int, output_parent_fd: int, stage
     if (
         not stat.S_ISDIR(supplied.st_mode)
         or (expected.st_dev, expected.st_ino) != (supplied.st_dev, supplied.st_ino)
+        or not stat.S_ISDIR(current.st_mode)
+        or (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino)
     ):
         raise ValueError("campaign_child_output_parent_invalid")
 
