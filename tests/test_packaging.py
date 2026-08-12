@@ -4,12 +4,54 @@ import tomllib
 import importlib.util
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_setup_module(name: str) -> types.ModuleType:
+    """Load `setup.py` without requiring setuptools to be installed.
+
+    Python 3.12 stopped seeding fresh environments with setuptools, and the
+    runtime install (`pip install -e .`) supplies it only to the isolated
+    build, so importing the real package here would reduce the contract below
+    to a 3.11-only check. setup.py's build-backend wiring is already exercised
+    on every interpreter by the install and wheel-build steps; the assertions
+    below cover the release-tree exclusion contract, which is stdlib-only.
+
+    The stand-in exposes exactly what setup.py imports, so any new
+    build-backend usage fails loudly here instead of passing against a
+    permissive mock.
+    """
+    setuptools = types.ModuleType("setuptools")
+    command = types.ModuleType("setuptools.command")
+    build_py_module = types.ModuleType("setuptools.command.build_py")
+
+    class build_py:  # noqa: N801 - stands in for the setuptools class of this name
+        """Base class for setup.py's build_py subclass; never run by these tests."""
+
+    setuptools.setup = lambda **attrs: None
+    setuptools.command = command
+    command.build_py = build_py_module
+    build_py_module.build_py = build_py
+
+    spec = importlib.util.spec_from_file_location(name, ROOT / "setup.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "setuptools": setuptools,
+            "setuptools.command": command,
+            "setuptools.command.build_py": build_py_module,
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module
 
 
 class PackagingContractTests(unittest.TestCase):
@@ -19,41 +61,26 @@ class PackagingContractTests(unittest.TestCase):
         It is git-ignored local agent runtime and plans; embedding it would both
         diverge from RELEASE_MANIFEST.json and publish untracked local state.
         """
-        sys.path.insert(0, str(ROOT))
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "_oab_setup_under_test", ROOT / "setup.py"
-            )
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            with patch("setuptools.setup"):
-                spec.loader.exec_module(module)
-            self.assertIn(".hermes", module.EXCLUDED_PARTS)
-            offenders = [
-                str(path)
-                for path in module.release_files()
-                if path.parts and path.parts[0] == ".hermes"
-            ]
-            self.assertEqual([], offenders)
-        finally:
-            sys.path.remove(str(ROOT))
+        module = _load_setup_module("_oab_setup_under_test")
+
+        self.assertIn(".hermes", module.EXCLUDED_PARTS)
+        offenders = [
+            str(path)
+            for path in module.release_files()
+            if path.parts and path.parts[0] == ".hermes"
+        ]
+        self.assertEqual([], offenders)
 
     def test_frozen_release_tree_matches_release_manifest_exclusions(self) -> None:
         """setup.py and tools/release_manifest.py must agree on what is release content."""
+        module = _load_setup_module("_oab_setup_exclusions")
         sys.path.insert(0, str(ROOT))
         try:
-            spec = importlib.util.spec_from_file_location(
-                "_oab_setup_exclusions", ROOT / "setup.py"
-            )
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            with patch("setuptools.setup"):
-                spec.loader.exec_module(module)
             from tools.release_manifest import _EXCLUDED_PARTS
-
-            self.assertEqual(set(_EXCLUDED_PARTS), set(module.EXCLUDED_PARTS))
         finally:
             sys.path.remove(str(ROOT))
+
+        self.assertEqual(set(_EXCLUDED_PARTS), set(module.EXCLUDED_PARTS))
 
     def test_runtime_package_does_not_import_collision_prone_tools_namespace(self) -> None:
         offenders = []
