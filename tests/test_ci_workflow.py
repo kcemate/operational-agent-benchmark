@@ -22,6 +22,15 @@ class CiWorkflowContractTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("runs-on: macos-latest", workflow)
 
+    def test_ci_runs_the_offline_qualification_acceptance_gate(self) -> None:
+        """Task 7: offline qualification acceptance is a release-blocking CI gate."""
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            2,
+            workflow.count("python tools/qualification_acceptance.py --json"),
+            "both CI jobs must run the offline qualification acceptance gate",
+        )
+
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
     """The release workflow must verify digests and never auto-publish."""

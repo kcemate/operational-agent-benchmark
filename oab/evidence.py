@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from .manifest import ManifestError, build_tree_manifest, verify_tree_manifest
+from .qualification_contract import QUALIFICATION_PROBE_RESULT_SCHEMA
 from .trace import validate_trace
 
-_RESULT_SCHEMA = "oab.episode-result/v1"
+_RESULT_SCHEMAS = frozenset(
+    {"oab.episode-result/v1", QUALIFICATION_PROBE_RESULT_SCHEMA}
+)
 _SHA256_LENGTH = len("sha256:") + 64
 _EVIDENCE_MANIFEST_NAME = "evidence-manifest.json"
 _EVIDENCE_MANIFEST_EXCLUDES = frozenset({_EVIDENCE_MANIFEST_NAME})
@@ -101,7 +104,7 @@ def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
             "status": None,
             "evidence_dir": reported_dir,
         }
-    if receipt.get("schema") != _RESULT_SCHEMA:
+    if receipt.get("schema") not in _RESULT_SCHEMAS:
         errors.append("result_schema_invalid")
     status_value = receipt.get("status")
     if isinstance(status_value, str):

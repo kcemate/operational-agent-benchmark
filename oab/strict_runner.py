@@ -18,6 +18,7 @@ from .manifest import (
     build_tree_manifest,
     ignore_generated_python_caches,
 )
+from .qualification_contract import QUALIFICATION_PROBE_RESULT_SCHEMA
 from .runner import StrictEpisodeSpec
 from .sandbox import SandboxPolicy, SandboxResult, select_backend
 from .trace import CanonicalTrace, validate_trace
@@ -197,7 +198,11 @@ def _validate_identity(identity: ControllerIdentity) -> tuple[str, ...]:
     elif identity.execution_class == "model":
         if not identity.returned_route or not identity.response_id:
             reasons.append("provider_returned_identity_missing")
-        if identity.identity_source != "provider_response":
+        # Hermes CLI attests route+session via adapter_runtime. That is
+        # accepted for exploratory qualification readiness when the route and
+        # response id are present; provider_response remains preferred when
+        # the adapter can surface raw provider attestation.
+        if identity.identity_source not in {"provider_response", "adapter_runtime"}:
             reasons.append("provider_identity_source_unverified")
     else:
         reasons.append("execution_class_invalid")
@@ -526,6 +531,7 @@ def run_strict_episode(
     repository_root: Path,
     run_root: Path,
     evidence_dir: Path,
+    artifact_profile: str = "standard",
 ) -> StrictEpisodeResult:
     repository = repository_root.resolve()
     run_root = run_root.resolve()
@@ -534,6 +540,8 @@ def run_strict_episode(
         raise ValueError("run and evidence roots must be disjoint from the repository")
     if evidence_dir.exists():
         raise FileExistsError(f"evidence directory already exists: {evidence_dir}")
+    if artifact_profile not in {"standard", "qualification_readiness"}:
+        raise ValueError("artifact_profile_invalid")
     if tool_policy.max_steps < 1 or tool_policy.max_write_bytes < 0 or tool_policy.max_read_bytes < 0:
         raise ValueError("invalid tool policy limits")
     input_manifest = build_fixture_manifest(spec.input_tree)
@@ -939,6 +947,30 @@ def run_strict_episode(
             "Route identity is adapter-attested metadata, not cryptographic provider proof."
         ),
     }
+    if artifact_profile == "qualification_readiness":
+        # This projection is intentionally constructed before the evidence manifest
+        # is sealed. Qualification evidence is plumbing/identity/telemetry only;
+        # generic scoring and calibration fields never enter this artifact tree.
+        receipt = {
+            "schema": QUALIFICATION_PROBE_RESULT_SCHEMA,
+            "case_id": spec.case_id,
+            "repetition": spec.repetition,
+            "status": status,
+            "execution_class": execution_class,
+            "reason_codes": list(unique_reasons),
+            "controller_identity": identity_payload,
+            "controller_usage": _controller_usage_snapshot(controller),
+            "protocol_normalized_turns": _controller_protocol_normalized_turns(controller),
+            "runtime": {
+                "python_executable_sha256": _sha256_file(Path(sys.executable).resolve()),
+                "leaf_worker_sha256": _sha256_file(Path(__file__).with_name("leaf_worker.py").resolve()),
+                "platform": sys.platform,
+                "sandbox_backend": select_backend().name,
+            },
+            "trace_sha256": trace_digest,
+            "output_tree_sha256": output_manifest.get("tree_sha256") if output_manifest else None,
+            "readiness_evidence": status == "completed" and not unique_reasons,
+        }
     (evidence_dir / "result.json").write_bytes(_canonical_bytes(receipt) + b"\n")
     evidence_manifest = build_evidence_manifest(evidence_dir)
     (evidence_dir / "evidence-manifest.json").write_bytes(

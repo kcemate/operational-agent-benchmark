@@ -26,12 +26,19 @@ This repository provides an agent-native workflow for answering a bounded questi
 
 ## Conversational "candidate vs current" workflow
 
-The common request is conversational: *"Run OAB on this new model and tell me if it beats our current model."* Treat that as a **two-route comparison**, not a spend authorization.
+`oab test-model <provider/model>` infers the current route, selects exactly two
+routes, creates a campaign in `~/OAB-Runs`, calibrates, and stops without model
+inference. `oab test-model-status <campaign-root>` projects the campaign as
+qualification-ready, full-stage-ready, complete, or blocked. Qualification and
+full execution remain separate explicit `resume --stage` operations; completing
+qualification never launches full.
+
+The common request is conversational: *"Hermes, test this new model using OAB."* That is the product. Prefer `oab test-model <provider/model>` over a hand-built inventory. Treat the sentence as a **two-route comparison**, not a spend authorization and not a launch of the full grid.
 
 1. **Infer and confirm the pair.** The baseline is `current_route` from `DISCOVERY.json`; the candidate is the model the user named. If `current_route` is null, or the wording is ambiguous about which route is current, ask **one** concise question before creating a campaign. A campaign with a null `baseline_route` fails later at `campaign_plan_baseline_invalid`.
 2. **Say up front that a winner is not guaranteed.** `stay` and `not_supportable` are ordinary outcomes. An `exploratory` campaign cannot authorize a switch no matter what the numbers show.
-3. **Pin the comparison to exactly two routes** with `--inventory-json` (below), and verify `PLAN.json` holds two routes before requesting any approval.
-4. **Preview, then stop.** Qualification and full are separate approvals; neither is implied by the original request or by silence.
+3. **Create the campaign with `oab test-model`.** Verify `PLAN.json` holds exactly two routes before executing either stage. Expert CLI (`benchmark --inventory-json`) is fallback only.
+4. **Plan, then stop.** Read the immutable PLAN ceilings. Qualification and full are separate explicit `oab resume --stage` commands.
 5. **Report** the pair, the verdict in plain English, the authority posture, and the actual spend and cost posture. Keep route IDs, seals, and receipt digests out of the user-facing answer unless a failure requires naming one.
 
 ### Selecting exactly two routes
@@ -40,7 +47,7 @@ The common request is conversational: *"Run OAB on this new model and tell me if
 
 The file must be a JSON object. OAB sanitizes it and discards every field not listed here, so extras are pointless and risk leaking secrets:
 
-- `providers[]` — candidate rows (max 256). Each row uses `slug` (provider name; a row whose slug is `moa` is dropped), `models` (array of model names, max 2048), optional `authenticated` (a row is dropped only when this is exactly `false`), and optional `capabilities` mapping model name to `{"reasoning": bool}`.
+- `providers[]` — candidate rows (max 256). Each row uses `slug` (provider name; no provider slug receives special treatment), `models` (array of model names, max 2048), optional `authenticated` (a row is dropped only when this is exactly `false`), and optional `capabilities` mapping model name to `{"reasoning": bool}`.
 - `provider` and `model` — the **current** route. These become `current_route` only if that pair also appears in `providers`; otherwise `current_route` is silently `null`. Always list the baseline in `providers` too.
 
 ```json
@@ -85,77 +92,40 @@ oab discover --json --hermes-api-url http://127.0.0.1:8642
 
 The API key is read from `API_SERVER_KEY`; never put it in a CLI argument, inventory file, report, or evidence tree. Without `--hermes-api-url`, OAB uses Hermes' in-process authenticated inventory adapter. It explicitly disables live provider probes and pricing lookups, but Hermes context/plugin initialization may still read local configuration, refresh authentication, or perform implementation-defined network activity; discovery therefore means **no model inference**, not universally side-effect-free execution.
 
-Generate the exact no-spend preview before asking for approval. It prints the ordered route IDs/names, plan and calibration digests, stage, episode count, minimum call reserve, observed known-billed-cost stop and one-call crossing semantics, route/API ceilings, unknown-cost posture, and intended evidence posture:
+There is no `approval-preview`, `approval-request`, detached stage signature, or Approval Broker. Spend is PLAN-bound: `oab resume --stage` must restate the exact immutable PLAN ceilings. A mismatch fails closed before any provider call.
+
+Read `PLAN.json` `qualification_execution` / `full_execution` and restate them exactly:
 
 ```bash
-oab approval-preview "$HOME/OAB-Runs/my-campaign" \
-  --stage qualification \
-  --observed-cost-stop-usd <requested-stop-threshold> \
-  --max-api-calls <requested-call-ceiling> \
-  --max-routes <requested-route-count>
-```
-
-Show the complete JSON to the user and wait for explicit approval of those exact values. Never infer approval from silence, fabricate a reference, widen limits, or create the receipt before approval. Explicit conversational approval is required, but it is **not** sufficient to execute: OAB has no host-backed verifier for a quoted message reference, so `--conversation-approval-reference` is refused with `conversation_approval_not_host_verified`, and a hand-written conversational receipt is refused at `resume`. Spend-capable execution requires an externally signed Ed25519 stage approval:
-
-```bash
-oab approval-request "$HOME/OAB-Runs/my-campaign" \
-  --stage qualification \
-  --observed-cost-stop-usd <approved-stop-threshold> \
-  --max-api-calls <approved-call-ceiling> \
-  --max-routes <approved-route-count> \
-  --approval-public-key /path/to/approval-public.pem \
-  --output /tmp/qualification-approval.json
-
-# A separate approver signs the canonical
-# /tmp/qualification-approval.json.signing-payload with the matching Ed25519
-# private key. Never generate or handle that private key yourself.
-
 oab resume "$HOME/OAB-Runs/my-campaign" \
-  --qualification-approval /tmp/qualification-approval.json \
-  --approval-signature /tmp/qualification-approval.sig \
-  --approval-public-key /path/to/approval-public.pem \
-  --observed-cost-stop-usd <same-approved-stop-threshold> \
-  --max-api-calls <same-approved-call-ceiling> \
-  --max-routes <same-approved-route-count>
+  --stage qualification \
+  --observed-cost-stop-usd <PLAN.qualification_execution.known_cost_stop_usd> \
+  --max-api-calls <PLAN.qualification_execution.max_api_calls> \
+  --max-routes <PLAN.qualification_execution.max_routes>
+# add --allow-unknown-costs only when PLAN.qualification_execution.allow_unknown_costs is true
 ```
 
-Qualification runs the P01 matched approved/prohibited pair for 17 repetitions: exactly 34 one-call episodes and at most 34 provider API calls per route. This is a bounded infrastructure, identity, effort, telemetry, and first-response probe—not a substitute for the 80-episode full comparison. A route with all 34 infrastructure-valid episodes, pinned effort, and route identity attestation is qualified even if its one-call model outputs earn zero task credit. Authentication, route, provider, controller, containment, and effort-attestation failures are excluded and never become model scores.
+Qualification runs two deterministic multi-turn plumbing probes per route (approved read/tool loop and prohibited-effect/no-effect compliance). Live contract: **6 broker steps / 6 API calls per physical attempt**, first-attempt reserve **12 calls per route**, one infrastructure-only retry per probe, absolute ceiling **24 calls per route** (**48** across two routes). Qualification reports only READY / NOT READY / INCOMPATIBLE plus failure reasons — never a completion rate, pair stability, or “0% model” quality headline. It is not a substitute for the 80-episode full comparison. Authentication, route, provider, controller, containment, effort-attestation, and missing API-call-count failures remain infrastructure exclusions, never model scores.
 
-If any route lacks cost telemetry, OAB pauses after that route and returns exit status `3`. Continue only after disclosing the unknown-cost condition and obtaining a **new** exact preview and approval that include `--allow-unknown-costs`; pass the same flag on `resume`.
+Two accounting rules follow from that. A route whose telemetry omits the API-call count is infrastructure-invalid, because OAB cannot enforce its own spend ceiling without it. Unknown dollar cost is recorded as `null` with an `unknown_cost_api_calls` count — never `$0` — and can proceed only when the immutable PLAN records `allow_unknown_costs=true` and `resume` restates `--allow-unknown-costs`.
 
-After qualification, inspect `QUALIFICATION.json`. Obtain a separate full-stage preview and approval before scheduling 80 episodes per qualified route:
+**Qualification percentages from v2.2.3 and earlier are invalid as model-quality signals.** Those releases ran 34 one-call episodes against tasks that require a tool loop, so a capable model could score 0% purely because it never received a second turn. Do not cite, compare, or resume them under v2.3.0; start a fresh campaign instead.
+
+If any route lacks cost telemetry and the PLAN did not allow unknown costs, OAB pauses after that route and returns exit status `3`. Continue only on a **new** campaign whose PLAN records `allow_unknown_costs=true`; do not mutate an existing PLAN.
+
+After qualification, inspect `QUALIFICATION.json`. Both routes must be READY. Then run a **separate** full-stage resume that restates `PLAN.json` `full_execution` exactly:
 
 ```bash
-oab approval-preview "$HOME/OAB-Runs/my-campaign" \
-  --stage full \
-  --observed-cost-stop-usd <requested-stop-threshold> \
-  --max-api-calls <requested-call-ceiling> \
-  --max-routes <requested-route-count>
-
-oab approval-request "$HOME/OAB-Runs/my-campaign" \
-  --stage full \
-  --observed-cost-stop-usd <approved-stop-threshold> \
-  --max-api-calls <approved-call-ceiling> \
-  --max-routes <approved-route-count> \
-  --approval-public-key /path/to/approval-public.pem \
-  --output /tmp/full-approval.json
-
-# Sign /tmp/full-approval.json.signing-payload externally (Ed25519).
-
 oab resume "$HOME/OAB-Runs/my-campaign" \
-  --full-approval /tmp/full-approval.json \
-  --approval-signature /tmp/full-approval.sig \
-  --approval-public-key /path/to/approval-public.pem \
-  --observed-cost-stop-usd <same-approved-stop-threshold> \
-  --max-api-calls <same-approved-call-ceiling> \
-  --max-routes <same-approved-route-count>
+  --stage full \
+  --observed-cost-stop-usd <PLAN.full_execution.known_cost_stop_usd> \
+  --max-api-calls <PLAN.full_execution.max_api_calls> \
+  --max-routes <PLAN.full_execution.max_routes>
 ```
 
-The detached Ed25519 path is the only spend-capable authorization path: create the request with `--approval-public-key`, have a separate approver sign the canonical `.signing-payload`, and pass the signature and matching public key to `resume`. Never generate or use the approver's private key.
+Completing qualification never launches full. Restating PLAN ceilings authorizes only that bounded stage. It **does not confer release authority**. Because cost arrives after provider calls, the call revealing a threshold crossing may exceed it; all later calls stop. `--max-cost-usd` is only a compatibility alias, not an absolute prepaid cap.
 
-A stage approval authorizes only the exact bounded spend stage. It **does not confer release authority**. Receipts bind the plan/calibration digests, ordered route IDs, observed known-billed-cost stop, cost-control mode, maximum one crossing call, API-call and route ceilings, and unknown-cost posture. Because cost arrives after provider calls, the call revealing a threshold crossing may exceed it; all later calls stop. `--max-cost-usd` is only a compatibility alias, not an absolute prepaid cap.
-
-Qualification schedules exactly 34 one-call episodes and reserves up to 34 calls per route; full comparison reserves up to 1,360 calls per route. Exact-tree release approval plus all identity, coverage, grid, runtime, and seal gates is required for `authoritative_comparable`. Otherwise `report` and `verify` must label the campaign `exploratory`, expose route-level blockers, and decline an authoritative switch recommendation.
+Full comparison reserves up to 1,360 calls per route (2,720 across two routes). Exact-tree release approval plus all identity, coverage, grid, runtime, and seal gates is required for `authoritative_comparable`. Otherwise `report` and `verify` must label the campaign `exploratory`, expose route-level blockers, and decline an authoritative switch recommendation.
 
 ## Resume and verification
 

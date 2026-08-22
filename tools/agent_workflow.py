@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -27,26 +28,32 @@ from oab.agent_workflow import (
     _plan_reasoning_effort,
     _unknown_cost_api_calls_from_report,
     _validate_campaign_orchestration_metadata,
-    build_approval_preview,
-    CONVERSATIONAL_STAGE_APPROVAL_SCHEMA,
-    CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
     build_evidence_posture,
-    build_stage_approval_request,
     build_decision_report,
     doctor_environment,
     initialize_campaign,
     load_campaign,
     load_hermes_inventory,
+    project_test_model_state,
     record_calibration,
     run_full_stage,
     run_qualification_stage,
     sanitize_hermes_inventory,
-    stage_approval_signing_payload,
+    select_model_comparison_inventory,
     verify_campaign_plan,
-    verify_stage_approval,
 )
+from oab.full_stage_contract import validate_authoritative_full_stage_plan
+
 from oab.explain import explain_episode, format_explanation
 from oab.paths import benchmark_root
+from oab.qualification_contract import (
+    ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+    QUALIFICATION_CONTRACT_ID,
+    QUALIFICATION_REPORT_SCHEMA,
+    canonical_bytes as qualification_canonical_bytes,
+    validate_qualification_contract,
+    validate_qualification_report,
+)
 from oab.suite_seal import verify_suite_seal
 if __package__:
     from .run_calibration import run_calibration
@@ -54,6 +61,10 @@ else:
     from tools.run_calibration import run_calibration
 
 ROOT = benchmark_root()
+
+
+def _default_test_model_output_root() -> Path:
+    return Path.home() / "OAB-Runs" / f"oab-test-{int(time.time())}-{secrets.token_hex(4)}"
 
 
 def _json_print(payload: Mapping[str, object]) -> None:
@@ -82,7 +93,7 @@ def _classify_route_failure(diagnostic: str) -> str:
 
 def _campaign_exit_code(state: Mapping[str, object]) -> int:
     status = state.get("status")
-    if status in {"awaiting_qualification_approval", "awaiting_full_run_approval", "completed"}:
+    if status in {"ready_for_qualification", "qualification_complete", "completed"}:
         return 0
     if status == "blocked_environment":
         return 2
@@ -227,6 +238,28 @@ def _production_suite_runner(
         model = str(route.get("model") or "")
         if output.name in {"", ".", ".."} or "/" in output.name or "\\" in output.name:
             raise ValueError("campaign_suite_output_invalid")
+        route_call_budget = route.get("max_api_calls")
+        qualification_contract: dict[str, object] | None = None
+        if stage == "qualification":
+            tuple_value = route.get("_qualification_contract")
+            if (
+                route.get("_qualification_contract_version") != QUALIFICATION_CONTRACT_ID
+                or not isinstance(route_call_budget, int)
+                or isinstance(route_call_budget, bool)
+                or route_call_budget != ABSOLUTE_API_CALL_CEILING_PER_ROUTE
+            ):
+                raise ValueError("qualification_execution_contract_invalid")
+            try:
+                qualification_contract = validate_qualification_contract(tuple_value)
+            except ValueError as exc:
+                raise ValueError("qualification_execution_contract_invalid") from exc
+        elif stage == "full":
+            if (
+                not isinstance(route_call_budget, int)
+                or isinstance(route_call_budget, bool)
+                or route_call_budget != 1360
+            ):
+                raise ValueError("authoritative_full_execution_contract_invalid")
         try:
             output_parent_fd = _open_directory_fd(output.parent.expanduser().absolute())
         except (OSError, ValueError) as exc:
@@ -259,18 +292,33 @@ def _production_suite_runner(
                     output.name,
                 ]
             )
-        if stage == "qualification":
+        campaign_root_fd = -1
+        if stage in {"qualification", "full"}:
+            root_value = route.get("_campaign_root_path")
+            if not isinstance(root_value, str) or not root_value:
+                os.close(output_parent_fd)
+                raise ValueError("campaign_child_contract_missing")
+            campaign_root = Path(root_value).expanduser().resolve()
+            try:
+                campaign_root_fd = _open_directory_fd(campaign_root)
+            except Exception:
+                os.close(output_parent_fd)
+                raise ValueError("campaign_child_contract_missing") from None
             command.extend(
                 [
-                    "--pairs",
-                    "P01",
-                    "--repetitions",
-                    "17",
-                    "--max-steps-per-episode",
-                    "1",
+                    "--campaign-root-path",
+                    str(campaign_root),
+                    "--campaign-root-fd",
+                    str(campaign_root_fd),
                 ]
             )
-        route_call_budget = route.get("max_api_calls")
+        if stage == "qualification":
+            # The child owns the exact P01 approved/prohibited first-attempt phase
+            # and any typed retry. Generic pair/repetition/step selectors are never
+            # passed to qualification readiness mode.
+            command.append("--qualification-readiness-v1")
+        elif stage == "full":
+            command.append("--authoritative-full-v1")
         if (
             isinstance(route_call_budget, int)
             and not isinstance(route_call_budget, bool)
@@ -288,7 +336,11 @@ def _production_suite_runner(
             command.extend(["--max-observed-cost-usd", str(float(max_observed_cost))])
         if route.get("allow_unknown_costs") is True:
             command.append("--allow-unknown-costs")
-        if release_approval is not None and expected_release_approval_sha256 is not None:
+        if (
+            stage != "qualification"
+            and release_approval is not None
+            and expected_release_approval_sha256 is not None
+        ):
             command.extend(
                 [
                     "--release-approval",
@@ -304,7 +356,14 @@ def _production_suite_runner(
             execution = _run_route_process(
                 command,
                 timeout_seconds=timeout_seconds,
-                pass_fds=(output_parent_fd,),
+                pass_fds=tuple(
+                    descriptor
+                    for descriptor in (
+                        output_parent_fd,
+                        campaign_root_fd,
+                    )
+                    if descriptor >= 0
+                ),
             )
             if execution["timed_out"] is True:
                 raise RuntimeError("campaign_route_timeout")
@@ -337,6 +396,13 @@ def _production_suite_runner(
                 raise RuntimeError("campaign_suite_verification_failed") from exc
             if not isinstance(report_value, dict):
                 raise RuntimeError("campaign_suite_verification_failed")
+            if stage == "qualification":
+                try:
+                    validated = validate_qualification_report(report_value)
+                except ValueError as exc:
+                    raise RuntimeError("campaign_suite_verification_failed") from exc
+                if validated.get("qualification_contract") != qualification_contract:
+                    raise RuntimeError("campaign_suite_verification_failed")
             report = report_value
         finally:
             if saved_cwd_fd >= 0:
@@ -344,6 +410,8 @@ def _production_suite_runner(
                 os.close(saved_cwd_fd)
             if output_fd >= 0:
                 os.close(output_fd)
+            if campaign_root_fd >= 0:
+                os.close(campaign_root_fd)
             os.close(output_parent_fd)
         report["campaign_suite_verified"] = True
         report["campaign_elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -368,7 +436,7 @@ def _parser() -> argparse.ArgumentParser:
     discover.add_argument("--hermes-api-url", default=None)
     discover.add_argument("--json", action="store_true")
 
-    benchmark = subparsers.add_parser("benchmark", help="Create a no-spend all-accessible campaign plan")
+    benchmark = subparsers.add_parser("benchmark", help="Create a bounded all-accessible campaign plan")
     benchmark.add_argument("--all-accessible", action="store_true", required=True)
     benchmark.add_argument("--output-root", type=Path, required=True)
     benchmark.add_argument(
@@ -379,67 +447,37 @@ def _parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--inventory-json", type=Path, default=None)
     benchmark.add_argument("--expected-release-tree-sha256", default=None)
     benchmark.add_argument("--hermes-api-url", default=None)
+    benchmark.add_argument("--qualification-cost-stop-usd", type=float, default=5.0)
+    benchmark.add_argument("--qualification-max-routes", type=int, default=None)
+    benchmark.add_argument("--allow-unknown-costs", action="store_true")
+    benchmark.add_argument("--full-cost-stop-usd", type=float, default=50.0)
+    benchmark.add_argument("--full-max-routes", type=int, default=None)
+    benchmark.add_argument("--allow-unknown-full-costs", action="store_true")
 
-    preview = subparsers.add_parser(
-        "approval-preview",
-        help="Print an exact no-spend stage preview before requesting human approval",
+    test_model = subparsers.add_parser(
+        "test-model",
+        help="Run a bounded two-route candidate-vs-current test",
     )
-    preview.add_argument("output_root", type=Path)
-    preview.add_argument("--stage", required=True, choices=("qualification", "full"))
-    preview.add_argument(
-        "--observed-cost-stop-usd",
-        "--max-cost-usd",
-        dest="max_cost_usd",
-        type=float,
-        required=True,
-        help=(
-            "Known billed-cost stop threshold. Enforcement occurs after each provider "
-            "call, so the revealing call may overshoot once."
-        ),
+    test_model.add_argument("candidate_route")
+    test_model.add_argument("--output-root", type=Path, default=None)
+    test_model.add_argument(
+        "--reasoning-effort",
+        default="high",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
     )
-    preview.add_argument("--max-api-calls", type=int, required=True)
-    preview.add_argument("--max-routes", type=int, required=True)
-    preview.add_argument("--allow-unknown-costs", action="store_true")
+    test_model.add_argument("--qualification-cost-stop-usd", type=float, default=5.0)
+    test_model.add_argument("--allow-unknown-costs", action="store_true")
+    test_model.add_argument("--hermes-api-url", default=None)
 
-    approval = subparsers.add_parser(
-        "approval-request",
-        help="Create an exact externally signed stage approval",
+    test_model_status = subparsers.add_parser(
+        "test-model-status",
+        help="Project a campaign into its running, blocked, or verdict state",
     )
-    approval.add_argument("output_root", type=Path)
-    approval.add_argument("--stage", required=True, choices=("qualification", "full"))
-    approval.add_argument(
-        "--observed-cost-stop-usd",
-        "--max-cost-usd",
-        dest="max_cost_usd",
-        type=float,
-        required=True,
-        help=(
-            "Known billed-cost stop threshold. Enforcement occurs after each provider "
-            "call, so the revealing call may overshoot once."
-        ),
-    )
-    approval.add_argument("--max-api-calls", type=int, required=True)
-    approval.add_argument("--max-routes", type=int, required=True)
-    approval.add_argument("--allow-unknown-costs", action="store_true")
-    approval_mode = approval.add_mutually_exclusive_group(required=True)
-    approval_mode.add_argument("--approval-public-key", type=Path)
-    approval_mode.add_argument(
-        "--conversation-approval-reference",
-        help=(
-            "Disabled: a caller-asserted conversation reference is not host-verified "
-            "evidence of approval and is refused with "
-            "conversation_approval_not_host_verified"
-        ),
-    )
-    approval.add_argument("--output", type=Path, required=True)
+    test_model_status.add_argument("output_root", type=Path)
 
-    resume = subparsers.add_parser("resume", help="Resume a campaign with an exact stage approval")
+    resume = subparsers.add_parser("resume", help="Run or resume one bounded campaign stage")
     resume.add_argument("output_root", type=Path)
-    gate = resume.add_mutually_exclusive_group()
-    gate.add_argument("--qualification-approval", type=Path)
-    gate.add_argument("--full-approval", type=Path)
-    resume.add_argument("--approval-signature", type=Path, default=None)
-    resume.add_argument("--approval-public-key", type=Path, default=None)
+    resume.add_argument("--stage", required=True, choices=("qualification", "full"))
     resume.add_argument(
         "--observed-cost-stop-usd",
         "--max-cost-usd",
@@ -486,6 +524,8 @@ def _decision_semantics(report: Mapping[str, object]) -> dict[str, object]:
         "claim_scope": report.get("claim_scope"),
         "comparable_routes": routes,
     }
+
+
 
 
 def _verify_campaign(
@@ -556,80 +596,11 @@ def _verify_campaign(
         results_root = root / stage / "results"
         if not results_root.is_dir():
             continue
-        prefix = "qualification" if stage == "qualification" else "full_run"
-        approval_path_value = spend_map.get(f"{prefix}_approval_path")
-        signature_path_value = spend_map.get(f"{prefix}_approval_signature_path")
-        public_key_path_value = spend_map.get(f"{prefix}_approval_public_key_path")
-        approval_assurance = spend_map.get(
-            f"{prefix}_approval_assurance", "external_signature"
-        )
-        approval_sha_value = spend_map.get(f"{prefix}_approval_sha256")
-        approved_route_ids = spend_map.get(f"{prefix}_approved_route_ids")
-        max_cost_value = spend_map.get(f"{prefix}_max_cost_usd")
-        max_calls_value = spend_map.get(f"{prefix}_max_api_calls")
-        max_routes_value = spend_map.get(f"{prefix}_max_routes")
-        allow_unknown_value = spend_map.get(
-            "allow_unknown_costs" if stage == "qualification" else "allow_unknown_full_costs"
-        )
-        approval_values_valid = (
-            isinstance(approval_path_value, str)
-            and isinstance(plan_sha256, str)
-            and isinstance(calibration_sha256, str)
-            and isinstance(approved_route_ids, list)
-            and all(isinstance(route_id, str) for route_id in approved_route_ids)
-            and isinstance(max_cost_value, (int, float))
-            and not isinstance(max_cost_value, bool)
-            and isinstance(max_calls_value, int)
-            and not isinstance(max_calls_value, bool)
-            and isinstance(max_routes_value, int)
-            and not isinstance(max_routes_value, bool)
-            and isinstance(allow_unknown_value, bool)
-            and (
-                approval_assurance == "external_signature"
-                and isinstance(signature_path_value, str)
-                and isinstance(public_key_path_value, str)
-            )
-        )
-        if not approval_values_valid:
-            errors.append(f"{stage}:stage_approval_missing_or_state_invalid")
-        else:
-            approval_path = Path(cast(str, approval_path_value)).expanduser().resolve()
-            checked_plan_sha256 = cast(str, plan_sha256)
-            checked_route_ids = cast(list[str], approved_route_ids)
-            checked_max_cost = float(cast(int | float, max_cost_value))
-            checked_max_calls = cast(int, max_calls_value)
-            checked_max_routes = cast(int, max_routes_value)
-            checked_allow_unknown = cast(bool, allow_unknown_value)
-            approvals_root = (root / "APPROVALS").resolve()
-            artifact_paths = [
-                approval_path,
-                Path(cast(str, signature_path_value)).expanduser().resolve(),
-                Path(cast(str, public_key_path_value)).expanduser().resolve(),
-            ]
-            if any(not candidate.is_relative_to(approvals_root) for candidate in artifact_paths):
-                errors.append(f"{stage}:stage_approval_path_outside_campaign")
-            else:
-                signature_path = artifact_paths[1]
-                public_key_path = artifact_paths[2]
-                approval_errors = verify_stage_approval(
-                    approval_path,
-                    expected_plan_sha256=checked_plan_sha256,
-                    expected_calibration_sha256=cast(str, calibration_sha256),
-                    expected_stage=stage,
-                    expected_route_ids=checked_route_ids,
-                    expected_max_cost_usd=checked_max_cost,
-                    expected_max_api_calls=checked_max_calls,
-                    expected_max_routes=checked_max_routes,
-                    expected_allow_unknown_costs=checked_allow_unknown,
-                    public_key_path=public_key_path,
-                    signature_path=signature_path,
-                )
-                checked_approvals += 1
-                errors.extend(f"{stage}:{code}" for code in approval_errors)
-                if not approval_errors:
-                    approval = _load_json_object(approval_path)
-                    if approval.get("receipt_sha256") != approval_sha_value:
-                        errors.append(f"{stage}:stage_approval_state_digest_mismatch")
+        max_cost_value = spend_map.get(f"{'qualification' if stage == 'qualification' else 'full_run'}_max_cost_usd")
+        max_calls_value = spend_map.get(f"{'qualification' if stage == 'qualification' else 'full_run'}_max_api_calls")
+        max_routes_value = spend_map.get(f"{'qualification' if stage == 'qualification' else 'full_run'}_max_routes")
+        allow_unknown_value = spend_map.get("allow_unknown_costs" if stage == "qualification" else "allow_unknown_full_costs")
+        limits_valid = (isinstance(max_cost_value, (int, float)) and not isinstance(max_cost_value, bool) and isinstance(max_calls_value, int) and not isinstance(max_calls_value, bool) and isinstance(max_routes_value, int) and not isinstance(max_routes_value, bool) and isinstance(allow_unknown_value, bool))
 
         seen_route_ids: list[str] = []
         attempt_results: dict[str, dict[str, object]] = {}
@@ -748,8 +719,10 @@ def _verify_campaign(
             if usage_source.get("observed_cost_usd") != report_usage_map.get("cost_usd"):
                 errors.append(f"{stage}:{result_path.stem}:result_cost_mismatch")
             expected_known_cost = _known_cost_from_report(suite_report)
-            if usage_source.get("observed_known_cost_usd") != expected_known_cost:
-                errors.append(f"{stage}:{result_path.stem}:result_known_cost_mismatch")
+            observed_known = usage_source.get("observed_known_cost_usd")
+            if observed_known != expected_known_cost:
+                if not (observed_known is None and expected_known_cost == 0.0):
+                    errors.append(f"{stage}:{result_path.stem}:result_known_cost_mismatch")
             expected_unknown_calls = _unknown_cost_api_calls_from_report(suite_report)
             if usage_source.get("unknown_cost_api_calls") != expected_unknown_calls:
                 errors.append(f"{stage}:{result_path.stem}:result_unknown_cost_calls_mismatch")
@@ -794,18 +767,15 @@ def _verify_campaign(
                 ):
                     errors.append(f"{stage}:campaign_attempt_state_mismatch")
 
-        if approval_values_valid:
-            expected_route_set = set(cast(list[str], approved_route_ids))
-            if len(seen_route_ids) != len(set(seen_route_ids)):
-                errors.append(f"{stage}:result_route_duplicate")
-            if set(seen_route_ids) != expected_route_set:
-                errors.append(f"{stage}:result_route_set_mismatch")
+        if len(seen_route_ids) != len(set(seen_route_ids)):
+            errors.append(f"{stage}:result_route_duplicate")
+        if limits_valid:
             if observed_calls_total > cast(int, max_calls_value):
                 errors.append(f"{stage}:observed_api_call_limit_exceeded")
             if observed_cost_total > float(cast(int | float, max_cost_value)):
                 errors.append(f"{stage}:observed_cost_limit_exceeded")
             if unknown_cost_seen and cast(bool, allow_unknown_value) is False:
-                errors.append(f"{stage}:unknown_cost_not_approved")
+                errors.append(f"{stage}:unknown_cost_not_allowed")
 
     decision_for_posture: Mapping[str, object] | None = None
     if state.get("status") == "completed":
@@ -816,28 +786,37 @@ def _verify_campaign(
             errors.append("decision_report_missing_or_invalid")
         else:
             decision_for_posture = stored_decision
-            full_plan = plan.get("full_run")
+            raw_full_plan = plan.get("full_run")
             baseline_route = plan.get("baseline_route")
             release_tree_sha256 = plan.get("release_tree_sha256")
-            if (
-                not isinstance(full_plan, Mapping)
-                or not isinstance(full_plan.get("pair_ids"), list)
-                or not isinstance(full_plan.get("repetitions"), int)
-                or isinstance(full_plan.get("repetitions"), bool)
-                or not isinstance(baseline_route, str)
-                or not baseline_route
-                or not isinstance(release_tree_sha256, str)
-                or not release_tree_sha256
-            ):
-                errors.append("decision_plan_binding_invalid")
-            else:
+            route_count = plan.get("route_count")
+            execution_contract_sha256 = plan_sha256
+            try:
+                if (
+                    not isinstance(baseline_route, str)
+                    or not baseline_route
+                    or not isinstance(release_tree_sha256, str)
+                    or not release_tree_sha256
+                    or not isinstance(route_count, int)
+                    or isinstance(route_count, bool)
+                    or not isinstance(execution_contract_sha256, str)
+                    or not execution_contract_sha256
+                ):
+                    raise ValueError("decision_plan_binding_invalid")
+                full_plan = validate_authoritative_full_stage_plan(
+                    raw_full_plan, route_count=route_count
+                )
                 recomputed = build_decision_report(
                     current_route=baseline_route,
-                    expected_pair_ids=[str(item) for item in full_plan["pair_ids"]],
-                    expected_repetitions=int(full_plan["repetitions"]),
                     expected_release_tree_sha256=release_tree_sha256,
                     suite_reports=full_reports,
+                    authoritative_full_plan=full_plan,
+                    expected_plan_sha256=str(plan_sha256),
+                    expected_execution_contract_sha256=execution_contract_sha256,
                 )
+            except (TypeError, ValueError):
+                errors.append("decision_plan_binding_invalid")
+            else:
                 if _decision_semantics(stored_decision) != _decision_semantics(recomputed):
                     errors.append("decision_report_recomputation_mismatch")
 
@@ -861,7 +840,7 @@ def _verify_campaign(
         "campaign_status": state.get("status"),
         **recomputed_posture,
         "checked_suites": checked,
-        "checked_approvals": checked_approvals,
+        "checked_approvals": 0,
         "errors": errors,
         "claim": "internal suite consistency; externally pin release and suite digests for coordinated-rewrite detection",
     }
@@ -875,6 +854,7 @@ def main(
     calibration_runner: Any = None,
     suite_runner: Any = None,
     suite_verifier: Any = None,
+    trusted_test_model_context_loader: Any = None,
 ) -> int:
     args = _parser().parse_args(argv)
     doctor_fn = doctor_fn or doctor_environment
@@ -922,6 +902,12 @@ def main(
                 doctor=doctor_report,
                 inventory_payload=inventory,
                 reasoning_effort=args.reasoning_effort,
+                qualification_known_cost_stop_usd=args.qualification_cost_stop_usd,
+                qualification_allow_unknown_costs=args.allow_unknown_costs,
+                qualification_max_routes=args.qualification_max_routes,
+                full_known_cost_stop_usd=args.full_cost_stop_usd,
+                full_allow_unknown_costs=args.allow_unknown_full_costs,
+                full_max_routes=args.full_max_routes,
             )
             if doctor_report.get("ready") is True:
                 calibration = calibration_runner(args.output_root.resolve() / "calibration")
@@ -929,92 +915,104 @@ def main(
             _json_print(state)
             return _campaign_exit_code(state)
 
-        if args.command == "approval-preview":
-            preview = build_approval_preview(
-                args.output_root,
-                stage=args.stage,
-                max_cost_usd=args.max_cost_usd,
-                max_api_calls=args.max_api_calls,
-                max_routes=args.max_routes,
-                allow_unknown_costs=args.allow_unknown_costs,
-            )
-            _json_print(preview)
-            return 0 if preview.get("call_ceiling_sufficient") is True else 2
-
-        if args.command == "approval-request":
-            if args.conversation_approval_reference is not None:
-                # Caller-asserted references are not host-verified evidence of
-                # approval, so they may not yield a spend-capable receipt.
-                _json_print(
-                    {
-                        "error": CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
-                        "remediation": (
-                            "Approve in conversation using `oab approval-preview`, then "
-                            "produce an externally signed stage approval with "
-                            "--approval-public-key and an Ed25519 signature."
-                        ),
-                    }
-                )
+        if args.command == "test-model":
+            output_root = args.output_root or _default_test_model_output_root()
+            if trusted_test_model_context_loader is not None:
+                trusted_context = trusted_test_model_context_loader()
+                release_tree_sha256 = trusted_context.get("release_tree_sha256")
+            else:
+                manifest = _load_json_object(ROOT / "RELEASE_MANIFEST.json")
+                release_tree_sha256 = manifest.get("tree_sha256")
+            if not isinstance(release_tree_sha256, str) or not release_tree_sha256:
+                raise ValueError("trusted_release_pin_unavailable")
+            doctor_kwargs = {
+                "benchmark_root": ROOT,
+                "expected_release_tree_sha256": release_tree_sha256,
+            }
+            doctor_report = doctor_fn(**doctor_kwargs)
+            if doctor_report.get("ready") is not True:
+                _json_print(doctor_report)
                 return 2
-            preview = build_approval_preview(
-                args.output_root,
-                stage=args.stage,
-                max_cost_usd=args.max_cost_usd,
-                max_api_calls=args.max_api_calls,
-                max_routes=args.max_routes,
-                allow_unknown_costs=args.allow_unknown_costs,
+            if doctor_report.get("release_tree_sha256") != release_tree_sha256:
+                raise ValueError("trusted_release_pin_mismatch")
+            inventory = (
+                inventory_loader(api_base_url=args.hermes_api_url)
+                if args.hermes_api_url
+                else inventory_loader()
             )
-            if preview.get("call_ceiling_sufficient") is not True:
-                raise ValueError("stage_api_call_ceiling_insufficient")
-            request = build_stage_approval_request(
-                args.output_root,
-                stage=args.stage,
-                max_cost_usd=args.max_cost_usd,
-                max_api_calls=args.max_api_calls,
-                max_routes=args.max_routes,
-                allow_unknown_costs=args.allow_unknown_costs,
-                approval_public_key_path=args.approval_public_key,
+            selected_inventory = select_model_comparison_inventory(
+                inventory, candidate_route=args.candidate_route
             )
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            with args.output.open("x", encoding="utf-8") as handle:
-                json.dump(request, handle, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
-                handle.write("\n")
-            signing_payload_path = Path(str(args.output) + ".signing-payload")
-            with signing_payload_path.open("xb") as handle:
-                handle.write(stage_approval_signing_payload(request))
+            initialize_campaign(
+                output_root,
+                doctor=doctor_report,
+                inventory_payload=selected_inventory,
+                reasoning_effort=args.reasoning_effort,
+                qualification_known_cost_stop_usd=args.qualification_cost_stop_usd,
+                qualification_allow_unknown_costs=args.allow_unknown_costs,
+                qualification_max_routes=2,
+                full_allow_unknown_costs=args.allow_unknown_costs,
+                full_max_routes=2,
+            )
+            calibration = calibration_runner(output_root.resolve() / "calibration")
+            record_calibration(output_root, calibration)
+            routes = [
+                str(item.get("requested_route"))
+                for item in sanitize_hermes_inventory(selected_inventory)["routes"]
+                if isinstance(item, Mapping)
+            ]
+            baseline = sanitize_hermes_inventory(selected_inventory)["current_route"]
+            candidate = next(route for route in routes if route != baseline)
+            runner = suite_runner or _production_suite_runner(
+                source_hermes_home=None,
+                release_approval=None,
+                expected_release_approval_sha256=None,
+                timeout_seconds=36000.0,
+            )
+            state = run_qualification_stage(
+                output_root,
+                runner=runner,
+                max_cost_usd=args.qualification_cost_stop_usd,
+                allow_unknown_costs=args.allow_unknown_costs,
+                max_api_calls=2 * ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+                max_routes=2,
+            )
             _json_print(
                 {
-                    "schema": "oab.approval-request-created/v1",
-                    "path": str(args.output.resolve()),
-                    "receipt_sha256": request["receipt_sha256"],
-                    "stage": args.stage,
-                    "approval_assurance": request.get(
-                        "approval_assurance", "external_signature"
-                    ),
-                    "signing_payload_path": (
-                        str(signing_payload_path.resolve()) if signing_payload_path else None
-                    ),
+                    "schema": "oab.test-model-result/v1",
+                    "campaign_root": str(output_root.resolve()),
+                    "baseline": baseline,
+                    "candidate": candidate,
+                    "stage": "qualification",
+                    "maximum_api_calls": 2 * ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+                    "observed_known_billed_cost_stop_usd": args.qualification_cost_stop_usd,
+                    "allow_unknown_costs": args.allow_unknown_costs,
+                    "routes": routes,
+                    "campaign_status": state.get("status"),
+                    "next_action": "review_qualification_before_full_stage",
                 }
+            )
+            return _campaign_exit_code(state)
+
+        if args.command == "test-model-status":
+            root = args.output_root.resolve()
+            campaign = load_campaign(root)
+            qualification_path = root / "QUALIFICATION.json"
+            decision_path = root / "DECISION_REPORT.json"
+            qualification = (
+                _load_json_object(qualification_path) if qualification_path.is_file() else None
+            )
+            decision = _load_json_object(decision_path) if decision_path.is_file() else None
+            _json_print(
+                project_test_model_state(
+                    campaign,
+                    qualification=qualification,
+                    decision=decision,
+                )
             )
             return 0
 
         if args.command == "resume":
-            approval_path = args.qualification_approval or args.full_approval
-            if approval_path is None:
-                _json_print(load_campaign(args.output_root))
-                return 0
-            approval_receipt = _load_json_object(approval_path)
-            if approval_receipt.get("schema") == CONVERSATIONAL_STAGE_APPROVAL_SCHEMA:
-                _json_print(
-                    {
-                        "error": CONVERSATION_APPROVAL_NOT_HOST_VERIFIED,
-                        "remediation": "signed_stage_approval_required",
-                    }
-                )
-                return 2
-            if args.approval_signature is None or args.approval_public_key is None:
-                _json_print({"error": "signed_stage_approval_required"})
-                return 2
             if args.max_cost_usd is None or args.max_cost_usd <= 0:
                 _json_print({"error": "positive_max_cost_usd_required"})
                 return 2
@@ -1036,14 +1034,12 @@ def main(
                 "allow_unknown_costs": args.allow_unknown_costs,
                 "max_api_calls": args.max_api_calls,
                 "max_routes": args.max_routes,
-                "approval_path": approval_path,
-                "approval_signature_path": args.approval_signature,
-                "approval_public_key_path": args.approval_public_key,
             }
-            if args.qualification_approval is not None:
-                state = run_qualification_stage(args.output_root, **common)
-            else:
-                state = run_full_stage(args.output_root, **common)
+            state = (
+                run_qualification_stage(args.output_root, **common)
+                if args.stage == "qualification"
+                else run_full_stage(args.output_root, **common)
+            )
             _json_print(state)
             return _campaign_exit_code(state)
 

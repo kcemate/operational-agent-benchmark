@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "operational-agent-benchmark"
-version = "2.2.3"
+version = "2.3.0"
 description = "A deterministic matched-pair benchmark for operational agent harness model switching"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "OAB Contributors"}]
-dependencies = ["PyYAML>=6.0", "cryptography>=44"]
+dependencies = ["PyYAML>=6.0"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3.11",

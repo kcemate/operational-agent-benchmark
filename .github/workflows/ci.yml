@@ -42,6 +42,8 @@ jobs:
         run: |
           base="$(mktemp -d)"
           python tools/run_calibration.py --output-root "$base/calibration"
+      - name: Run offline qualification acceptance gate
+        run: python tools/qualification_acceptance.py --json
       - name: Scan public tree
         run: |
           printf 'OAB_PRIVATE_RELEASE_%s\n' 'CANARY_DO_NOT_COMMIT' > "$RUNNER_TEMP/oab-public-denylist.txt"
@@ -75,5 +77,7 @@ jobs:
         run: |
           base="$(mktemp -d)"
           python tools/run_calibration.py --output-root "$base/calibration"
+      - name: Run offline qualification acceptance gate
+        run: python tools/qualification_acceptance.py --json
       - name: Verify release manifest
         run: python tools/release_manifest.py --verify RELEASE_MANIFEST.json

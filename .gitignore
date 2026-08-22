@@ -11,3 +11,6 @@ run-roots/
 evidence/
 suite-report.json
 HEADLINE.txt
+
+# Local agent runtime (never commit secrets)
+.hermes/

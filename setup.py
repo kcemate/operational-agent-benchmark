@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import stat
+import json
 from pathlib import Path
 
 from setuptools import setup
@@ -10,6 +11,7 @@ from setuptools.command.build_py import build_py
 ROOT = Path(__file__).resolve().parent
 EXCLUDED_PARTS = {
     ".git",
+    ".hermes",  # local agent runtime/plans: git-ignored, never release content
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
@@ -22,16 +24,17 @@ EXCLUDED_NAMES = {".DS_Store"}
 
 
 def release_files() -> list[Path]:
-    files: list[Path] = []
-    for path in sorted(ROOT.rglob("*")):
-        relative = path.relative_to(ROOT)
-        if any(
-            part in EXCLUDED_PARTS or part.endswith(".egg-info")
-            for part in relative.parts
-        ):
-            continue
-        if relative.name in EXCLUDED_NAMES or relative.suffix in EXCLUDED_SUFFIXES:
-            continue
+    manifest_path = ROOT / "RELEASE_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise RuntimeError("release manifest files invalid")
+    files = [Path("RELEASE_MANIFEST.json")]
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise RuntimeError("release manifest entry invalid")
+        relative = Path(entry["path"])
+        path = ROOT / relative
         try:
             info = path.lstat()
         except OSError as exc:
@@ -40,6 +43,8 @@ def release_files() -> list[Path]:
             raise RuntimeError(f"release source symlink rejected: {relative}")
         if stat.S_ISREG(info.st_mode):
             files.append(relative)
+        else:
+            raise RuntimeError(f"release source is not regular: {relative}")
     return files
 
 

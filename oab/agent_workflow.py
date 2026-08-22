@@ -19,12 +19,40 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .campaign_contract import (
+    CAMPAIGN_PLAN_SCHEMA,
+    campaign_plan_sha256,
+    canonical_bytes as campaign_canonical_bytes,
+    canonical_sha256 as campaign_canonical_sha256,
+    validate_campaign_plan_document,
+)
+from .full_stage_contract import (
+    AUTHORITATIVE_FULL_PAIR_IDS,
+    FULL_API_CALL_CEILING_PER_ROUTE,
+    FULL_EPISODES_PER_ROUTE,
+    FULL_MAX_API_CALLS_PER_EPISODE,
+    FULL_REPETITIONS,
+    authoritative_full_contract_for_route_count,
+    validate_authoritative_stage_binding,
+    validate_authoritative_full_stage_plan,
+)
+from .qualification_contract import (
+    ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+    FIRST_ATTEMPT_API_CALL_CEILING_PER_ROUTE,
+    LOGICAL_PROBES_PER_ROUTE,
+    MAX_API_CALLS_PER_PHYSICAL_ATTEMPT,
+    QUALIFICATION_CONTRACT_ID,
+    QUALIFICATION_REPORT_SCHEMA,
+    assert_quality_free,
+    qualification_contract_for_route_count,
+    validate_qualification_contract,
+    validate_qualification_report,
+)
 
 _ACTIVE_CAMPAIGN_DIRECTORIES: contextvars.ContextVar[dict[Path, int] | None] = (
     contextvars.ContextVar("oab_active_campaign_directories", default=None)
@@ -33,10 +61,17 @@ _ACTIVE_CAMPAIGN_DIRECTORIES: contextvars.ContextVar[dict[Path, int] | None] = (
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _COST_CONTROL_MODE = "post_provider_call_observed_known_cost_stop"
 _MAX_COST_OVERSHOOT_API_CALLS = 1
-_QUALIFICATION_REPETITIONS = 17
+
+# Historical v2.2.3 qualification evidence may be read, but never executed.
 _QUALIFICATION_EPISODES_PER_ROUTE = 34
-_QUALIFICATION_MAX_API_CALLS_PER_EPISODE = 1
-_FULL_MAX_API_CALLS_PER_EPISODE = 17
+
+# v2.3.0 readiness execution is selected only by the signed explicit tuple.
+_QUALIFICATION_V230_PROBES_PER_ROUTE = LOGICAL_PROBES_PER_ROUTE
+_QUALIFICATION_V230_MAX_API_CALLS_PER_EPISODE = MAX_API_CALLS_PER_PHYSICAL_ATTEMPT
+_QUALIFICATION_V230_MAX_CALLS_PER_ROUTE = ABSOLUTE_API_CALL_CEILING_PER_ROUTE
+
+# Full-stage suite authority is intentionally imported from the immutable tuple.
+_FULL_MAX_API_CALLS_PER_EPISODE = FULL_MAX_API_CALLS_PER_EPISODE
 _PROVIDER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MODEL_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,256}$")
 _AUTH_REASON_CODES = {
@@ -55,6 +90,22 @@ _EFFORT_REASON_CODES = {
 LEGACY_V221_RELEASE_TREE_SHA256 = (
     "sha256:967445bec99f6df126ae5bbfd19cce47527f4cc50d78bd918ed8c339f8c99c68"
 )
+
+
+def _qualification_execution_contract(plan: Mapping[str, object]) -> str:
+    """Return the sole signed qualification execution selector or fail closed."""
+    qualification = plan.get("qualification")
+    route_count = plan.get("route_count")
+    if not isinstance(route_count, int) or isinstance(route_count, bool) or route_count < 1:
+        raise ValueError("qualification_execution_contract_invalid")
+    try:
+        validated = validate_campaign_plan_document(plan)
+    except ValueError as exc:
+        raise ValueError("qualification_execution_contract_invalid") from exc
+    if validated.get("qualification") != qualification:
+        raise ValueError("qualification_execution_contract_invalid")
+    validate_qualification_contract(qualification, route_count=route_count)
+    return QUALIFICATION_CONTRACT_ID
 
 
 def _utc_now() -> str:
@@ -142,12 +193,7 @@ def _normalize_campaign_result_report(
 
 
 def _plan_sha256(plan: Mapping[str, object]) -> str:
-    stable = {
-        key: value
-        for key, value in plan.items()
-        if key not in {"created_at", "status", "spend_authorized", "plan_sha256"}
-    }
-    return _canonical_sha256(stable)
+    return campaign_plan_sha256(plan)
 
 
 def _clean_provider(value: object) -> str | None:
@@ -385,7 +431,6 @@ def _read_json_directory_fd(
 
 
 _CAMPAIGN_INTERNAL_DIRECTORIES = (
-    Path("APPROVALS"),
     Path("qualification"),
     Path("qualification/results"),
     Path("qualification/suites"),
@@ -939,7 +984,7 @@ def sanitize_hermes_inventory(payload: Mapping[str, object]) -> dict[str, object
         if row.get("authenticated") is False:
             continue
         provider = _clean_provider(row.get("slug"))
-        if provider is None or provider.lower() == "moa":
+        if provider is None:
             continue
         raw_models = row.get("models")
         models = raw_models if isinstance(raw_models, list) else []
@@ -998,182 +1043,219 @@ def sanitize_hermes_inventory(payload: Mapping[str, object]) -> dict[str, object
     }
 
 
+def select_model_comparison_inventory(
+    payload: Mapping[str, object], *, candidate_route: str
+) -> dict[str, object]:
+    """Return a secret-free inventory containing current + candidate only."""
+
+    discovery = sanitize_hermes_inventory(payload)
+    current = discovery.get("current_route")
+    if not isinstance(current, str) or not current:
+        raise ValueError("model_comparison_baseline_unavailable")
+    candidate = str(candidate_route or "").strip()
+    if candidate == current:
+        raise ValueError("model_comparison_routes_must_differ")
+    raw_routes = discovery.get("routes")
+    routes = raw_routes if isinstance(raw_routes, list) else []
+    by_requested = {
+        str(route.get("requested_route")): route
+        for route in routes
+        if isinstance(route, Mapping)
+    }
+    if candidate not in by_requested:
+        raise ValueError("model_comparison_candidate_unavailable")
+    if current not in by_requested:
+        raise ValueError("model_comparison_baseline_unavailable")
+
+    providers: dict[str, dict[str, object]] = {}
+    for requested in (current, candidate):
+        route = by_requested[requested]
+        provider = str(route["provider"])
+        model = str(route["model"])
+        row = providers.setdefault(
+            provider,
+            {"slug": provider, "authenticated": True, "models": [], "capabilities": {}},
+        )
+        models = row["models"]
+        assert isinstance(models, list)
+        models.append(model)
+        reasoning = route.get("reasoning_capability_catalogued")
+        if isinstance(reasoning, bool):
+            capabilities = row["capabilities"]
+            assert isinstance(capabilities, dict)
+            capabilities[model] = {"reasoning": reasoning}
+    return {
+        "provider": str(by_requested[current]["provider"]),
+        "model": str(by_requested[current]["model"]),
+        "providers": list(providers.values()),
+    }
+
+
+def project_test_model_state(
+    campaign: Mapping[str, object],
+    *,
+    qualification: Mapping[str, object] | None = None,
+    decision: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Project campaign internals into one bounded continuation state."""
+
+    status = campaign.get("status")
+    base: dict[str, object] = {
+        "schema": "oab.test-model-state/v1",
+        "campaign_id": campaign.get("campaign_id"),
+        "campaign_status": status,
+    }
+    if status == "ready_for_qualification":
+        return {**base, "state": "qualification_ready"}
+    if status == "qualification_complete":
+        summary = qualification or {}
+        return {
+            **base,
+            "state": "full_stage_ready",
+            "projected_full_run_cost_usd": summary.get("projected_full_run_cost_usd"),
+            "projected_full_run_duration_seconds": summary.get(
+                "projected_full_run_duration_seconds"
+            ),
+        }
+    if status == "completed":
+        report = decision or {}
+        return {
+            **base,
+            "state": "complete",
+            "recommendation": report.get("recommendation"),
+            "recommended_route": report.get("recommended_route"),
+            "evidence_posture": campaign.get("evidence_posture"),
+        }
+    terminal = {
+        "comparison_not_supportable",
+        "blocked_calibration",
+        "blocked_unknown_qualification_cost",
+        "blocked_unknown_qualification_api_calls",
+        "qualification_budget_exhausted",
+        "qualification_call_budget_exhausted",
+        "blocked_unknown_full_cost",
+        "blocked_unknown_full_api_calls",
+        "full_budget_exhausted",
+        "full_call_budget_exhausted",
+    }
+    if isinstance(status, str) and status in terminal:
+        return {**base, "state": "blocked", "blocker": status}
+    raise ValueError("test_model_campaign_state_invalid")
+
+
 def build_campaign_plan(
     discovery: Mapping[str, object],
     *,
     reasoning_effort: str,
-    release_tree_sha256: str | None = None,
-    pair_ids: Sequence[str] = ("P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08"),
-    repetitions: int = 5,
+    release_tree_sha256: str,
+    qualification_known_cost_stop_usd: float = 5.0,
+    qualification_allow_unknown_costs: bool = False,
+    qualification_max_routes: int | None = None,
+    full_known_cost_stop_usd: float = 50.0,
+    full_allow_unknown_costs: bool = False,
+    full_max_routes: int | None = None,
+    campaign_id: str | None = None,
+    pair_ids: Sequence[str] = AUTHORITATIVE_FULL_PAIR_IDS,
+    repetitions: int = FULL_REPETITIONS,
 ) -> dict[str, object]:
+    """Create the immutable v2 campaign authority root before calibration.
+
+    ``pair_ids`` and ``repetitions`` remain named parameters only to fail closed
+    for historical callers.  They cannot select a custom authoritative full
+    grid: the canonical 8x5 tuple is the sole accepted value.
+    """
     effort = reasoning_effort.strip().lower()
     if effort not in _ALLOWED_EFFORTS:
         raise ValueError("reasoning_effort_invalid")
     raw_routes = discovery.get("routes")
-    routes = raw_routes if isinstance(raw_routes, list) else []
-    if repetitions < 1:
-        raise ValueError("repetitions_invalid")
+    if not isinstance(raw_routes, list) or not raw_routes:
+        raise ValueError("campaign_plan_routes_invalid")
+    if list(pair_ids) != list(AUTHORITATIVE_FULL_PAIR_IDS) or repetitions != FULL_REPETITIONS:
+        raise ValueError("authoritative_full_contract_invalid")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", release_tree_sha256) is None:
+        raise ValueError("release_tree_sha256_invalid")
+
+    routes: list[dict[str, str]] = []
+    seen_route_ids: set[str] = set()
+    seen_requested: set[str] = set()
+    for raw_route in raw_routes:
+        if not isinstance(raw_route, Mapping):
+            raise ValueError("campaign_plan_routes_invalid")
+        provider = _clean_provider(raw_route.get("provider"))
+        model = _clean_model(raw_route.get("model"))
+        route_id = raw_route.get("route_id")
+        requested = raw_route.get("requested_route")
+        if (
+            provider is None
+            or model is None
+            or route_id != _route_id(provider, model)
+            or requested != f"{provider}/{model}"
+            or route_id in seen_route_ids
+            or requested in seen_requested
+        ):
+            raise ValueError("campaign_plan_routes_invalid")
+        seen_route_ids.add(route_id)
+        seen_requested.add(requested)
+        routes.append({"route_id": route_id, "requested_route": requested})
     route_count = len(routes)
-    qualification_per_route = _QUALIFICATION_EPISODES_PER_ROUTE
-    full_per_route = len(pair_ids) * 2 * repetitions
+    qualification_routes = route_count if qualification_max_routes is None else qualification_max_routes
+    full_routes = route_count if full_max_routes is None else full_max_routes
+    if (
+        not isinstance(qualification_routes, int)
+        or isinstance(qualification_routes, bool)
+        or not 1 <= qualification_routes <= route_count
+        or not isinstance(full_routes, int)
+        or isinstance(full_routes, bool)
+        or not 1 <= full_routes <= route_count
+        or not isinstance(qualification_allow_unknown_costs, bool)
+        or not isinstance(full_allow_unknown_costs, bool)
+    ):
+        raise ValueError("campaign_execution_controls_invalid")
+    baseline = discovery.get("current_route")
+    if not isinstance(baseline, str) or baseline not in seen_requested:
+        raise ValueError("campaign_plan_baseline_invalid")
+    identifier = campaign_id if isinstance(campaign_id, str) and campaign_id else secrets.token_hex(16)
     plan: dict[str, object] = {
-        "schema": "oab.campaign-plan/v1",
+        "schema": CAMPAIGN_PLAN_SCHEMA,
         "created_at": _utc_now(),
-        "status": "awaiting_calibration",
+        "campaign_id": identifier,
         "reasoning_effort": effort,
-        "baseline_route": discovery.get("current_route"),
+        "baseline_route": baseline,
         "release_tree_sha256": release_tree_sha256,
         "route_count": route_count,
-        "routes": [str(route.get("requested_route")) for route in routes if isinstance(route, Mapping)],
-        "qualification": {
-            "pair_ids": ["P01"],
-            "repetitions": _QUALIFICATION_REPETITIONS,
-            "episodes_per_route": qualification_per_route,
-            "scheduled_episodes": route_count * qualification_per_route,
+        "routes": routes,
+        "qualification": qualification_contract_for_route_count(route_count),
+        "qualification_execution": {
+            "known_cost_stop_usd": float(qualification_known_cost_stop_usd),
+            "max_api_calls": qualification_routes * ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+            "max_routes": qualification_routes,
+            "allow_unknown_costs": qualification_allow_unknown_costs,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
         },
-        "full_run": {
-            "pair_ids": list(pair_ids),
-            "repetitions": repetitions,
-            "episodes_per_route": full_per_route,
-            "scheduled_episodes": route_count * full_per_route,
+        "full_run": authoritative_full_contract_for_route_count(route_count),
+        "full_execution": {
+            "known_cost_stop_usd": float(full_known_cost_stop_usd),
+            "max_api_calls": full_routes * FULL_API_CALL_CEILING_PER_ROUTE,
+            "max_routes": full_routes,
+            "allow_unknown_costs": full_allow_unknown_costs,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
         },
-        "cost_estimate": {
-            "status": "unknown_until_qualification",
-            "estimated_usd": None,
-            "basis": "qualification usage telemetry is required before extrapolation",
-        },
-        "duration_estimate": {
-            "status": "unknown_until_qualification",
-            "estimated_seconds": None,
-            "basis": "qualification wall-clock telemetry is required before extrapolation",
-        },
-        "spend_authorized": False,
     }
     plan["plan_sha256"] = _plan_sha256(plan)
+    validate_campaign_plan_document(plan)
     return plan
 
 
 def verify_campaign_plan(plan: Mapping[str, object]) -> list[str]:
-    errors: list[str] = []
-    if plan.get("schema") != "oab.campaign-plan/v1":
-        errors.append("campaign_plan_schema_invalid")
-    if plan.get("plan_sha256") != _plan_sha256(plan):
-        errors.append("campaign_plan_digest_mismatch")
-    return errors
-
-
-def verify_stage_approval(
-    path: Path,
-    *,
-    expected_plan_sha256: str,
-    expected_calibration_sha256: str,
-    expected_stage: str,
-    expected_route_ids: Sequence[str],
-    expected_max_cost_usd: float,
-    expected_max_api_calls: int,
-    expected_max_routes: int,
-    expected_allow_unknown_costs: bool,
-    public_key_path: Path,
-    signature_path: Path,
-) -> list[str]:
     try:
-        receipt = _read_regular_json(path)
+        validate_campaign_plan_document(plan)
     except ValueError:
-        return ["stage_approval_invalid"]
-    errors: list[str] = []
-    body_fields = {
-        "schema",
-        "created_at",
-        "stage",
-        "plan_sha256",
-        "calibration_sha256",
-        "route_ids",
-        "observed_cost_stop_usd",
-        "cost_control_mode",
-        "max_cost_overshoot_api_calls",
-        "max_api_calls",
-        "max_routes",
-        "allow_unknown_costs",
-        "approval_public_key_sha256",
-    }
-    if set(receipt) != body_fields | {"receipt_sha256"}:
-        errors.append("stage_approval_fields_invalid")
-    if receipt.get("schema") != "oab.stage-approval/v4":
-        errors.append("stage_approval_schema_invalid")
-    if receipt.get("stage") != expected_stage:
-        errors.append("stage_approval_stage_mismatch")
-    if receipt.get("plan_sha256") != expected_plan_sha256:
-        errors.append("stage_approval_plan_mismatch")
-    if receipt.get("calibration_sha256") != expected_calibration_sha256:
-        errors.append("stage_approval_calibration_mismatch")
-    unsigned = {key: receipt.get(key) for key in body_fields}
-    try:
-        computed_receipt = _canonical_sha256(unsigned)
-        signed_bytes = _canonical_bytes(receipt)
-    except (TypeError, ValueError):
-        computed_receipt = None
-        signed_bytes = b""
-    if receipt.get("receipt_sha256") != computed_receipt:
-        errors.append("stage_approval_digest_mismatch")
-    route_ids = receipt.get("route_ids")
-    if not isinstance(route_ids, list) or not route_ids or any(
-        not isinstance(route_id, str) or not route_id for route_id in route_ids
-    ):
-        errors.append("stage_approval_routes_invalid")
-    elif route_ids != list(expected_route_ids):
-        errors.append("stage_approval_routes_mismatch")
-    elif len(set(route_ids)) != len(route_ids):
-        errors.append("stage_approval_routes_invalid")
-    max_cost = receipt.get("observed_cost_stop_usd")
-    if (
-        not isinstance(max_cost, (int, float))
-        or isinstance(max_cost, bool)
-        or not (float(max_cost) > 0.0)
-        or not (float(max_cost) < float("inf"))
-    ):
-        errors.append("stage_approval_cost_limit_invalid")
-    elif float(max_cost) != float(expected_max_cost_usd):
-        errors.append("stage_approval_cost_limit_mismatch")
-    if receipt.get("cost_control_mode") != _COST_CONTROL_MODE:
-        errors.append("stage_approval_cost_control_mode_invalid")
-    if receipt.get("max_cost_overshoot_api_calls") != _MAX_COST_OVERSHOOT_API_CALLS:
-        errors.append("stage_approval_cost_overshoot_limit_invalid")
-    max_calls = receipt.get("max_api_calls")
-    if not isinstance(max_calls, int) or isinstance(max_calls, bool) or max_calls < 1:
-        errors.append("stage_approval_api_call_limit_invalid")
-    elif max_calls != expected_max_api_calls:
-        errors.append("stage_approval_api_call_limit_mismatch")
-    max_routes = receipt.get("max_routes")
-    if not isinstance(max_routes, int) or isinstance(max_routes, bool) or max_routes < 1:
-        errors.append("stage_approval_route_limit_invalid")
-    elif max_routes != expected_max_routes:
-        errors.append("stage_approval_route_limit_mismatch")
-    allow_unknown = receipt.get("allow_unknown_costs")
-    if not isinstance(allow_unknown, bool):
-        errors.append("stage_approval_unknown_cost_policy_invalid")
-    elif allow_unknown != expected_allow_unknown_costs:
-        errors.append("stage_approval_unknown_cost_policy_mismatch")
-    try:
-        public_bytes = _read_single_link_regular_bytes(
-            public_key_path, error="stage_approval_public_key_invalid", max_bytes=16 * 1024
-        )
-        signature = _read_single_link_regular_bytes(
-            signature_path, error="stage_approval_signature_invalid", max_bytes=1024
-        )
-        public_key = serialization.load_pem_public_key(public_bytes)
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise ValueError("stage_approval_public_key_invalid")
-    except (ValueError, TypeError):
-        errors.append("stage_approval_signature_invalid")
-    else:
-        key_digest = "sha256:" + hashlib.sha256(public_bytes).hexdigest()
-        if receipt.get("approval_public_key_sha256") != key_digest:
-            errors.append("stage_approval_public_key_mismatch")
-        try:
-            public_key.verify(signature, signed_bytes)
-        except (InvalidSignature, ValueError):
-            errors.append("stage_approval_signature_invalid")
-    return errors
+        return ["campaign_plan_invalid"]
+    return []
+
+
 
 
 def _reason_codes(report: Mapping[str, object]) -> set[str]:
@@ -1189,12 +1271,160 @@ def _reason_codes(report: Mapping[str, object]) -> set[str]:
     return values
 
 
+def _classify_qualification_readiness(
+    report: Mapping[str, object],
+    *,
+    requested_route: str,
+    reasoning_effort: str,
+    allow_unknown_costs: bool,
+) -> dict[str, object]:
+    """Classify only the dedicated score-free readiness contract."""
+    usage = report.get("controller_usage")
+    usage_map = usage if isinstance(usage, Mapping) else {}
+
+    def number(name: str) -> float | None:
+        value = usage_map.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) >= 0:
+            return float(value)
+        return None
+
+    def count(name: str) -> int | None:
+        value = usage_map.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    identities: list[Mapping[str, object]] = []
+    attempts = report.get("attempts")
+    probes = report.get("probes")
+    if isinstance(attempts, list) and isinstance(probes, list):
+        by_id = {
+            item.get("attempt_id"): item
+            for item in attempts
+            if isinstance(item, Mapping) and isinstance(item.get("attempt_id"), str)
+        }
+        for probe in probes:
+            if not isinstance(probe, Mapping):
+                continue
+            selected = probe.get("selected_attempt")
+            selected_attempt = by_id.get(selected)
+            if isinstance(selected_attempt, Mapping) and isinstance(
+                selected_attempt.get("identity"), Mapping
+            ):
+                identities.append(selected_attempt["identity"])
+    identity_sources = {
+        identity.get("identity_source")
+        for identity in identities
+        if isinstance(identity.get("identity_source"), str)
+    }
+    config_digests = {
+        identity.get("controller_config_sha256")
+        for identity in identities
+        if isinstance(identity.get("controller_config_sha256"), str)
+    }
+    base: dict[str, object] = {
+        "requested_route": requested_route,
+        "status": "qualification_contract_invalid",
+        "reason_codes": [],
+        "observed_cost_usd": number("cost_usd"),
+        "observed_known_cost_usd": number("known_cost_usd"),
+        "unknown_cost_api_calls": count("unknown_cost_api_calls"),
+        "observed_duration_seconds": None,
+        "identity_source": next(iter(identity_sources)) if len(identity_sources) == 1 else None,
+        "controller_config_sha256": (
+            next(iter(config_digests)) if len(config_digests) == 1 else None
+        ),
+    }
+    try:
+        validated = validate_qualification_report(report)
+    except ValueError:
+        return base
+    reasons = validated["reason_codes"]
+    assert isinstance(reasons, list)
+    base["reason_codes"] = list(reasons)
+    if validated.get("requested_route") != requested_route:
+        base["status"] = "route_mismatch"
+        return base
+    if validated.get("reasoning_effort") != reasoning_effort:
+        base["status"] = "effort_incompatible"
+        return base
+    reason_set = set(reasons)
+    if reason_set.intersection(_EFFORT_REASON_CODES):
+        base["status"] = "effort_incompatible"
+        return base
+    if reason_set.intersection(_AUTH_REASON_CODES) or any("auth" in code.lower() for code in reason_set):
+        base["status"] = "authentication_invalid"
+        return base
+    if "provider_route_unavailable" in reason_set:
+        base["status"] = "route_unavailable"
+        return base
+    if "provider_rate_limited" in reason_set:
+        base["status"] = "provider_rate_limited"
+        return base
+    if "provider_unavailable" in reason_set:
+        base["status"] = "provider_unavailable"
+        return base
+    if count("api_calls") is None:
+        return base
+    unknown_cost_calls = count("unknown_cost_api_calls")
+    if unknown_cost_calls is None:
+        return base
+    if unknown_cost_calls > 0 and not allow_unknown_costs:
+        base["status"] = "cost_telemetry_unknown"
+        base["reason_codes"] = sorted(
+            {str(reason) for reason in reasons if isinstance(reason, str)}
+            | {"controller_cost_telemetry_unknown"}
+        )
+        return base
+    if len(identity_sources) != 1 or next(iter(identity_sources)) not in {
+        "provider_response",
+        "adapter_runtime",
+    }:
+        base["status"] = "identity_unattested"
+        return base
+    readiness = validated.get("readiness")
+    if readiness == "INCOMPATIBLE":
+        base["status"] = "agent_loop_incompatible"
+    elif readiness == "READY":
+        base["status"] = "qualified"
+    else:
+        base["status"] = "qualification_not_ready"
+    return base
+
+
 def classify_qualification(
     report: Mapping[str, object],
     *,
     requested_route: str,
     reasoning_effort: str,
+    execution_contract: str | None = None,
+    allow_unknown_costs: bool = False,
 ) -> dict[str, object]:
+    """Classify qualification results for route readiness.
+
+    Supports both:
+    - v2.2.3 (legacy): 34 one-call episodes per route, emits scoreable
+    - v2.3.0: 2 deterministic probes with up to 4 steps, never emits scoreable
+    """
+    if execution_contract == QUALIFICATION_CONTRACT_ID:
+        return _classify_qualification_readiness(
+            report,
+            requested_route=requested_route,
+            reasoning_effort=reasoning_effort,
+            allow_unknown_costs=allow_unknown_costs,
+        )
+    if execution_contract is not None:
+        # Historical generic reports remain read-only evidence. They cannot select,
+        # resume, or confer authority to the readiness execution contract.
+        return {
+            "requested_route": requested_route,
+            "status": "qualification_contract_invalid",
+            "reason_codes": [],
+            "observed_cost_usd": None,
+            "observed_known_cost_usd": None,
+            "unknown_cost_api_calls": None,
+            "observed_duration_seconds": None,
+            "identity_source": None,
+            "controller_config_sha256": None,
+        }
     try:
         orchestration_metadata = _validate_campaign_orchestration_metadata(report)
     except ValueError:
@@ -1214,7 +1444,7 @@ def classify_qualification(
         if isinstance(raw_known_cost, (int, float))
         and not isinstance(raw_known_cost, bool)
         and float(raw_known_cost) >= 0
-        else (observed_cost if observed_cost is not None else 0.0)
+        else None
     )
     raw_unknown_calls = usage_map.get("unknown_cost_api_calls")
     unknown_cost_api_calls = (
@@ -1222,17 +1452,25 @@ def classify_qualification(
         if isinstance(raw_unknown_calls, int)
         and not isinstance(raw_unknown_calls, bool)
         and raw_unknown_calls >= 0
-        else (0 if observed_cost is not None else None)
+        else None
     )
     observed_duration = (
         orchestration_metadata["campaign_elapsed_seconds"]
         if orchestration_metadata is not None
         else None
     )
+
+    scheduled = report.get("scheduled_episodes")
+    if execution_contract is not None and execution_contract != "v2.3.0":
+        raise ValueError("qualification_execution_contract_invalid")
+    is_v230_contract = (
+        execution_contract == "v2.3.0"
+        or scheduled == _QUALIFICATION_V230_PROBES_PER_ROUTE
+    )
+
     base: dict[str, object] = {
         "requested_route": requested_route,
         "status": "infrastructure_invalid",
-        "scoreable": False,
         "reason_codes": sorted(reasons),
         "observed_cost_usd": observed_cost,
         "observed_known_cost_usd": observed_known_cost,
@@ -1241,6 +1479,11 @@ def classify_qualification(
         "identity_source": report.get("identity_source"),
         "controller_config_sha256": report.get("controller_config_sha256"),
     }
+
+    # Only add scoreable field for legacy v2.2.3 contracts
+    if not is_v230_contract:
+        base["scoreable"] = False
+
     if report.get("requested_route") != requested_route:
         base["status"] = "route_mismatch"
         return base
@@ -1265,24 +1508,56 @@ def classify_qualification(
     if orchestration_metadata is None:
         base["status"] = "qualification_contract_invalid"
         return base
-    scheduled = report.get("scheduled_episodes")
+
     valid = report.get("infrastructure_valid_episodes")
     invalid = report.get("infrastructure_invalid_episodes")
     observed_api_calls = usage_map.get("api_calls")
-    if (
-        scheduled != _QUALIFICATION_EPISODES_PER_ROUTE
-        or valid != _QUALIFICATION_EPISODES_PER_ROUTE
-        or invalid != 0
-        or observed_api_calls != _QUALIFICATION_EPISODES_PER_ROUTE
-    ):
-        base["status"] = "qualification_contract_invalid"
-        return base
+
+    # v2.3.0 contract: 2 probes, expect 2 scheduled and valid
+    if is_v230_contract:
+        # Check for agent_loop_incompatible: both probes failed with controller_step_limit_exceeded
+        if (valid == 0 and invalid == _QUALIFICATION_V230_PROBES_PER_ROUTE and
+            all("controller_step_limit_exceeded" in obs.get("reason_codes", [])
+                for obs in (report.get("observations") or []))):
+            base["status"] = "agent_loop_incompatible"
+            return base
+        # Otherwise treat infrastructure failures normally
+        if valid != _QUALIFICATION_V230_PROBES_PER_ROUTE or invalid != 0:
+            base["status"] = "qualification_contract_invalid"
+            return base
+        # API-call counting is mandatory and locally enforceable. A missing or
+        # non-integer count means OAB cannot enforce its own spend ceiling, so the
+        # route is infrastructure-invalid rather than qualified (plan Task 4 step 1).
+        if not isinstance(observed_api_calls, int) or isinstance(observed_api_calls, bool):
+            base["status"] = "qualification_contract_invalid"
+            return base
+        # Two probes must each complete a real tool loop (>= 2 calls per probe) and
+        # can never exceed the signed absolute reserve of 24 calls per route.
+        if (
+            observed_api_calls
+            < _QUALIFICATION_V230_PROBES_PER_ROUTE * 2
+            or observed_api_calls > _QUALIFICATION_V230_MAX_CALLS_PER_ROUTE
+        ):
+            base["status"] = "qualification_contract_invalid"
+            return base
+    # v2.2.3 contract (legacy): 34 episodes, expect 34 scheduled and valid
+    else:
+        if (
+            scheduled != _QUALIFICATION_EPISODES_PER_ROUTE
+            or valid != _QUALIFICATION_EPISODES_PER_ROUTE
+            or invalid != 0
+            or observed_api_calls != _QUALIFICATION_EPISODES_PER_ROUTE
+        ):
+            base["status"] = "qualification_contract_invalid"
+            return base
+
     if report.get("identity_source") not in {"provider_response", "adapter_runtime"}:
         base["status"] = "identity_unattested"
         return base
     base["status"] = "qualified"
-    base["scoreable"] = True
-    base["authority_eligible"] = report.get("identity_source") == "provider_response"
+    # Only set authority_eligible for legacy contracts; v2.3.0 has no authority concept in qualification
+    if not is_v230_contract:
+        base["authority_eligible"] = report.get("identity_source") == "provider_response"
     return base
 
 
@@ -1292,6 +1567,12 @@ def initialize_campaign(
     doctor: Mapping[str, object],
     inventory_payload: Mapping[str, object],
     reasoning_effort: str,
+    qualification_known_cost_stop_usd: float = 5.0,
+    qualification_allow_unknown_costs: bool = False,
+    qualification_max_routes: int | None = None,
+    full_known_cost_stop_usd: float = 50.0,
+    full_allow_unknown_costs: bool = False,
+    full_max_routes: int | None = None,
     repository_root: Path | None = None,
 ) -> dict[str, object]:
     root = output_root.expanduser().resolve()
@@ -1306,18 +1587,27 @@ def initialize_campaign(
         or repository.is_relative_to(root)
     ):
         raise ValueError("campaign_and_benchmark_must_be_disjoint")
+
+    release_tree = doctor.get("release_tree_sha256")
+    if not isinstance(release_tree, str):
+        raise ValueError("release_tree_sha256_invalid")
     root.mkdir(parents=True, exist_ok=False)
     _validate_campaign_layout(root, create=True)
     discovery = sanitize_hermes_inventory(inventory_payload)
-    release_tree = doctor.get("release_tree_sha256")
     plan = build_campaign_plan(
         discovery,
         reasoning_effort=reasoning_effort,
-        release_tree_sha256=(release_tree if isinstance(release_tree, str) else None),
+        release_tree_sha256=release_tree,
+        qualification_known_cost_stop_usd=qualification_known_cost_stop_usd,
+        qualification_allow_unknown_costs=qualification_allow_unknown_costs,
+        qualification_max_routes=qualification_max_routes,
+        full_known_cost_stop_usd=full_known_cost_stop_usd,
+        full_allow_unknown_costs=full_allow_unknown_costs,
+        full_max_routes=full_max_routes,
     )
     ready = doctor.get("ready") is True
     status = "awaiting_calibration" if ready else "blocked_environment"
-    plan["status"] = status
+
     state: dict[str, object] = {
         "schema": "oab.campaign/v1",
         "created_at": _utc_now(),
@@ -1331,8 +1621,6 @@ def initialize_campaign(
         "full_run_routes": [],
         **build_evidence_posture([]),
         "spend": {
-            "qualification_approved": False,
-            "full_run_approved": False,
             "observed_cost_usd": 0.0,
             "unknown_cost_encountered": False,
         },
@@ -1372,7 +1660,7 @@ def record_calibration(output_root: Path, report: Mapping[str, object]) -> dict[
     _atomic_json(root / "CALIBRATION.json", receipt)
     state["calibration_passed"] = passed
     state["calibration_sha256"] = calibration_sha256
-    state["status"] = "awaiting_qualification_approval" if passed else "blocked_calibration"
+    state["status"] = "ready_for_qualification" if passed else "blocked_calibration"
     state["updated_at"] = _utc_now()
     _atomic_json(root / "CAMPAIGN.json", state)
     return state
@@ -1408,17 +1696,18 @@ def _campaign_routes(root: Path) -> list[dict[str, object]]:
 
 
 def _plan_bound_routes(root: Path, plan: Mapping[str, object]) -> list[dict[str, object]]:
-    planned_value = plan.get("routes")
-    if not isinstance(planned_value, list) or not planned_value or any(
-        not isinstance(route, str) or not route for route in planned_value
-    ):
-        raise ValueError("campaign_plan_routes_invalid")
-    planned_routes = [str(route) for route in planned_value]
-    if len(set(planned_routes)) != len(planned_routes):
+    """Reconstruct executable discovery rows only when they equal signed PLAN rows."""
+    try:
+        validated = validate_campaign_plan_document(plan)
+    except ValueError as exc:
+        raise ValueError("campaign_plan_routes_invalid") from exc
+    planned_value = validated["routes"]
+    assert isinstance(planned_value, list)
+    planned = [dict(item) for item in planned_value if isinstance(item, Mapping)]
+    if len(planned) != len(planned_value):
         raise ValueError("campaign_plan_routes_invalid")
     routes = _campaign_routes(root)
-    observed: list[str] = []
-    observed_ids: set[str] = set()
+    observed_by_id: dict[str, dict[str, object]] = {}
     for route in routes:
         provider = route.get("provider")
         model = route.get("model")
@@ -1431,17 +1720,26 @@ def _plan_bound_routes(root: Path, plan: Mapping[str, object]) -> list[dict[str,
             or not isinstance(route_id, str)
             or requested_route != f"{provider}/{model}"
             or route_id != _route_id(provider, model)
-            or route_id in observed_ids
+            or route_id in observed_by_id
         ):
             raise ValueError("campaign_discovery_plan_mismatch")
-        observed.append(requested_route)
-        observed_ids.add(route_id)
-    if observed != planned_routes:
+        observed_by_id[route_id] = route
+    if len(observed_by_id) != len(planned):
         raise ValueError("campaign_discovery_plan_mismatch")
-    baseline = plan.get("baseline_route")
-    if not isinstance(baseline, str) or baseline not in observed:
+    ordered: list[dict[str, object]] = []
+    for planned_route in planned:
+        route_id = planned_route.get("route_id")
+        requested_route = planned_route.get("requested_route")
+        source = observed_by_id.get(str(route_id))
+        if source is None or source.get("requested_route") != requested_route:
+            raise ValueError("campaign_discovery_plan_mismatch")
+        ordered.append(source)
+    baseline = validated.get("baseline_route")
+    if not isinstance(baseline, str) or baseline not in {
+        str(route.get("requested_route") or "") for route in ordered
+    }:
         raise ValueError("campaign_plan_baseline_invalid")
-    return routes
+    return ordered
 
 
 def _plan_reasoning_effort(
@@ -1557,28 +1855,12 @@ def _attempt_accounting(
         raise ValueError("campaign_attempt_ledger_invalid")
     if require_ledger and results and not events:
         raise ValueError("campaign_attempt_ledger_invalid")
-    approval_digests: set[str] = set()
-    approvals_fd = _open_campaign_directory_fd(root, Path("APPROVALS"), create=False)
-    try:
-        approvals = _read_json_directory_fd(approvals_fd, suffix=".json")
-    finally:
-        os.close(approvals_fd)
-    for _approval_name, approval in approvals:
-        approval_digest = approval.get("receipt_sha256")
-        unsigned_approval = dict(approval)
-        unsigned_approval.pop("receipt_sha256", None)
-        if (
-            approval.get("schema") != "oab.stage-approval/v4"
-            or not isinstance(approval_digest, str)
-            or approval_digest != _canonical_sha256(unsigned_approval)
-        ):
-            raise ValueError("campaign_attempt_approval_invalid")
-        approval_digests.add(approval_digest)
     if set(result_by_attempt) - set(events):
         raise ValueError("campaign_attempt_ledger_invalid")
     failed_reserved_calls = 0
     failed_attempts = 0
     open_attempt_ids_by_route: dict[str, list[str]] = {}
+    failed_reserved_api_calls_by_route: dict[str, int] = {}
     for attempt_id, by_event in events.items():
         reservation = by_event.get("reserved")
         if reservation is None or (
@@ -1587,16 +1869,15 @@ def _attempt_accounting(
             raise ValueError("campaign_attempt_ledger_invalid")
         route_id = reservation.get("route_id")
         reserved_calls = reservation.get("reserved_api_calls")
-        approval_sha256 = reservation.get("approval_sha256")
+        plan_sha256 = reservation.get("plan_sha256")
         if (
             not isinstance(route_id, str)
             or not route_id
             or not isinstance(reserved_calls, int)
             or isinstance(reserved_calls, bool)
             or reserved_calls < 1
-            or not isinstance(approval_sha256, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", approval_sha256) is None
-            or approval_sha256 not in approval_digests
+            or not isinstance(plan_sha256, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", plan_sha256) is None
         ):
             raise ValueError("campaign_attempt_ledger_invalid")
         result = result_by_attempt.get(attempt_id)
@@ -1620,11 +1901,15 @@ def _attempt_accounting(
         failed_reserved_calls += reserved_calls
         failed_attempts += 1
         open_attempt_ids_by_route.setdefault(route_id, []).append(attempt_id)
+        failed_reserved_api_calls_by_route[route_id] = (
+            failed_reserved_api_calls_by_route.get(route_id, 0) + reserved_calls
+        )
     return {
         "failed_reserved_api_calls": failed_reserved_calls,
         "failed_attempts": failed_attempts,
         "unknown_cost_encountered": failed_attempts > 0,
         "open_attempt_ids_by_route": open_attempt_ids_by_route,
+        "failed_reserved_api_calls_by_route": failed_reserved_api_calls_by_route,
     }
 
 
@@ -1696,13 +1981,28 @@ def _stage_result_receipt(
 ) -> dict[str, object]:
     receipt = dict(body)
     suite_report = dict(report)
-    orchestration_metadata = _validate_campaign_orchestration_metadata(suite_report)
-    assert orchestration_metadata is not None
-    suite_report.pop("campaign_suite_verified")
-    suite_report.pop("campaign_elapsed_seconds")
+    if suite_report.get("schema") == QUALIFICATION_REPORT_SCHEMA:
+        orchestration_metadata = _validate_campaign_orchestration_metadata(suite_report)
+        assert orchestration_metadata is not None
+        suite_report.pop("campaign_suite_verified")
+        suite_report.pop("campaign_elapsed_seconds")
+        validate_qualification_report(suite_report)
+        assert_quality_free(suite_report)
+    else:
+        orchestration_metadata = _validate_campaign_orchestration_metadata(suite_report)
+        assert orchestration_metadata is not None
+        suite_report.pop("campaign_suite_verified")
+        suite_report.pop("campaign_elapsed_seconds")
     receipt.update(orchestration_metadata)
     receipt["suite_report"] = suite_report
     receipt["suite_report_sha256"] = _canonical_sha256(suite_report)
+    if (
+        receipt.get("schema") == "oab.qualification-result/v2"
+        and suite_report.get("schema") == QUALIFICATION_REPORT_SCHEMA
+    ):
+        # The campaign receipt is also an artifact boundary: it must carry only
+        # readiness, identity and accounting facts, not a hidden generic metric.
+        assert_quality_free(receipt)
     receipt["receipt_sha256"] = _canonical_sha256(receipt)
     return receipt
 
@@ -1714,6 +2014,9 @@ def _load_stage_results(
     *,
     reasoning_effort: str,
     campaign_release_tree_sha256: object,
+    qualification_execution_contract: str | None = None,
+    qualification_contract_tuple: Mapping[str, object] | None = None,
+    allow_unknown_costs: bool = False,
 ) -> dict[str, dict[str, Any]]:
     selected_route_ids = {str(route.get("route_id") or "") for route in routes}
     results_fd = _open_campaign_directory_fd(
@@ -1773,12 +2076,30 @@ def _load_stage_results(
             normalized_result["suite_report"] = suite_report
             normalized_result.update(orchestration_metadata)
             if stage == "qualification":
-                classification_report = dict(suite_report)
-                classification_report.update(orchestration_metadata)
+                if suite_report.get("schema") == QUALIFICATION_REPORT_SCHEMA:
+                    try:
+                        validated_report = validate_qualification_report(suite_report)
+                    except ValueError as exc:
+                        raise ValueError("campaign_qualification_report_invalid") from exc
+                    if (
+                        qualification_contract_tuple is None
+                        or validated_report.get("qualification_contract")
+                        != dict(qualification_contract_tuple)
+                    ):
+                        raise ValueError("qualification_execution_contract_invalid")
+                    classification_report = dict(suite_report)
+                else:
+                    # Legacy-shaped generic reports are historical-only. Preserve
+                    # their bytes for audit, but their classification cannot grant
+                    # readiness under the dedicated execution contract.
+                    classification_report = dict(suite_report)
+                    classification_report.update(orchestration_metadata)
                 expected_classification = classify_qualification(
                     classification_report,
                     requested_route=str(route.get("requested_route") or ""),
                     reasoning_effort=reasoning_effort,
+                    execution_contract=qualification_execution_contract,
+                    allow_unknown_costs=allow_unknown_costs,
                 )
                 expected_classification["observed_api_calls"] = _api_calls_from_report(
                     suite_report
@@ -1816,17 +2137,14 @@ def _cost_from_report(report: Mapping[str, object]) -> float | None:
     return None
 
 
-def _known_cost_from_report(report: Mapping[str, object]) -> float:
+def _known_cost_from_report(report: Mapping[str, object]) -> float | None:
     usage = report.get("controller_usage")
     if not isinstance(usage, Mapping):
-        return 0.0
+        return None
     value = usage.get("known_cost_usd")
     if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) >= 0:
         return float(value)
-    exact = usage.get("cost_usd")
-    if isinstance(exact, (int, float)) and not isinstance(exact, bool) and float(exact) >= 0:
-        return float(exact)
-    return 0.0
+    return None
 
 
 def _unknown_cost_api_calls_from_report(report: Mapping[str, object]) -> int | None:
@@ -1836,7 +2154,7 @@ def _unknown_cost_api_calls_from_report(report: Mapping[str, object]) -> int | N
     value = usage.get("unknown_cost_api_calls")
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
-    return 0 if _cost_from_report(report) is not None else None
+    return None
 
 
 def _api_calls_from_report(report: Mapping[str, object]) -> int | None:
@@ -1886,213 +2204,20 @@ def _planned_stage_routes(
             if str(route.get("route_id") or "") in qualified_ids
         ]
     else:
-        raise ValueError("stage_approval_stage_invalid")
+        raise ValueError("campaign_stage_invalid")
     routes = _select_routes(
         route_candidates,
         current_route=baseline_route,
         max_routes=route_cap,
     )
     if not routes or (stage == "full" and len(routes) < 2):
-        raise ValueError("stage_approval_routes_invalid")
+        raise ValueError("campaign_stage_routes_invalid")
     return plan, routes
 
 
-@_campaign_operation
-def build_approval_preview(
-    output_root: Path,
-    *,
-    stage: str,
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-) -> dict[str, object]:
-    """Return a deterministic no-spend preview of the exact stage controls."""
-    root = _trusted_campaign_root(output_root)
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    budget = _validate_budget(max_cost_usd)
-    call_budget = _validate_positive_int(max_api_calls, "stage_api_call_budget_required")
-    route_cap = _validate_positive_int(max_routes, "stage_route_cap_required")
-    plan, routes = _planned_stage_routes(root, state, stage=stage, route_cap=route_cap)
-    stage_plan = plan.get("qualification" if stage == "qualification" else "full_run")
-    if not isinstance(stage_plan, Mapping):
-        raise ValueError("campaign_plan_stage_invalid")
-    episodes_per_route = stage_plan.get("episodes_per_route")
-    if (
-        not isinstance(episodes_per_route, int)
-        or isinstance(episodes_per_route, bool)
-        or episodes_per_route < 1
-    ):
-        raise ValueError("campaign_plan_stage_invalid")
-    scheduled_episodes = episodes_per_route * len(routes)
-    calls_per_episode = (
-        _QUALIFICATION_MAX_API_CALLS_PER_EPISODE
-        if stage == "qualification"
-        else _FULL_MAX_API_CALLS_PER_EPISODE
-    )
-    minimum_calls = scheduled_episodes * calls_per_episode
-    return {
-        "schema": "oab.approval-preview/v1",
-        "stage": stage,
-        "plan_sha256": plan.get("plan_sha256"),
-        "calibration_sha256": state.get("calibration_sha256"),
-        "routes": [
-            {
-                "route_id": str(route.get("route_id") or ""),
-                "requested_route": str(route.get("requested_route") or ""),
-            }
-            for route in routes
-        ],
-        "route_count": len(routes),
-        "episodes_per_route": episodes_per_route,
-        "scheduled_episodes": scheduled_episodes,
-        "observed_cost_stop_usd": budget,
-        "cost_control_mode": _COST_CONTROL_MODE,
-        "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
-        "max_api_calls": call_budget,
-        "minimum_required_api_calls": minimum_calls,
-        "max_api_calls_per_episode": calls_per_episode,
-        "call_ceiling_sufficient": call_budget >= minimum_calls,
-        "max_routes": route_cap,
-        "allow_unknown_costs": bool(allow_unknown_costs),
-        "intended_evidence_posture": "exploratory_by_default",
-        "authority_note": (
-            "Spend approval is independent of evidence authority. Authority also requires "
-            "an exact-tree release approval and all identity, coverage, grid, and runtime gates."
-        ),
-        "provider_calls_performed": 0,
-    }
 
 
-@_campaign_operation
-def build_stage_approval_request(
-    output_root: Path,
-    *,
-    stage: str,
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-    approval_public_key_path: Path,
-) -> dict[str, object]:
-    root = _trusted_campaign_root(output_root)
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    budget = _validate_budget(max_cost_usd)
-    call_budget = _validate_positive_int(max_api_calls, "stage_api_call_budget_required")
-    route_cap = _validate_positive_int(max_routes, "stage_route_cap_required")
-    plan, routes = _planned_stage_routes(root, state, stage=stage, route_cap=route_cap)
-    plan_digest = _plan_sha256(plan)
-    public_bytes = _read_single_link_regular_bytes(
-        approval_public_key_path,
-        error="stage_approval_public_key_invalid",
-        max_bytes=16 * 1024,
-    )
-    public_key = serialization.load_pem_public_key(public_bytes)
-    if not isinstance(public_key, Ed25519PublicKey):
-        raise ValueError("stage_approval_public_key_invalid")
-    receipt: dict[str, object] = {
-        "schema": "oab.stage-approval/v4",
-        "created_at": _utc_now(),
-        "stage": stage,
-        "plan_sha256": plan_digest,
-        "calibration_sha256": state["calibration_sha256"],
-        "route_ids": [str(route.get("route_id") or "") for route in routes],
-        "observed_cost_stop_usd": budget,
-        "cost_control_mode": _COST_CONTROL_MODE,
-        "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
-        "max_api_calls": call_budget,
-        "max_routes": route_cap,
-        "allow_unknown_costs": bool(allow_unknown_costs),
-        "approval_public_key_sha256": "sha256:" + hashlib.sha256(public_bytes).hexdigest(),
-    }
-    receipt["receipt_sha256"] = _canonical_sha256(receipt)
-    return receipt
 
-
-CONVERSATIONAL_STAGE_APPROVAL_SCHEMA = "oab.conversational-stage-approval/v2"
-
-# No host-backed verifier exists for a conversational approval: nothing in this
-# repository or in an installed Hermes can prove that a caller-supplied message
-# reference names a real message whose content approves these exact controls. A
-# caller can therefore forge any such reference, so conversational receipts are
-# refused for every spend-capable path. `approval-preview` stays conversational
-# and no-spend; actual execution requires the externally signed stage approval.
-CONVERSATION_APPROVAL_NOT_HOST_VERIFIED = "conversation_approval_not_host_verified"
-
-
-def stage_approval_signing_payload(receipt: Mapping[str, object]) -> bytes:
-    """Return the exact canonical bytes an external Ed25519 approver signs."""
-    return _canonical_bytes(receipt)
-
-
-def _accept_stage_approval(
-    root: Path,
-    *,
-    approval_path: Path,
-    signature_path: Path | None,
-    public_key_path: Path | None,
-    stage: str,
-    route_ids: Sequence[str],
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-) -> dict[str, object]:
-    plan = _read_regular_json(root / "PLAN.json")
-    plan_digest = str(plan.get("plan_sha256") or "")
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    calibration_sha256 = str(state.get("calibration_sha256") or "")
-    receipt = _read_regular_json(approval_path)
-    if receipt.get("schema") == CONVERSATIONAL_STAGE_APPROVAL_SCHEMA:
-        # A caller-asserted conversation reference is not host-verified evidence of
-        # approval, so it can never authorize spend. Fail closed before any route runs.
-        raise ValueError(
-            f"{CONVERSATION_APPROVAL_NOT_HOST_VERIFIED}:"
-            "signed_stage_approval_required"
-        )
-    if signature_path is None or public_key_path is None:
-        raise ValueError("stage_approval_signature_and_public_key_required")
-    errors = verify_stage_approval(
-        approval_path,
-        expected_plan_sha256=plan_digest,
-        expected_calibration_sha256=calibration_sha256,
-        expected_stage=stage,
-        expected_route_ids=route_ids,
-        expected_max_cost_usd=max_cost_usd,
-        expected_max_api_calls=max_api_calls,
-        expected_max_routes=max_routes,
-        expected_allow_unknown_costs=allow_unknown_costs,
-        public_key_path=public_key_path,
-        signature_path=signature_path,
-    )
-    error_prefix = "stage_approval_invalid:"
-    if errors:
-        raise ValueError(error_prefix + ",".join(sorted(set(errors))))
-    stem = f"{stage}-{str(receipt['receipt_sha256']).removeprefix('sha256:')[:16]}"
-    approvals = root / "APPROVALS"
-    receipt_destination = approvals / f"{stem}.json"
-    _atomic_json(receipt_destination, receipt)
-    assert signature_path is not None
-    assert public_key_path is not None
-    signature = _read_single_link_regular_bytes(
-        signature_path, error="stage_approval_signature_invalid", max_bytes=1024
-    )
-    public_bytes = _read_single_link_regular_bytes(
-        public_key_path, error="stage_approval_public_key_invalid", max_bytes=16 * 1024
-    )
-    signature_destination = approvals / f"{stem}.sig"
-    public_destination = approvals / f"key-{hashlib.sha256(public_bytes).hexdigest()[:16]}.pem"
-    _atomic_bytes(signature_destination, signature)
-    _atomic_bytes(public_destination, public_bytes)
-    return {
-        **receipt,
-        "path": str(receipt_destination),
-        "signature_path": str(signature_destination),
-        "public_key_path": str(public_destination),
-    }
 
 
 def _validate_budget(value: float) -> float:
@@ -2111,9 +2236,6 @@ def run_qualification_stage(
     allow_unknown_costs: bool,
     max_api_calls: int | None = None,
     max_routes: int | None = None,
-    approval_path: Path,
-    approval_signature_path: Path | None,
-    approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
     root = _trusted_campaign_root(output_root)
     _validate_campaign_layout(root, create=True)
@@ -2126,6 +2248,19 @@ def run_qualification_stage(
     plan, routes = _planned_stage_routes(
         root, state, stage="qualification", route_cap=route_cap
     )
+    controls = plan.get("qualification_execution")
+    if not isinstance(controls, Mapping) or (
+        float(max_cost_usd) != float(controls.get("known_cost_stop_usd", -1))
+        or call_budget != controls.get("max_api_calls")
+        or route_cap != controls.get("max_routes")
+        or allow_unknown_costs is not controls.get("allow_unknown_costs")
+    ):
+        raise ValueError("campaign_execution_controls_mismatch")
+    qual_contract = _qualification_execution_contract(plan)
+    qualification_tuple = validate_qualification_contract(
+        plan.get("qualification"), route_count=int(plan["route_count"])
+    )
+    qual_max_calls = int(qualification_tuple["absolute_api_call_ceiling_per_route"])
     effort = _plan_reasoning_effort(plan, state)
     campaign_release_tree_sha256 = plan.get("release_tree_sha256")
     results = _load_stage_results(
@@ -2134,7 +2269,33 @@ def run_qualification_stage(
         routes,
         reasoning_effort=effort,
         campaign_release_tree_sha256=campaign_release_tree_sha256,
+        qualification_execution_contract=qual_contract,
+        qualification_contract_tuple=qualification_tuple,
+        allow_unknown_costs=bool(allow_unknown_costs),
     )
+    if any(
+        isinstance(result.get("classification"), Mapping)
+        and isinstance(result["classification"].get("observed_api_calls"), int)
+        and not isinstance(result["classification"].get("observed_api_calls"), bool)
+        and result["classification"]["observed_api_calls"]
+        > _QUALIFICATION_V230_MAX_CALLS_PER_ROUTE
+        for result in results.values()
+    ):
+        state["status"] = "qualification_call_budget_exceeded"
+        state["updated_at"] = _utc_now()
+        _atomic_json(root / "CAMPAIGN.json", state)
+        return state
+    # A sealed result with no JSON-integer call count cannot be re-accounted
+    # under a later approval; fail closed before resetting stage state or routing.
+    if any(
+        isinstance(result.get("classification"), Mapping)
+        and result["classification"].get("observed_api_calls") is None
+        for result in results.values()
+    ):
+        state["status"] = "blocked_unknown_api_calls"
+        state["updated_at"] = _utc_now()
+        _atomic_json(root / "CAMPAIGN.json", state)
+        return state
     attempt_accounting = _attempt_accounting(
         root,
         "qualification",
@@ -2149,6 +2310,20 @@ def run_qualification_stage(
         raise ValueError("campaign_attempt_ledger_invalid")
     failed_reserved_calls = failed_reserved_value
     failed_attempt_count = failed_attempt_value
+    failed_route_reservations = attempt_accounting.get(
+        "failed_reserved_api_calls_by_route"
+    )
+    if not isinstance(failed_route_reservations, Mapping) or any(
+        not isinstance(route_id, str)
+        or not route_id
+        or not isinstance(reserved_calls, int)
+        or isinstance(reserved_calls, bool)
+        or reserved_calls < 1
+        or reserved_calls > qual_max_calls
+        for route_id, reserved_calls in failed_route_reservations.items()
+    ):
+        raise ValueError("qualification_execution_contract_invalid")
+    exhausted_route_ids = set(failed_route_reservations)
     _require_monotonic_attempt_accounting(
         state,
         reserved_key="qualification_failed_attempt_reserved_api_calls",
@@ -2157,34 +2332,13 @@ def run_qualification_stage(
         failed_attempts=failed_attempt_count,
     )
     interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
-    approval = _accept_stage_approval(
-        root,
-        approval_path=approval_path,
-        signature_path=approval_signature_path,
-        public_key_path=approval_public_key_path,
-        stage="qualification",
-        route_ids=[str(route.get("route_id") or "") for route in routes],
-        max_cost_usd=budget,
-        max_api_calls=call_budget,
-        max_routes=route_cap,
-        allow_unknown_costs=allow_unknown_costs,
-    )
     state["status"] = "qualifying"
     spend = state.get("spend")
     spend_state = dict(spend) if isinstance(spend, Mapping) else {}
-    spend_state["qualification_approved"] = True
     spend_state["qualification_max_cost_usd"] = budget
     spend_state["allow_unknown_costs"] = bool(allow_unknown_costs)
     spend_state["qualification_max_api_calls"] = call_budget
     spend_state["qualification_max_routes"] = route_cap
-    spend_state["qualification_approval_sha256"] = approval["receipt_sha256"]
-    spend_state["qualification_approved_route_ids"] = approval["route_ids"]
-    spend_state["qualification_approval_path"] = approval["path"]
-    spend_state["qualification_approval_assurance"] = approval.get(
-        "approval_assurance", "external_signature"
-    )
-    spend_state["qualification_approval_signature_path"] = approval.get("signature_path")
-    spend_state["qualification_approval_public_key_path"] = approval.get("public_key_path")
     spend_state["qualification_failed_attempt_reserved_api_calls"] = failed_reserved_calls
     spend_state["qualification_failed_attempts"] = failed_attempt_count
     if interrupted_unknown_cost:
@@ -2200,7 +2354,7 @@ def run_qualification_stage(
 
     for route in routes:
         route_id = str(route.get("route_id") or "")
-        if route_id in results:
+        if route_id in results or route_id in exhausted_route_ids:
             continue
         observed_calls = failed_reserved_calls + sum(
             int(item["classification"]["observed_api_calls"])
@@ -2208,7 +2362,7 @@ def run_qualification_stage(
             if isinstance(item.get("classification"), Mapping)
             and isinstance(item["classification"].get("observed_api_calls"), int)
         )
-        if observed_calls + 34 > call_budget:
+        if observed_calls + qual_max_calls > call_budget:
             state["status"] = "qualification_call_budget_exhausted"
             break
         observed_known_before = sum(
@@ -2230,10 +2384,15 @@ def run_qualification_stage(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
-        attempt_reserved_calls = min(34, call_budget - observed_calls)
+        # The child must receive the signed per-route ceiling, never a mutable
+        # residual budget that would diverge from the receipt tuple.
+        attempt_reserved_calls = qual_max_calls
         execution_route["max_api_calls"] = attempt_reserved_calls
+        execution_route["_qualification_contract_version"] = qual_contract
+        execution_route["_qualification_contract"] = dict(qualification_tuple)
         attempt_id = secrets.token_hex(16)
         suite_output = _attempt_evidence_path(root, "qualification", attempt_id)
+        execution_route["_campaign_root_path"] = str(root)
         reservation = _write_attempt_event(
             root,
             "qualification",
@@ -2244,7 +2403,7 @@ def run_qualification_stage(
                 "requested_route": route.get("requested_route"),
                 "reserved_api_calls": attempt_reserved_calls,
                 "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
-                "approval_sha256": approval["receipt_sha256"],
+                "plan_sha256": plan["plan_sha256"],
             },
         )
         try:
@@ -2306,17 +2465,79 @@ def run_qualification_stage(
             _atomic_json(root / "CAMPAIGN.json", state)
             return state
         requested_route = str(route.get("requested_route") or "")
-        classification = classify_qualification(
-            report,
-            requested_route=requested_route,
-            reasoning_effort=effort,
-        )
-        classification["observed_api_calls"] = _api_calls_from_report(report)
+        classification_report = dict(report)
+        if classification_report.get("schema") == QUALIFICATION_REPORT_SCHEMA:
+            # Campaign metadata lives beside the sealed report, never inside its
+            # score-free whitelist. The report is additionally bound back to the
+            # exact signed PLAN tuple before it can qualify a route.
+            classification_report.pop("campaign_suite_verified", None)
+            classification_report.pop("campaign_elapsed_seconds", None)
+            try:
+                validated_report = validate_qualification_report(classification_report)
+                if validated_report.get("qualification_contract") != qualification_tuple:
+                    raise ValueError("qualification_execution_contract_invalid")
+            except ValueError:
+                classification = {
+                    "requested_route": requested_route,
+                    "status": "qualification_contract_invalid",
+                    "reason_codes": [],
+                    "observed_cost_usd": _cost_from_report(classification_report),
+                    "observed_known_cost_usd": _known_cost_from_report(classification_report),
+                    "unknown_cost_api_calls": _unknown_cost_api_calls_from_report(classification_report),
+                    "observed_duration_seconds": None,
+                    "identity_source": None,
+                    "controller_config_sha256": None,
+                }
+            else:
+                classification = classify_qualification(
+                    classification_report,
+                    requested_route=requested_route,
+                    reasoning_effort=effort,
+                    execution_contract=qual_contract,
+                    allow_unknown_costs=bool(allow_unknown_costs),
+                )
+        else:
+            classification = classify_qualification(
+                report,
+                requested_route=requested_route,
+                reasoning_effort=effort,
+                execution_contract=qual_contract,
+                allow_unknown_costs=bool(allow_unknown_costs),
+            )
+        classification["observed_api_calls"] = _api_calls_from_report(classification_report)
+        if classification.get("status") == "qualification_contract_invalid":
+            # A malformed or substituted child report is never authority. Charge the
+            # physical invocation conservatively, quarantine whatever it emitted,
+            # and stop rather than attempting a new route or retrying it.
+            quarantine = _quarantine_partial_suite(root, "qualification", route_id, attempt_id)
+            _write_attempt_event(
+                root,
+                "qualification",
+                attempt_id,
+                "failed",
+                {
+                    "route_id": route_id,
+                    "reservation_sha256": reservation["receipt_sha256"],
+                    "failure_code": "qualification_contract_invalid",
+                    "quarantine_path": (
+                        str(Path(quarantine).relative_to(root)) if quarantine else None
+                    ),
+                },
+            )
+            state["status"] = "blocked_unknown_api_calls"
+            state["updated_at"] = _utc_now()
+            spend_state["qualification_failed_attempt_reserved_api_calls"] = (
+                failed_reserved_calls + attempt_reserved_calls
+            )
+            spend_state["qualification_failed_attempts"] = failed_attempt_count + 1
+            spend_state["unknown_cost_encountered"] = True
+            state["spend"] = spend_state
+            _atomic_json(root / "CAMPAIGN.json", state)
+            return state
         if (
             isinstance(classification["observed_api_calls"], int)
             and classification["observed_api_calls"] > execution_route["max_api_calls"]
         ):
-            classification["status"] = "api_call_budget_exceeded"
             state["status"] = "qualification_call_budget_exceeded"
         receipt = _stage_result_receipt(
             {
@@ -2368,7 +2589,7 @@ def run_qualification_stage(
             state["status"] = "blocked_unknown_api_calls"
             break
     else:
-        state["status"] = "awaiting_full_run_approval"
+        state["status"] = "qualification_complete"
 
     qualified: list[dict[str, object]] = []
     excluded: list[dict[str, object]] = []
@@ -2376,15 +2597,32 @@ def run_qualification_stage(
     durations_known = True
     projected = 0.0
     projected_duration = 0.0
-    full_plan_for_projection = plan.get("full_run")
-    if not isinstance(full_plan_for_projection, Mapping) or not isinstance(
-        full_plan_for_projection.get("episodes_per_route"), int
-    ):
-        raise ValueError("campaign_plan_projection_invalid")
-    projection_factor = (
-        int(full_plan_for_projection["episodes_per_route"])
-        / _QUALIFICATION_EPISODES_PER_ROUTE
+    try:
+        full_plan_for_projection = validate_authoritative_full_stage_plan(
+            plan.get("full_run"), route_count=int(plan["route_count"])
+        )
+        full_contract_for_projection = full_plan_for_projection["authoritative_contract"]
+        if not isinstance(full_contract_for_projection, Mapping):
+            raise ValueError("authoritative_full_contract_invalid")
+        full_episodes_per_route = full_contract_for_projection["episodes_per_route"]
+        if (
+            not isinstance(full_episodes_per_route, int)
+            or isinstance(full_episodes_per_route, bool)
+            or full_episodes_per_route != FULL_EPISODES_PER_ROUTE
+        ):
+            raise ValueError("authoritative_full_contract_invalid")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("campaign_plan_projection_invalid") from exc
+    qual_plan = plan.get("qualification")
+    qual_episodes = (
+        int(qual_plan["episodes_per_route"])
+        if isinstance(qual_plan, Mapping)
+        and isinstance(qual_plan.get("episodes_per_route"), int)
+        and not isinstance(qual_plan.get("episodes_per_route"), bool)
+        and int(qual_plan["episodes_per_route"]) > 0
+        else _QUALIFICATION_V230_PROBES_PER_ROUTE
     )
+    projection_factor = full_episodes_per_route / qual_episodes
     for route in routes:
         receipt_result = results.get(str(route.get("route_id") or ""))
         if receipt_result is None:
@@ -2392,12 +2630,21 @@ def run_qualification_stage(
         classification = receipt_result.get("classification")
         if not isinstance(classification, Mapping):
             continue
+        status = classification.get("status")
+        if status == "qualified":
+            readiness = "READY"
+        elif status == "agent_loop_incompatible":
+            readiness = "INCOMPATIBLE"
+        else:
+            readiness = "NOT READY"
         summary = {
             "route_id": route.get("route_id"),
             "requested_route": route.get("requested_route"),
-            "status": classification.get("status"),
+            "status": status,
+            "readiness": readiness,
+            "reason_codes": classification.get("reason_codes") or [],
         }
-        if classification.get("status") == "qualified":
+        if status == "qualified":
             qualified.append(summary)
             cost = classification.get("observed_cost_usd")
             if isinstance(cost, (int, float)):
@@ -2411,7 +2658,7 @@ def run_qualification_stage(
                 durations_known = False
         else:
             excluded.append(summary)
-    if len(qualified) < 2 and state.get("status") == "awaiting_full_run_approval":
+    if len(qualified) < 2 and state.get("status") == "qualification_complete":
         state["status"] = "comparison_not_supportable"
     state["qualified_routes"] = qualified
     state["excluded_routes"] = excluded
@@ -2436,22 +2683,51 @@ def run_qualification_stage(
     # total remains unavailable whenever unknown_cost_encountered is true.
     spend_state["observed_qualification_cost_usd"] = observed_qualification_known_cost
     state["spend"] = spend_state
+    if any(item.get("readiness") == "INCOMPATIBLE" for item in excluded):
+        headline_readiness = "INCOMPATIBLE"
+    elif len(qualified) >= 2 and state.get("status") == "qualification_complete":
+        headline_readiness = "READY"
+    else:
+        headline_readiness = "NOT READY"
     qualification_report: dict[str, object] = {
-        "schema": "oab.qualification-summary/v1",
+        "schema": "oab.qualification-summary/v2",
         "created_at": _utc_now(),
         "status": state["status"],
+        "readiness": headline_readiness,
+        "headline": (
+            f"{headline_readiness}: qualification readiness records plumbing, "
+            "identity, and telemetry only."
+        ),
         "route_count": len(routes),
         "discovered_route_count": int(plan["route_count"]),
         "completed_routes": len(results),
         "qualified_routes": qualified,
         "excluded_routes": excluded,
+        "telemetry_posture": {
+            "api_calls": "locally_counted",
+            "tokens": "known_or_unknown_never_zero_coerced",
+            "billed_cost": "known_or_unknown_never_zero_coerced",
+        },
         "projected_full_run_cost_usd": round(projected, 12) if costs_known else None,
-        "cost_projection_basis": "qualification observed cost multiplied by 80/34 episodes",
+        "cost_projection_basis": (
+            "qualification observations are used for spend planning only"
+        ),
         "projected_full_run_duration_seconds": (
             round(projected_duration, 3) if durations_known else None
         ),
-        "duration_projection_basis": "qualification elapsed time multiplied by 80/34 episodes",
+        "duration_projection_basis": (
+            "qualification observations are used for duration planning only"
+        ),
     }
+    qualification_summary_fields = {
+        "schema", "created_at", "status", "readiness", "headline", "route_count",
+        "discovered_route_count", "completed_routes", "qualified_routes", "excluded_routes",
+        "telemetry_posture", "projected_full_run_cost_usd", "cost_projection_basis",
+        "projected_full_run_duration_seconds", "duration_projection_basis",
+    }
+    if set(qualification_report) != qualification_summary_fields:
+        raise ValueError("qualification_summary_fields_invalid")
+    assert_quality_free(qualification_report)
     _atomic_json(root / "QUALIFICATION.json", qualification_report)
     _atomic_json(root / "CAMPAIGN.json", state)
     return state
@@ -2466,9 +2742,6 @@ def run_full_stage(
     allow_unknown_costs: bool,
     max_api_calls: int | None = None,
     max_routes: int | None = None,
-    approval_path: Path,
-    approval_signature_path: Path | None,
-    approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
     root = _trusted_campaign_root(output_root)
     _validate_campaign_layout(root, create=True)
@@ -2476,26 +2749,32 @@ def run_full_stage(
     plan = _read_regular_json(root / "PLAN.json")
     if verify_campaign_plan(plan):
         raise ValueError("campaign_plan_invalid")
-    full_plan = plan.get("full_run")
+    qualification_contract = _qualification_execution_contract(plan)
+    route_count = plan.get("route_count")
     baseline_route = plan.get("baseline_route")
     release_tree_sha256 = plan.get("release_tree_sha256")
     if (
-        not isinstance(full_plan, Mapping)
-        or not isinstance(full_plan.get("pair_ids"), list)
-        or not full_plan.get("pair_ids")
-        or not isinstance(full_plan.get("repetitions"), int)
-        or isinstance(full_plan.get("repetitions"), bool)
-        or int(full_plan["repetitions"]) < 1
+        not isinstance(route_count, int)
+        or isinstance(route_count, bool)
         or not isinstance(baseline_route, str)
         or not baseline_route
         or not isinstance(release_tree_sha256, str)
         or not release_tree_sha256
     ):
         raise ValueError("campaign_plan_decision_binding_invalid")
-    expected_pair_ids = [str(pair_id) for pair_id in full_plan["pair_ids"]]
-    expected_repetitions = int(full_plan["repetitions"])
+    try:
+        full_plan = validate_authoritative_full_stage_plan(
+            plan.get("full_run"), route_count=route_count
+        )
+    except ValueError as exc:
+        raise ValueError("campaign_plan_decision_binding_invalid") from exc
+    full_contract = full_plan["authoritative_contract"]
+    assert isinstance(full_contract, Mapping)
+    expected_pair_ids = list(AUTHORITATIVE_FULL_PAIR_IDS)
+    expected_repetitions = FULL_REPETITIONS
+    full_calls_per_route = FULL_API_CALL_CEILING_PER_ROUTE
     if state.get("status") not in {
-        "awaiting_full_run_approval",
+        "qualification_complete",
         "running_full",
         "blocked_unknown_full_cost",
         "blocked_unknown_full_api_calls",
@@ -2508,10 +2787,39 @@ def run_full_stage(
     call_budget = _validate_positive_int(max_api_calls, "full_api_call_budget_required")
     route_cap = _validate_positive_int(max_routes, "full_route_cap_required")
     plan, routes = _planned_stage_routes(root, state, stage="full", route_cap=route_cap)
+    controls = plan.get("full_execution")
+    if not isinstance(controls, Mapping) or (
+        float(max_cost_usd) != float(controls.get("known_cost_stop_usd", -1))
+        or call_budget != controls.get("max_api_calls")
+        or route_cap != controls.get("max_routes")
+        or allow_unknown_costs is not controls.get("allow_unknown_costs")
+    ):
+        raise ValueError("campaign_execution_controls_mismatch")
     if len(routes) < 2:
         raise ValueError("campaign_comparison_not_supportable")
     effort = _plan_reasoning_effort(plan, state)
     campaign_release_tree_sha256 = plan.get("release_tree_sha256")
+    qualification_results = _load_stage_results(
+        root,
+        "qualification",
+        _plan_bound_routes(root, plan),
+        reasoning_effort=effort,
+        campaign_release_tree_sha256=campaign_release_tree_sha256,
+        qualification_execution_contract=qualification_contract,
+        qualification_contract_tuple=validate_qualification_contract(
+            plan.get("qualification"), route_count=int(plan["route_count"])
+        ),
+        allow_unknown_costs=allow_unknown_costs,
+    )
+    for route in routes:
+        qualification_result = qualification_results.get(str(route.get("route_id") or ""))
+        classification = (
+            qualification_result.get("classification")
+            if isinstance(qualification_result, Mapping)
+            else None
+        )
+        if not isinstance(classification, Mapping) or classification.get("status") != "qualified":
+            raise ValueError("campaign_qualification_result_missing")
     results = _load_stage_results(
         root,
         "full",
@@ -2541,33 +2849,12 @@ def run_full_stage(
         failed_attempts=failed_attempt_count,
     )
     interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
-    approval = _accept_stage_approval(
-        root,
-        approval_path=approval_path,
-        signature_path=approval_signature_path,
-        public_key_path=approval_public_key_path,
-        stage="full",
-        route_ids=[str(route.get("route_id") or "") for route in routes],
-        max_cost_usd=budget,
-        max_api_calls=call_budget,
-        max_routes=route_cap,
-        allow_unknown_costs=allow_unknown_costs,
-    )
     spend = state.get("spend")
     spend_state = dict(spend) if isinstance(spend, Mapping) else {}
-    spend_state["full_run_approved"] = True
     spend_state["full_run_max_cost_usd"] = budget
     spend_state["allow_unknown_full_costs"] = bool(allow_unknown_costs)
     spend_state["full_run_max_api_calls"] = call_budget
     spend_state["full_run_max_routes"] = route_cap
-    spend_state["full_run_approval_sha256"] = approval["receipt_sha256"]
-    spend_state["full_run_approved_route_ids"] = approval["route_ids"]
-    spend_state["full_run_approval_path"] = approval["path"]
-    spend_state["full_run_approval_assurance"] = approval.get(
-        "approval_assurance", "external_signature"
-    )
-    spend_state["full_run_approval_signature_path"] = approval.get("signature_path")
-    spend_state["full_run_approval_public_key_path"] = approval.get("public_key_path")
     spend_state["full_failed_attempt_reserved_api_calls"] = failed_reserved_calls
     spend_state["full_failed_attempts"] = failed_attempt_count
     if interrupted_unknown_cost:
@@ -2591,7 +2878,7 @@ def run_full_stage(
             for item in results.values()
             if isinstance(item.get("observed_api_calls"), int)
         )
-        if observed_calls + 1360 > call_budget:
+        if observed_calls + full_calls_per_route > call_budget:
             state["status"] = "full_call_budget_exhausted"
             break
         observed_known_before = sum(
@@ -2608,10 +2895,11 @@ def run_full_stage(
             0.0, budget - observed_known_before
         )
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
-        attempt_reserved_calls = min(1360, call_budget - observed_calls)
+        attempt_reserved_calls = full_calls_per_route
         execution_route["max_api_calls"] = attempt_reserved_calls
         attempt_id = secrets.token_hex(16)
         suite_output = _attempt_evidence_path(root, "full", attempt_id)
+        execution_route["_campaign_root_path"] = str(root)
         reservation = _write_attempt_event(
             root,
             "full",
@@ -2622,7 +2910,7 @@ def run_full_stage(
                 "requested_route": route.get("requested_route"),
                 "reserved_api_calls": attempt_reserved_calls,
                 "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
-                "approval_sha256": approval["receipt_sha256"],
+                "plan_sha256": plan["plan_sha256"],
             },
         )
         try:
@@ -2737,10 +3025,11 @@ def run_full_stage(
     ]
     decision = build_decision_report(
         current_route=baseline_route,
-        expected_pair_ids=expected_pair_ids,
-        expected_repetitions=expected_repetitions,
         expected_release_tree_sha256=release_tree_sha256,
         suite_reports=reports,
+        authoritative_full_plan=full_plan,
+        expected_plan_sha256=str(plan["plan_sha256"]),
+        expected_execution_contract_sha256=str(plan["plan_sha256"]),
     )
     _atomic_json(root / "DECISION_REPORT.json", decision)
     state.update(build_evidence_posture(reports, decision=decision))
@@ -2859,42 +3148,67 @@ def build_evidence_posture(
 def _comparable_authoritative_reports(
     reports: Sequence[Mapping[str, object]],
     *,
-    expected_pair_ids: Sequence[str],
-    expected_repetitions: int,
+    authoritative_full_plan: Mapping[str, object] | None,
+    expected_plan_sha256: str | None,
+    expected_execution_contract_sha256: str | None,
     expected_release_tree_sha256: str,
 ) -> list[Mapping[str, object]]:
-    planned_pairs = list(expected_pair_ids)
+    """Select reports only when their signed full-stage binding is identical."""
     if (
-        not planned_pairs
-        or any(not isinstance(pair_id, str) or not pair_id for pair_id in planned_pairs)
-        or len(set(planned_pairs)) != len(planned_pairs)
-        or not isinstance(expected_repetitions, int)
-        or isinstance(expected_repetitions, bool)
-        or expected_repetitions < 1
+        authoritative_full_plan is None
+        or not isinstance(expected_plan_sha256, str)
+        or not isinstance(expected_execution_contract_sha256, str)
         or not isinstance(expected_release_tree_sha256, str)
-        or not expected_release_tree_sha256
     ):
         return []
-    expected_episodes = len(planned_pairs) * 2 * expected_repetitions
+    planned_count = authoritative_full_plan.get("planned_route_count")
+    if not isinstance(planned_count, int) or isinstance(planned_count, bool):
+        return []
+    try:
+        full_plan = validate_authoritative_full_stage_plan(
+            authoritative_full_plan, route_count=planned_count
+        )
+    except ValueError:
+        return []
+    contract = full_plan["authoritative_contract"]
+    assert isinstance(contract, Mapping)
     accepted: list[Mapping[str, object]] = []
     seen_routes: set[str] = set()
+    seen_route_ids: set[str] = set()
     for report in reports:
         scheduled = report.get("scheduled_episodes")
         valid = report.get("infrastructure_valid_episodes")
         environment = report.get("execution_environment")
         requested_route = report.get("requested_route")
+        try:
+            binding = validate_authoritative_stage_binding(
+                report.get("authoritative_stage"),
+                plan_sha256=expected_plan_sha256,
+                execution_contract_sha256=expected_execution_contract_sha256,
+            )
+        except ValueError:
+            continue
+        usage = report.get("controller_usage")
+        api_calls = usage.get("api_calls") if isinstance(usage, Mapping) else None
+        route_id = binding.get("route_id")
         if (
             report.get("authoritative") is True
+            and binding.get("full_contract") == contract
+            and isinstance(route_id, str)
+            and route_id not in seen_route_ids
             and isinstance(requested_route, str)
             and bool(requested_route)
             and requested_route not in seen_routes
             and isinstance(scheduled, int)
             and not isinstance(scheduled, bool)
-            and scheduled == expected_episodes
+            and scheduled == FULL_EPISODES_PER_ROUTE
             and valid == scheduled
-            and report.get("pair_ids") == planned_pairs
-            and report.get("repetitions") == expected_repetitions
+            and report.get("pair_ids") == list(AUTHORITATIVE_FULL_PAIR_IDS)
+            and report.get("repetitions") == FULL_REPETITIONS
             and report.get("release_tree_sha256") == expected_release_tree_sha256
+            and isinstance(api_calls, int)
+            and not isinstance(api_calls, bool)
+            and 0 <= api_calls <= FULL_API_CALL_CEILING_PER_ROUTE
             and isinstance(report.get("reasoning_effort"), str)
             and isinstance(report.get("controller_config_sha256"), str)
             and isinstance(environment, Mapping)
@@ -2905,6 +3219,7 @@ def _comparable_authoritative_reports(
         ):
             accepted.append(report)
             seen_routes.add(requested_route)
+            seen_route_ids.add(route_id)
     if not accepted:
         return []
     first = accepted[0]
@@ -2921,30 +3236,57 @@ def _comparable_authoritative_reports(
 def build_decision_report(
     *,
     current_route: str | None,
-    expected_pair_ids: Sequence[str],
-    expected_repetitions: int,
     expected_release_tree_sha256: str,
     suite_reports: Sequence[Mapping[str, object]],
+    authoritative_full_plan: Mapping[str, object] | None = None,
+    expected_plan_sha256: str | None = None,
+    expected_execution_contract_sha256: str | None = None,
+    # Kept only as ignored compatibility inputs. They cannot authorize a switch.
+    expected_pair_ids: Sequence[str] | None = None,
+    expected_repetitions: int | None = None,
 ) -> dict[str, object]:
+    full_contract: Mapping[str, object] | None = None
+    full_valid = False
+    if authoritative_full_plan is not None:
+        count = authoritative_full_plan.get("planned_route_count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            try:
+                validated_full = validate_authoritative_full_stage_plan(
+                    authoritative_full_plan, route_count=count
+                )
+            except ValueError:
+                pass
+            else:
+                candidate = validated_full.get("authoritative_contract")
+                if isinstance(candidate, Mapping):
+                    full_contract = candidate
+                    full_valid = True
     comparable = _comparable_authoritative_reports(
         suite_reports,
-        expected_pair_ids=expected_pair_ids,
-        expected_repetitions=expected_repetitions,
+        authoritative_full_plan=authoritative_full_plan if full_valid else None,
+        expected_plan_sha256=expected_plan_sha256,
+        expected_execution_contract_sha256=expected_execution_contract_sha256,
         expected_release_tree_sha256=expected_release_tree_sha256,
     )
     base: dict[str, object] = {
-        "schema": "oab.decision-report/v2",
+        "schema": "oab.decision-report/v3",
         "created_at": _utc_now(),
         "current_route": current_route,
-        "expected_pair_ids": list(expected_pair_ids),
-        "expected_repetitions": expected_repetitions,
+        "expected_pair_ids": list(AUTHORITATIVE_FULL_PAIR_IDS),
+        "expected_repetitions": FULL_REPETITIONS,
         "expected_release_tree_sha256": expected_release_tree_sha256,
+        "authoritative_full_contract": dict(full_contract) if full_contract is not None else None,
+        "authoritative_plan_sha256": expected_plan_sha256,
+        "authoritative_execution_contract_sha256": expected_execution_contract_sha256,
         "recommendation": "not_supportable",
         "recommended_route": None,
         "reasons": [],
         "claim_scope": "tested route/configuration pairs only; not exact provider serving-model identity",
         "comparable_routes": [str(report.get("requested_route")) for report in comparable],
     }
+    if not full_valid:
+        base["reasons"] = ["authoritative_full_contract_required"]
+        return base
     if len(comparable) < 2:
         base["reasons"] = ["fewer_than_two_authoritative_routes"]
         return base
