@@ -12,11 +12,9 @@ The output is a decision: whether the evidence justifies switching the model you
 > **Requires a Hermes agent installation.** OAB drives models through the Hermes agent harness and reads its configured model routes; the active `hermes` command must remain on `PATH`. It is not a standalone model-evaluation harness today, and there is no adapter for other frameworks yet.
 
 > [!WARNING]
-> **Engine-only integration preview.** This release contains the fail-closed
-> candidate-preparation and broker-facing state-machine primitives. The Hermes
-> Approval Broker, production protected-host adapter, user-presence signing UI,
-> and automatic approval/resume loop do **not** exist yet. The commands below are
-> integration primitives, not a finished “just ask Hermes” product experience.
+> **Qualification and full remain separate explicit commands.** Completing
+> qualification never launches the full comparison. Evidence is exploratory by
+> default and cannot authorize a production route switch.
 
 ### What you get
 
@@ -25,45 +23,38 @@ The output is a decision: whether the evidence justifies switching the model you
 | **Deterministic scoring** | Schema shape, computed values against an oracle, authorization effects, source-read coverage. No judge model. |
 | **Real containment** | macOS Seatbelt or Linux Bubblewrap + libseccomp; network-denied, no-fork. The model never touches your filesystem directly. |
 | **Sealed evidence** | Every episode writes a hash-chained trace that recomputes independently. Aggregates are rebuilt from raw receipts. |
-| **Spend gates** | Nothing calls a provider until you approve exact ceilings. Planning and preview cost $0.00. |
+| **Spend gates** | Provider calls happen only after an explicit `resume --stage` restates the immutable PLAN ceilings. Planning costs $0.00. |
 | **Free to try** | Local Ollama routes run the entire suite at $0.00. |
 
 ---
 
-## Target Hermes experience — requires a future Approval Broker
+## Target Hermes experience
 
 The intended product experience is:
 
 > "Run OAB on this new model and tell me if it beats our current model."
 
-A future protected Hermes integration will confirm the pair, verify the release
-digests, install the wheel, pin exactly two routes, calibrate, obtain separately
-signed stage approvals, run and resume the bounded comparison, verify the seals,
-and return a decision report. That integration is not implemented in this tree.
-
-Qualification and the full comparison are **separate** approvals. Neither is implied by asking the question.
+`oab test-model` creates a two-route campaign, calibrates, and stops. Qualification
+and the full comparison are **separate** `oab resume --stage` commands. Neither is
+implied by asking the question, and completing qualification never launches full.
 
 Two honest caveats, stated before you spend anything:
 
 - **A winner is not guaranteed.** `stay` and "no supportable comparison" are ordinary results. The candidate has to strictly beat your current route on contract completion *without* regressing matched pairs or the weakest pair.
 - **Exploratory evidence cannot authorize a switch.** Authoritative status additionally requires an exact-tree release approval with two distinct reviewers. Without one your campaign is explicitly `exploratory`, and the report will decline to recommend a switch regardless of the numbers.
 
-You approve the disclosed call and cost limits. Before a paid stage can run, a
-separately controlled Ed25519 signer must also sign that exact stage request.
-Once both gates are present, the existing engine can handle the benchmark
-mechanics; the future Approval Broker must supply the protected product loop.
-`AGENTS.md` is the runbook it follows.
+You restate the disclosed call and cost limits on `resume`. Those values must
+match the immutable PLAN exactly; a mismatch fails closed before any provider
+call. `AGENTS.md` is the runbook.
 
-### Signed child boundary
+### PLAN-bound child boundary
 
-Spend approval is not a command-line capability. The campaign parent reconstructs
-the exact signed `PLAN.json`, calibration receipt, v5 stage approval, route,
-effort, cost posture, and planned evidence location, then passes a one-use
-authorization proof to its child through retained file descriptors. A public
-qualification or full child refuses mutable `--qualification-contract-json`
-input, an unsigned proof, or a route, effort, PLAN, public-key, cost-policy, or
-output-path mismatch **before** it constructs a controller. This is deliberate:
-conversation text and mutable CLI JSON are never public child authority.
+Spend is not a signature ceremony. The campaign parent reconstructs the exact
+`PLAN.json`, calibration receipt, route, effort, cost posture, and planned
+evidence location, then passes descriptor-bound campaign identity to its child.
+A public qualification or full child refuses mutable `--qualification-contract-json`
+input or a route, effort, PLAN, cost-policy, or output-path mismatch **before**
+it constructs a controller.
 
 The full stage has a second immutable boundary. Only P01–P08 × approved/
 prohibited × five repetitions — 80 episodes per route, at most 17 calls each,
@@ -102,36 +93,15 @@ The isolated OAB environment avoids package collisions while `oab doctor` safely
 
 ## Run it free first
 
-## Prepare a candidate test from a protected host
+## Prepare a candidate test
 
-The engine integration begins with one intent: name the candidate route. OAB
-discovers the current Hermes route, selects exactly those two routes, checks the
-trusted release and containment environment, calibrates the harness, and returns
-one compact qualification approval card without calling either model:
+Name the candidate route. OAB discovers the current Hermes route, selects exactly those two routes, checks the release and containment environment, calibrates the harness, and returns a compact no-inference campaign card:
 
 ```bash
 oab test-model example-provider/candidate-model
 ```
 
-When invoked by a future production protected host, the candidate route is the
-only user-supplied argument. OAB creates a campaign under `~/OAB-Runs`, uses
-high reasoning, and proposes (but does not authorize) a $5 known-cost stop for
-the plumbing-only qualification stage. Advanced callers can override those
-no-spend preparation defaults before approving anything.
-
-No production protected-host adapter or Approval Broker is included today. A
-future adapter must supply both an independently published release-tree
-pin and its approval authority. Direct CLI launch without that adapter fails
-closed; CLI flags and ambient environment variables cannot replace either trust
-root. The
-person asking to “test this model” should not manage manifests, route IDs,
-receipts, signing payloads, or key files. OAB still stops before provider calls
-until the exact compact card is approved and signed by the separately controlled
-host authority. Qualification is plumbing only, not a quality score. A separate
-full-stage approval remains necessary if both routes qualify. A future protected host
-uses `oab test-model-status <campaign-root>` after each action to receive one
-stable next state—qualification approval, full approval, completion, or a
-terminal blocker—without exposing the user to the internal resume/report steps.
+OAB creates a campaign under `~/OAB-Runs`, uses high reasoning by default, and records bounded qualification/full execution controls in `PLAN.json`. The user does not manage manifests, route IDs, receipts, signing payloads, or key files. Qualification remains plumbing only, not a quality score, and full testing remains a separate explicit stage. `oab test-model-status <campaign-root>` reports qualification-ready, full-stage-ready, complete, or blocked.
 
 You don't need to spend anything to see this work. Local Ollama routes run the full suite at **$0.00**.
 
@@ -253,11 +223,11 @@ Add `--json` for machine-readable output. The command is read-only and never mod
 
 Cost control is a first-class feature, not a footnote.
 
-- `oab benchmark` performs **zero model inference**. It checks the environment, discovers routes, and calibrates.
-- Before any paid stage, `oab approval-preview` prints exactly what will run — ordered routes, episode counts, call ceilings, cost stop, and unknown-cost posture — with **no provider calls**.
-- Nothing runs until you approve those exact values. Approval is bound to the plan and calibration digests, so a receipt can't be reused for a different run.
-- Qualification is a **plumbing-only** check: two bounded multi-turn probes per route (up to four provider calls each; absolute reserve 16 calls/route including one infrastructure-only retry per probe). It reports READY / NOT READY / INCOMPATIBLE and never a model-quality score. A full comparison is a **separate** approval.
-- If a route reports no cost telemetry, the campaign pauses and returns exit `3` rather than guessing. Continuing requires a fresh preview and a new approval carrying `--allow-unknown-costs`. There is no named-provider exception: unknown dollar cost fails closed unless that exact signed policy permits it.
+- `oab benchmark` performs **zero model inference**. It checks the environment, discovers routes, calibrates, and writes immutable qualification/full execution controls into `PLAN.json`.
+- `oab resume --stage qualification` and `oab resume --stage full` are separate explicit actions. Completing qualification never launches full.
+- Each resume must restate the exact planned route count, API-call ceiling, known-cost stop, and unknown-cost posture. A mismatch fails closed before controller construction or provider calls.
+- Qualification is a **plumbing-only** check: two bounded multi-turn probes per route, with an absolute reserve of 24 calls per route. It reports READY / NOT READY / INCOMPATIBLE and never a model-quality score.
+- Unknown dollar cost is recorded as `null`, never `$0`, and may proceed only when the immutable plan explicitly records `allow_unknown_costs=true`.
 
 To compare just your current route against one candidate, pass a two-route inventory instead of letting discovery enumerate everything. Both `oab discover` and `oab benchmark` accept `--inventory-json`:
 
@@ -277,35 +247,21 @@ To compare just your current route against one candidate, pass a two-route inven
 Two routes at 16 absolute calls each is a **32-call** qualification ceiling; the full comparison reserves 1,360 calls per route, a **2,720-call** ceiling. Those are call counts, not dollar estimates — OAB cannot estimate dollars until qualification telemetry exists.
 
 ```bash
-oab approval-preview "$HOME/OAB-Runs/my-campaign" --stage qualification \
-  --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n>
-
-# Show that preview, get an explicit yes in conversation, then produce a signed
-# approval. A conversation reference alone is not accepted: OAB cannot verify it.
-oab approval-request "$HOME/OAB-Runs/my-campaign" --stage qualification \
-  --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n> \
-  --approval-public-key /path/to/approval-public.pem \
-  --output /tmp/qualification-approval.json
-
-# Sign /tmp/qualification-approval.json.signing-payload externally (Ed25519).
-
-oab resume "$HOME/OAB-Runs/my-campaign" \
-  --qualification-approval /tmp/qualification-approval.json \
-  --approval-signature /tmp/qualification-approval.sig \
-  --approval-public-key /path/to/approval-public.pem \
-  --observed-cost-stop-usd <stop> --max-api-calls <ceiling> --max-routes <n>
+oab resume "$HOME/OAB-Runs/my-campaign" --stage qualification \
+  --observed-cost-stop-usd <planned-stop> \
+  --max-api-calls <planned-ceiling> \
+  --max-routes <planned-route-count> \
+  [--allow-unknown-costs]
 ```
 
-Repeat with `--stage full` for the 80-episode comparison, then:
+After qualification, inspect `QUALIFICATION.json`. Full testing remains a separate command using `--stage full` and the exact `full_execution` controls from `PLAN.json`. Then verify and report:
 
 ```bash
 oab verify "$HOME/OAB-Runs/my-campaign"
 oab report "$HOME/OAB-Runs/my-campaign"
 ```
 
-One honest caveat: providers only reveal billed cost *after* a call, so the call that first crosses your threshold may exceed it. Everything after it stops. `--max-cost-usd` is a compatibility alias, not a prepaid cap.
-
-**Approval assurance.** Preview and ask in conversation; execute only with a signed approval. Both steps are required. OAB has no host-backed way to prove that a quoted message reference exists or that its text approves these exact controls, so `--conversation-approval-reference` is refused with `conversation_approval_not_host_verified`, and any hand-written conversational receipt is refused at `resume`. The only accepted spend gate is the externally signed Ed25519 stage approval above; that path is unchanged and still accepted. It authorizes **spend only** — it never confers release authority.
+One honest caveat: providers reveal billed cost only after a call, so the call that first crosses the planned threshold may exceed it. Everything after it stops. `--max-cost-usd` is only a compatibility alias, not a prepaid cap.
 
 ---
 
@@ -358,12 +314,9 @@ See `BENCHMARK_CARD.md` for the construct card, `AGENTS.md` for the agent runboo
 
 ## Status
 
-**Engine status:** public beta, under active hardening. Candidate-only
-preparation and broker-facing state projection are implemented.
+**Engine status:** public beta, under active hardening. Immutable campaign planning, bounded stage execution, resume, verification, and decision reporting are implemented.
 
-**Product status:** incomplete. The Hermes Approval Broker, production
-protected-host adapter, protected signing UX, and automated continuation loop
-are not implemented.
+**Product status:** qualification and full remain separate explicit operations. Evidence is exploratory unless exact-tree release authority and all comparability gates are present; exploratory results cannot authorize a production route switch.
 
 Published release artifacts carry their own pinned test/CI evidence; this source
 checkout must not be called published, released, or CI-verified unless its exact

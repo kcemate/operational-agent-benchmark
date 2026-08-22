@@ -52,8 +52,8 @@ class QualificationAcceptanceTests(unittest.TestCase):
         self.assertEqual("v2.3.0", report["contract"])
         self.assertEqual("oab.qualification-readiness/v1", report["execution_contract"])
         self.assertEqual(2, PROBES_PER_ROUTE)
-        self.assertEqual(4, MAX_STEPS_PER_EPISODE)
-        self.assertEqual(16, ABSOLUTE_CALLS_PER_ROUTE)
+        self.assertEqual(6, MAX_STEPS_PER_EPISODE)
+        self.assertEqual(24, ABSOLUTE_CALLS_PER_ROUTE)
         self.assertEqual(0, report["provider_calls"])
 
     def test_acceptance_report_contains_no_quality_percentage(self) -> None:

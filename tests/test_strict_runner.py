@@ -897,6 +897,82 @@ class QualificationMultiTurnRegressionTests(unittest.TestCase):
             self.assertIn("controller_step_limit_exceeded", result.reason_codes)
             self.assertFalse(result.valid_for_scoring)
 
+    def test_five_turn_rollup_loop_fails_at_four_and_passes_at_six(self) -> None:
+        """P01 data-rollup needs 3 reads + 1 write + final = 5 controller turns."""
+
+        class FiveTurnRollupController:
+            def __init__(self) -> None:
+                self.step = 0
+
+            def begin(self, context: dict[str, object]) -> ControllerIdentity:
+                return ControllerIdentity(
+                    adapter_name="test-five-turn",
+                    adapter_version="1.0",
+                    adapter_sha256="sha256:" + "4" * 64,
+                    requested_route="test/five-turn",
+                    returned_route="test/five-turn",
+                    response_id="response-004",
+                    identity_source="adapter_runtime",
+                )
+
+            def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
+                self.step += 1
+                if self.step == 1:
+                    return ToolRequest("read-policy", "read_text", {"path": "input/value.txt"})
+                if self.step == 2:
+                    return ToolRequest("read-schema", "read_text", {"path": "input/value.txt"})
+                if self.step == 3:
+                    return ToolRequest("read-records", "read_text", {"path": "input/value.txt"})
+                if self.step == 4:
+                    return ToolRequest(
+                        "write-summary",
+                        "write_text",
+                        {"path": "output/result.json", "text": '{"ok": true}'},
+                    )
+                return FinalResponse("rollup complete")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            repository, spec, policy = self.make_spec(base)
+            four = ToolPolicy(
+                allowed_reads=policy.allowed_reads,
+                allowed_writes=policy.allowed_writes,
+                allowed_effects=policy.allowed_effects,
+                max_steps=4,
+                max_write_bytes=policy.max_write_bytes,
+            )
+            six = ToolPolicy(
+                allowed_reads=policy.allowed_reads,
+                allowed_writes=policy.allowed_writes,
+                allowed_effects=policy.allowed_effects,
+                max_steps=6,
+                max_write_bytes=policy.max_write_bytes,
+            )
+            failed = run_strict_episode(
+                spec,
+                controller=FiveTurnRollupController(),
+                tool_policy=four,
+                repository_root=repository,
+                run_root=base / "episodes-fail",
+                evidence_dir=base / "evidence-fail",
+            )
+            self.assertEqual("task_failed", failed.status)
+            self.assertIn("controller_step_limit_exceeded", failed.reason_codes)
+            self.assertNotIn("provider_identity_source_unverified", failed.reason_codes)
+
+            passed = run_strict_episode(
+                spec,
+                controller=FiveTurnRollupController(),
+                tool_policy=six,
+                repository_root=repository,
+                run_root=base / "episodes-pass",
+                evidence_dir=base / "evidence-pass",
+            )
+            self.assertEqual("completed", passed.status)
+            self.assertTrue(passed.valid_for_scoring)
+            self.assertNotIn("controller_step_limit_exceeded", passed.reason_codes)
+            self.assertNotIn("provider_identity_source_unverified", passed.reason_codes)
+
 
 class ControllerUsageSnapshotTests(unittest.TestCase):
     """Episode usage must carry every field the suite aggregator recomputes.

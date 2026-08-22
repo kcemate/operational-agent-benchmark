@@ -16,7 +16,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 
 from oab.aggregation import aggregate_suite_observations, format_headline
-from oab.campaign_authorization import verify_campaign_child_authorization
+from oab.campaign_contract import verify_campaign_child_contract
 from oab.full_stage_contract import (
     AUTHORITATIVE_FULL_PAIR_IDS,
     FULL_API_CALL_CEILING_PER_ROUTE,
@@ -474,7 +474,8 @@ def _run_authoritative_full_stage(
     output_root: Path,
     runtime_home: Path,
     release_tree_sha256: str,
-    release_approval_sha256: str,
+    release_approval_sha256: str | None,
+    release_authorized: bool,
     authorization: Mapping[str, object],
 ) -> int:
     """Execute the sole full-stage authority tuple reconstructed from PLAN."""
@@ -529,15 +530,15 @@ def _run_authoritative_full_stage(
     route_id = authorization.get("route_id")
     output_relative_path = authorization.get("output_relative_path")
     plan_sha256 = authorization.get("plan_sha256")
-    stage_approval_sha256 = authorization.get("stage_approval_sha256")
+    execution_contract_sha256 = authorization.get("execution_contract_sha256")
     if not all(
         isinstance(value, str) and value
-        for value in (route_id, output_relative_path, plan_sha256, stage_approval_sha256)
+        for value in (route_id, output_relative_path, plan_sha256, execution_contract_sha256)
     ):
         raise ValueError("authoritative_full_execution_contract_invalid")
     binding = build_authoritative_stage_binding(
         plan_sha256=str(plan_sha256),
-        stage_approval_sha256=str(stage_approval_sha256),
+        execution_contract_sha256=str(execution_contract_sha256),
         route_id=str(route_id),
         output_relative_path=str(output_relative_path),
         full_plan=full_plan,
@@ -552,7 +553,7 @@ def _run_authoritative_full_stage(
         ),
         release_tree_sha256=release_tree_sha256,
         release_approval_sha256=release_approval_sha256,
-        release_authorized=True,
+        release_authorized=bool(release_authorized),
         repetitions=FULL_REPETITIONS,
         pair_ids=list(AUTHORITATIVE_FULL_PAIR_IDS),
         case_ids_by_pair=_case_ids_by_pair(selected_cases),
@@ -664,7 +665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--authoritative-full-v1", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--campaign-root-path", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--campaign-root-fd", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--campaign-authorization-fd", type=int, default=None, help=argparse.SUPPRESS)
+
     args = parser.parse_args(argv)
 
     protected_stage: str | None = None
@@ -686,11 +687,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             args.campaign_root_path is None
             or args.campaign_root_fd is None
-            or args.campaign_authorization_fd is None
             or args.output_parent_fd is None
             or args.output_name is None
         ):
-            raise SystemExit("campaign_child_authorization_required")
+            raise SystemExit("campaign_child_contract_required")
         if protected_stage == "full" and (
             args.pairs is not None
             or args.repetitions is not None
@@ -698,11 +698,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise SystemExit("authoritative_full_arguments_invalid")
         try:
-            child_authorization = verify_campaign_child_authorization(
+            child_authorization = verify_campaign_child_contract(
                 stage=protected_stage,
                 campaign_root_path=args.campaign_root_path,
                 campaign_root_fd=args.campaign_root_fd,
-                authorization_fd=args.campaign_authorization_fd,
+
                 output_parent_fd=args.output_parent_fd,
                 requested_route=f"{args.provider}/{args.model}",
                 reasoning_effort=args.reasoning_effort,
@@ -762,7 +762,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         release_approval_sha256 = str(approval["file_sha256"])
         release_authorized = True
     if protected_stage == "full" and not release_authorized:
-        raise SystemExit("authoritative_full_release_approval_required")
+        # Exploratory full may run without a release approval. Decision/switch
+        # authority still requires an independently pinned release approval.
+        pass
 
     if (args.output_parent_fd is None) != (args.output_name is None):
         raise SystemExit("internal output descriptor and name are required together")
@@ -841,7 +843,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.authoritative_full_v1:
         if (
             not isinstance(release_tree_sha256, str)
-            or release_approval_sha256 is None
             or child_authorization is None
         ):
             raise SystemExit("authoritative_full_execution_contract_invalid")
@@ -856,6 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runtime_home=runtime.home,
                     release_tree_sha256=release_tree_sha256,
                     release_approval_sha256=release_approval_sha256,
+                    release_authorized=release_authorized,
                     authorization=child_authorization,
                 )
         except ValueError as exc:

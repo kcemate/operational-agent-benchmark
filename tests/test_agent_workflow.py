@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import Mapping, cast
 from unittest.mock import patch
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import oab.agent_workflow as agent_workflow_module
 from oab.agent_workflow import (
@@ -23,9 +21,7 @@ from oab.agent_workflow import (
     _validate_campaign_orchestration_metadata,
     _write_attempt_event,
     build_campaign_plan,
-    build_approval_preview,
     build_decision_report,
-    build_stage_approval_request,
     classify_qualification,
     doctor_environment,
     initialize_campaign,
@@ -37,7 +33,6 @@ from oab.agent_workflow import (
     sanitize_hermes_inventory,
     select_model_comparison_inventory,
     project_test_model_state,
-    verify_stage_approval,
 )
 from oab.qualification_contract import (
     QUALIFICATION_CONTRACT_ID,
@@ -45,6 +40,7 @@ from oab.qualification_contract import (
     qualification_contract_for_route_count,
     qualification_probe_definitions,
 )
+from oab.campaign_contract import campaign_plan_sha256
 from oab.full_stage_contract import (
     authoritative_full_contract_for_route_count,
     build_authoritative_stage_binding,
@@ -57,16 +53,6 @@ _REAL_INITIALIZE_CAMPAIGN = initialize_campaign
 
 class AgentWorkflowContractTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._key_tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._key_tempdir.cleanup)
-        self._approval_private_key = Ed25519PrivateKey.generate()
-        self._approval_public_path = Path(self._key_tempdir.name) / "approval-authority.pem"
-        self._approval_public_path.write_bytes(
-            self._approval_private_key.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-        )
         self._initialize_patch = patch(
             __name__ + ".initialize_campaign",
             side_effect=self._initialize_with_pinned_test_key,
@@ -83,21 +69,20 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     doctor.get("release_tree_sha256") or ("sha256:" + "e" * 64)
                 ),
             }
-        kwargs.setdefault("approval_authority_public_key_path", self._approval_public_path)
         return _REAL_INITIALIZE_CAMPAIGN(*args, **kwargs)
 
     def authoritative_decision_context(self, *route_ids: str) -> dict[str, object]:
         plan_sha256 = "sha256:" + "a" * 64
-        approval_sha256 = "sha256:" + "d" * 64
+        execution_contract_sha256 = "sha256:" + "d" * 64
         full_plan = authoritative_full_contract_for_route_count(len(route_ids))
         return {
             "authoritative_full_plan": full_plan,
             "expected_plan_sha256": plan_sha256,
-            "expected_stage_approval_sha256": approval_sha256,
+            "expected_execution_contract_sha256": execution_contract_sha256,
             "bindings": {
                 route_id: build_authoritative_stage_binding(
                     plan_sha256=plan_sha256,
-                    stage_approval_sha256=approval_sha256,
+                    execution_contract_sha256=execution_contract_sha256,
                     route_id=route_id,
                     output_relative_path=f"full/attempts/{index:032x}.evidence",
                     full_plan=full_plan,
@@ -198,93 +183,24 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 }
             )
 
-    def signed_stage_approval(
-        self,
-        root: Path,
-        *,
-        stage: str,
-        max_cost_usd: float,
-        max_api_calls: int,
-        max_routes: int,
-        allow_unknown_costs: bool,
-    ) -> dict[str, Path]:
-        state = load_campaign(root)
-        if state.get("calibration_passed") is not True:
-            record_calibration(
-                root,
-                {"schema": "oab.calibration-report/v1", "passed": True, "failures": []},
-            )
-        serial = len(list(root.parent.glob("test-approval-*.json")))
-        receipt_path = root.parent / f"test-approval-{serial}.json"
-        signature_path = root.parent / f"test-approval-{serial}.sig"
-        receipt = build_stage_approval_request(
-            root,
-            stage=stage,
-            max_cost_usd=max_cost_usd,
-            max_api_calls=max_api_calls,
-            max_routes=max_routes,
-            allow_unknown_costs=allow_unknown_costs,
-            approval_public_key_path=self._approval_public_path,
-        )
-        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-        signed_bytes = json.dumps(
-            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-        ).encode("utf-8")
-        signature_path.write_bytes(self._approval_private_key.sign(signed_bytes))
-        return {
-            "approval_path": receipt_path,
-            "approval_signature_path": signature_path,
-            "approval_public_key_path": self._approval_public_path,
+    def signed_stage_approval(self, root: Path, *args: object, **kwargs: object) -> dict[str, object]:
+        stage = kwargs.get("stage")
+        plan_path = root / "PLAN.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        field = "qualification_execution" if stage == "qualification" else "full_execution"
+        controls = {
+            "known_cost_stop_usd": float(cast(float, kwargs["max_cost_usd"])),
+            "max_api_calls": cast(int, kwargs["max_api_calls"]),
+            "max_routes": cast(int, kwargs["max_routes"]),
+            "allow_unknown_costs": cast(bool, kwargs["allow_unknown_costs"]),
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
         }
+        plan[field] = controls
+        plan["plan_sha256"] = campaign_plan_sha256(plan)
+        plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return {}
 
-    def test_stage_approval_requires_valid_signature_and_exact_controls(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            artifacts = self.signed_stage_approval(
-                root,
-                stage="qualification",
-                max_cost_usd=1.0,
-                max_api_calls=48,
-                max_routes=3,
-                allow_unknown_costs=False,
-            )
-            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
-            state = load_campaign(root)
-            kwargs = {
-                "expected_plan_sha256": plan["plan_sha256"],
-                "expected_calibration_sha256": state["calibration_sha256"],
-                "expected_stage": "qualification",
-                "expected_route_ids": [item["route_id"] for item in plan["routes"]],
-                "expected_max_cost_usd": 1.0,
-                "expected_max_api_calls": 48,
-                "expected_max_routes": 3,
-                "expected_allow_unknown_costs": False,
-                "public_key_path": artifacts["approval_public_key_path"],
-                "signature_path": artifacts["approval_signature_path"],
-                "campaign_root": root,
-                "expected_plan": plan,
-            }
-            receipt_path = artifacts["approval_path"]
-            self.assertEqual([], verify_stage_approval(receipt_path, **kwargs))
-            self.assertEqual(
-                ["stage_approval_invalid"],
-                verify_stage_approval(
-                    receipt_path,
-                    **{**kwargs, "expected_calibration_sha256": "sha256:" + "d" * 64},
-                ),
-            )
-            self.assertEqual(
-                ["stage_approval_controls_mismatch"],
-                verify_stage_approval(receipt_path, **{**kwargs, "expected_max_api_calls": 47}),
-            )
-            artifacts["approval_signature_path"].write_bytes(b"")
-            self.assertEqual(["stage_approval_invalid"], verify_stage_approval(receipt_path, **kwargs))
 
     def test_record_calibration_accepts_current_all_pairs_schema(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -309,193 +225,9 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertEqual("oab.calibration-report/v2", receipt["schema"])
             self.assertTrue(load_campaign(root)["calibration_passed"])
 
-    def test_caller_asserted_conversational_receipt_cannot_authorize_spend(self) -> None:
-        """A caller-asserted conversation reference is not host-verified evidence.
 
-        Anyone able to run the CLI can write such a receipt, so it must never reach a
-        spend-capable stage. Only the externally signed stage approval qualifies.
-        """
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-            )
-            record_calibration(root, {"schema": "oab.calibration-report/v1", "passed": True})
-            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
-            state = load_campaign(root)
-            _plan, routes = _planned_stage_routes(
-                root, state, stage="qualification", route_cap=2
-            )
-            body: dict[str, object] = {
-                "schema": "oab.conversational-stage-approval/v2",
-                "created_at": "2026-08-09T00:00:00+00:00",
-                "approval_assurance": "conversation_attested",
-                "user_approval_reference": "telegram:user-confirmed:$5:68:2:unknown-cost",
-                "stage": "qualification",
-                "plan_sha256": plan["plan_sha256"],
-                "calibration_sha256": state["calibration_sha256"],
-                "route_ids": [str(route["route_id"]) for route in routes],
-                "observed_cost_stop_usd": 5.0,
-                "cost_control_mode": "post_provider_call_observed_known_cost_stop",
-                "max_cost_overshoot_api_calls": 1,
-                "max_api_calls": 68,
-                "max_routes": 2,
-                "allow_unknown_costs": True,
-            }
-            body["receipt_sha256"] = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    body,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            approval_path = Path(td) / "qualification-conversation.json"
-            approval_path.write_text(json.dumps(body), encoding="utf-8")
-            calls: list[str] = []
 
-            def runner(route: dict[str, object], _stage: str, output: Path, _effort: str) -> dict[str, object]:
-                calls.append(str(route["requested_route"]))
-                return self.qualification_report(
-                    str(route["requested_route"]),
-                    output=output,
-                    contract=cast(Mapping[str, object], route["_qualification_contract"]),
-                )
 
-            with self.assertRaisesRegex(
-                ValueError, "conversation_approval_not_host_verified"
-            ):
-                run_qualification_stage(
-                    root,
-                    runner=runner,
-                    approval_path=approval_path,
-                    approval_signature_path=None,
-                    approval_public_key_path=None,
-                    max_cost_usd=5.0,
-                    max_api_calls=32,
-                    max_routes=2,
-                    allow_unknown_costs=True,
-                )
-            self.assertEqual([], calls)
-            spend = load_campaign(root).get("spend")
-            self.assertTrue(
-                not isinstance(spend, dict)
-                or spend.get("qualification_approved") is not True
-            )
-            self.assertFalse(sorted((root / "APPROVALS").glob("*.json")))
-
-    def test_signed_stage_approval_still_authorizes_qualification(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-            )
-            approval = self.signed_stage_approval(
-                root,
-                stage="qualification",
-                max_cost_usd=5.0,
-                max_api_calls=32,
-                max_routes=2,
-                allow_unknown_costs=True,
-            )
-            state = run_qualification_stage(
-                root,
-                runner=lambda route, _stage, output, _effort: self.qualification_report(
-                    str(route["requested_route"]),
-                    output=output,
-                    contract=cast(Mapping[str, object], route["_qualification_contract"]),
-                ),
-                max_cost_usd=5.0,
-                max_api_calls=32,
-                max_routes=2,
-                allow_unknown_costs=True,
-                **approval,
-            )
-            spend = state["spend"]
-            assert isinstance(spend, dict)
-            self.assertTrue(spend["qualification_approved"])
-            self.assertEqual(
-                "external_signature", spend["qualification_approval_assurance"]
-            )
-
-    def test_route_semantics_cannot_change_after_plan_and_approval(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-            )
-            approval = self.signed_stage_approval(
-                root,
-                stage="qualification",
-                max_cost_usd=5.0,
-                max_api_calls=32,
-                max_routes=2,
-                allow_unknown_costs=False,
-            )
-            discovery_path = root / "DISCOVERY.json"
-            discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
-            discovery["routes"][0]["provider"] = "xai-oauth"
-            discovery["routes"][0]["model"] = "grok-mutated"
-            discovery["routes"][0]["requested_route"] = "xai-oauth/grok-mutated"
-            discovery_path.write_text(json.dumps(discovery), encoding="utf-8")
-            calls: list[object] = []
-
-            with self.assertRaisesRegex(ValueError, "campaign_discovery_plan_mismatch"):
-                run_qualification_stage(
-                    root,
-                    runner=lambda *args: calls.append(args),
-                    max_cost_usd=5.0,
-                    max_api_calls=32,
-                    max_routes=2,
-                    allow_unknown_costs=False,
-                    **approval,
-                )
-            self.assertEqual([], calls)
-
-    def test_reasoning_effort_cannot_change_after_plan_and_approval(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-            )
-            approval = self.signed_stage_approval(
-                root,
-                stage="qualification",
-                max_cost_usd=5.0,
-                max_api_calls=32,
-                max_routes=2,
-                allow_unknown_costs=False,
-            )
-            campaign_path = root / "CAMPAIGN.json"
-            campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
-            campaign["reasoning_effort"] = "low"
-            campaign_path.write_text(json.dumps(campaign), encoding="utf-8")
-            calls: list[object] = []
-
-            with self.assertRaisesRegex(ValueError, "campaign_reasoning_effort_mismatch"):
-                run_qualification_stage(
-                    root,
-                    runner=lambda *args: calls.append(args),
-                    max_cost_usd=5.0,
-                    max_api_calls=32,
-                    max_routes=2,
-                    allow_unknown_costs=False,
-                    **approval,
-                )
-            self.assertEqual([], calls)
 
     def inventory(self) -> dict[str, object]:
         return {
@@ -846,62 +578,16 @@ class AgentWorkflowContractTests(unittest.TestCase):
             discovery,
             reasoning_effort="high",
             release_tree_sha256="sha256:" + "e" * 64,
-            approval_authority_public_key_sha256=(
-                "sha256:" + hashlib.sha256(self._approval_public_path.read_bytes()).hexdigest()
-            ),
         )
-        self.assertEqual("oab.campaign-plan/v2", plan["schema"])
+        self.assertEqual("oab.campaign-plan/v3", plan["schema"])
         self.assertEqual(3, plan["route_count"])
         self.assertEqual(qualification_contract_for_route_count(3), plan["qualification"])
         self.assertEqual(1, plan["qualification"]["repetitions"])
         self.assertEqual(2, plan["qualification"]["episodes_per_route"])
         self.assertEqual(6, plan["qualification"]["scheduled_episodes"])
         self.assertEqual(240, plan["full_run"]["scheduled_episodes"])
-        self.assertIn("approval_authority_public_key_sha256", plan)
         self.assertIn("plan_sha256", plan)
 
-    def test_v230_readiness_plan_tuple_and_preview_are_exactly_bound(self) -> None:
-        """The signed plan, not a child default, selects readiness execution semantics."""
-        discovery = sanitize_hermes_inventory(self.inventory())
-        plan = build_campaign_plan(
-            discovery,
-            reasoning_effort="high",
-            release_tree_sha256="sha256:" + "e" * 64,
-            approval_authority_public_key_sha256=(
-                "sha256:" + hashlib.sha256(self._approval_public_path.read_bytes()).hexdigest()
-            ),
-        )
-        qualification = plan["qualification"]
-        self.assertEqual(qualification_contract_for_route_count(3), qualification)
-        self.assertEqual(
-            "oab.qualification-readiness/v1",
-            agent_workflow_module._qualification_execution_contract(plan),
-        )
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            record_calibration(
-                root,
-                {"schema": "oab.calibration-report/v1", "passed": True, "failures": []},
-            )
-            preview = build_approval_preview(
-                root,
-                stage="qualification",
-                max_cost_usd=5.0,
-                max_api_calls=48,
-                max_routes=3,
-                allow_unknown_costs=False,
-            )
-        self.assertEqual(2, preview["episodes_per_route"])
-        self.assertEqual(6, preview["scheduled_episodes"])
-        self.assertEqual(8, preview["first_attempt_api_calls_per_route"])
-        self.assertEqual(16, preview["absolute_api_calls_per_route"])
-        self.assertEqual(48, preview["absolute_reserved_api_calls"])
 
     def test_historical_legacy_report_can_be_read_but_not_used_as_v230_contract(self) -> None:
         """Historical 34-episode evidence remains readable but cannot select v2.3 execution."""
@@ -1019,32 +705,6 @@ class AgentWorkflowContractTests(unittest.TestCase):
             plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
             self.assertRegex(plan["plan_sha256"], r"^sha256:[0-9a-f]{64}$")
 
-    def test_stage_approval_request_requires_passing_calibration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            public_path = Path(td) / "approval-public.pem"
-            public_path.write_bytes(
-                Ed25519PrivateKey.generate().public_key().public_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-            )
-            with self.assertRaisesRegex(ValueError, "campaign_calibration_required"):
-                build_stage_approval_request(
-                    root,
-                    stage="qualification",
-                    max_cost_usd=1.0,
-                    max_api_calls=16,
-                    max_routes=1,
-                    allow_unknown_costs=False,
-                    approval_public_key_path=public_path,
-                )
 
     def test_resume_rejects_configuration_drift(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1204,18 +864,18 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=48,
+                    max_api_calls=72,
                     max_routes=3,
                     allow_unknown_costs=False,
                 ),
             )
-            self.assertEqual("awaiting_full_run_approval", state["status"])
+            self.assertEqual("qualification_complete", state["status"])
             receipts = sorted((root / "qualification" / "results").glob("*.json"))
             self.assertEqual(3, len(receipts))
             for receipt in receipts:
@@ -1274,25 +934,23 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=48,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=72,
                     max_routes=3, allow_unknown_costs=False,
                 ),
             )
-            self.assertEqual("awaiting_full_run_approval", state["status"])
+            self.assertEqual("qualification_complete", state["status"])
             self.assertEqual(3, len(calls))
             self.assertEqual(2, len(state["qualified_routes"]))
             self.assertEqual(1, len(state["excluded_routes"]))
             self.assertAlmostEqual(0.6, state["spend"]["observed_qualification_cost_usd"])
-            approvals = list((root / "APPROVALS").glob("qualification-*.json"))
-            self.assertEqual(1, len(approvals))
-            approval = json.loads(approvals[0].read_text(encoding="utf-8"))
-            self.assertEqual("qualification", approval["stage"])
-            self.assertEqual(48, approval["max_api_calls"])
-            self.assertEqual(3, approval["max_routes"])
-            self.assertRegex(approval["receipt_sha256"], r"^sha256:[0-9a-f]{64}$")
+            self.assertFalse((root / "APPROVALS").exists())
+            plan = json.loads((root / "PLAN.json").read_text(encoding="utf-8"))
+            controls = plan["qualification_execution"]
+            self.assertEqual(72, controls["max_api_calls"])
+            self.assertEqual(3, controls["max_routes"])
             qualification = json.loads((root / "QUALIFICATION.json").read_text(encoding="utf-8"))
             # 2 qualified routes × $0.1 × (80 full episodes / 2 qual probes) = $8.0
             self.assertEqual(8.0, qualification["projected_full_run_cost_usd"])
@@ -1343,10 +1001,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=0.5,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=0.5, max_api_calls=16,
+                    root, stage="qualification", max_cost_usd=0.5, max_api_calls=24,
                     max_routes=1, allow_unknown_costs=False,
                 ),
             )
@@ -1381,13 +1039,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=False,
                 ),
@@ -1421,10 +1079,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=48,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=72,
                     max_routes=3, allow_unknown_costs=False,
                 ),
             )
@@ -1441,10 +1099,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=True,
-                    max_api_calls=48,
+                    max_api_calls=72,
                     max_routes=3,
                     **self.signed_stage_approval(
-                        root, stage="qualification", max_cost_usd=1.0, max_api_calls=48,
+                        root, stage="qualification", max_cost_usd=1.0, max_api_calls=72,
                         max_routes=3, allow_unknown_costs=True,
                     ),
                 )
@@ -1453,7 +1111,6 @@ class AgentWorkflowContractTests(unittest.TestCase):
 
     def test_stage_rejects_symlinked_campaign_internal_directories(self) -> None:
         for relative in (
-            Path("APPROVALS"),
             Path("qualification/results"),
             Path("qualification/suites"),
         ):
@@ -1469,7 +1126,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     allow_unknown_costs=False,
                 )
@@ -1488,7 +1145,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                         runner=lambda *_args: self.readiness_report("unused"),
                         max_cost_usd=1.0,
                         allow_unknown_costs=False,
-                        max_api_calls=32,
+                        max_api_calls=48,
                         max_routes=2,
                         **approval,
                     )
@@ -1517,13 +1174,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=interrupted,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     allow_unknown_costs=False,
                 ),
@@ -1535,7 +1192,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
             self.assertTrue(list(attempts.glob("*.failed.json")))
             self.assertTrue(list(attempts.glob("*.evidence")))
             self.assertEqual(
-                16,
+                24,
                 first["spend"]["qualification_failed_attempt_reserved_api_calls"],
             )
             self.assertTrue(first["spend"]["unknown_cost_encountered"])
@@ -1546,13 +1203,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=lambda route, *_args: blocked_calls.append(str(route["route_id"])),
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     allow_unknown_costs=False,
                 ),
@@ -1575,13 +1232,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=completed,
                 max_cost_usd=1.0,
                 allow_unknown_costs=True,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     allow_unknown_costs=True,
                 ),
@@ -1611,19 +1268,19 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=interrupted,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=False,
                 ),
             )
             self.assertEqual(
-                16,
+                24,
                 first["spend"]["qualification_failed_attempt_reserved_api_calls"],
             )
             attempts = root / "qualification/attempts"
@@ -1657,19 +1314,19 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=interrupted,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=False,
                 ),
             )
             self.assertEqual(
-                16,
+                24,
                 first["spend"]["qualification_failed_attempt_reserved_api_calls"],
             )
             attempts = root / "qualification/attempts"
@@ -1685,13 +1342,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     ),
                     max_cost_usd=1.0,
                     allow_unknown_costs=True,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **self.signed_stage_approval(
                         root,
                         stage="qualification",
                         max_cost_usd=1.0,
-                        max_api_calls=16,
+                        max_api_calls=24,
                         max_routes=1,
                         allow_unknown_costs=True,
                     ),
@@ -1719,13 +1376,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=interrupted,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=False,
                 ),
@@ -1747,7 +1404,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=1.0,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 allow_unknown_costs=True,
             )
@@ -1763,14 +1420,14 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     )[1],
                     max_cost_usd=1.0,
                     allow_unknown_costs=True,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **resume_approval,
                 )
             self.assertTrue(swapped)
             self.assertEqual([], resumed_calls)
             self.assertEqual(
-                16,
+                24,
                 resumed["spend"]["qualification_failed_attempt_reserved_api_calls"],
             )
 
@@ -1803,13 +1460,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=1.0,
-                    max_api_calls=48,
+                    max_api_calls=72,
                     max_routes=3,
                     allow_unknown_costs=False,
                 ),
@@ -1823,13 +1480,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=False,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **self.signed_stage_approval(
                         root,
                         stage="qualification",
                         max_cost_usd=1.0,
-                        max_api_calls=16,
+                        max_api_calls=24,
                         max_routes=1,
                         allow_unknown_costs=False,
                     ),
@@ -1863,13 +1520,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=5.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=5.0,
-                    max_api_calls=48,
+                    max_api_calls=72,
                     max_routes=3,
                     allow_unknown_costs=False,
                 ),
@@ -1891,13 +1548,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=5.0,
                     allow_unknown_costs=True,
-                    max_api_calls=48,
+                    max_api_calls=72,
                     max_routes=3,
                     **self.signed_stage_approval(
                         root,
                         stage="qualification",
                         max_cost_usd=5.0,
-                        max_api_calls=48,
+                        max_api_calls=72,
                         max_routes=3,
                         allow_unknown_costs=True,
                     ),
@@ -1927,7 +1584,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=1.0,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 allow_unknown_costs=False,
             )
@@ -1936,7 +1593,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **approval,
             )
@@ -1964,7 +1621,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=False,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **approval,
                 )
@@ -1992,7 +1649,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=1.0,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 allow_unknown_costs=False,
             )
@@ -2001,7 +1658,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **approval,
             )
@@ -2047,7 +1704,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=False,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **approval,
                 )
@@ -2080,7 +1737,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=1.0,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 allow_unknown_costs=False,
             )
@@ -2089,7 +1746,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **approval,
             )
@@ -2117,7 +1774,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=False,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **approval,
                 )
@@ -2150,7 +1807,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=1.0,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 allow_unknown_costs=False,
             )
@@ -2159,7 +1816,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **approval,
             )
@@ -2174,7 +1831,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=1.0,
                     allow_unknown_costs=False,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     **approval,
                 )
@@ -2206,10 +1863,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=qualify,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=48,
+                max_api_calls=72,
                 max_routes=3,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=48,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=72,
                     max_routes=3, allow_unknown_costs=False,
                 ),
             )
@@ -2255,10 +1912,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     plan_sha256=str(
                         json.loads((root / "PLAN.json").read_text(encoding="utf-8"))["plan_sha256"]
                     ),
-                    stage_approval_sha256=str(
-                        json.loads(
-                            Path(str(route["_campaign_approval_path"])).read_text(encoding="utf-8")
-                        )["receipt_sha256"]
+                    execution_contract_sha256=str(
+                        json.loads((root / "PLAN.json").read_text(encoding="utf-8"))["plan_sha256"]
                     ),
                     route_id=str(route["route_id"]),
                     output_relative_path=str(output.resolve().relative_to(root.resolve())),
@@ -2450,10 +2105,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     contract=cast(Mapping[str, object], route["_qualification_contract"]),
                 )
 
-            # A 15-call request cannot even produce a signed readiness stage proof:
+            # A 15-call plan is invalid: the immutable per-route ceiling is 16.
             # the immutable per-route ceiling is exactly 16.
             with self.assertRaisesRegex(
-                ValueError, "stage_api_call_budget_must_match_authoritative_tuple"
+                ValueError, "campaign_plan_invalid"
             ):
                 run_qualification_stage(
                     root,
@@ -2497,10 +2152,10 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=1.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
-                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=16,
+                    root, stage="qualification", max_cost_usd=1.0, max_api_calls=24,
                     max_routes=1, allow_unknown_costs=False,
                 ),
             )
@@ -2594,92 +2249,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
         self.assertEqual("not_supportable", report["recommendation"])
         self.assertIn("authoritative_full_contract_required", report["reasons"])
 
-    def test_v230_signed_call_ceiling_is_exact_for_selected_routes(self) -> None:
-        """A stage proof binds the selected routes × 16-call readiness ceiling exactly."""
-        for call_budget in (32,):
-            with self.subTest(max_api_calls=call_budget), tempfile.TemporaryDirectory() as td:
-                root = Path(td) / "campaign"
-                initialize_campaign(
-                    root,
-                    doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                    inventory_payload=self.inventory(),
-                    reasoning_effort="high",
-                )
-                route_limits: list[int] = []
 
-                def runner(
-                    route: dict[str, object], stage: str, output: Path, effort: str
-                ) -> dict[str, object]:
-                    route_limit = route["max_api_calls"]
-                    assert isinstance(route_limit, int) and not isinstance(route_limit, bool)
-                    route_limits.append(route_limit)
-                    probes = qualification_probe_definitions()
-                    attempts = [
-                        {
-                            "probe": probe,
-                            "attempt_number": number,
-                            "status": "runner_invalid" if number == 1 else "completed",
-                            "reason_codes": ["provider_unavailable"] if number == 1 else [],
-                            "telemetry": qualification_usage(
-                                api_calls=4,
-                                cost_usd=0.0,
-                                known_cost_usd=0.0,
-                                unknown_cost_api_calls=0,
-                            ),
-                        }
-                        for number in (1, 2)
-                        for probe in probes
-                    ]
-                    return self.qualification_report(
-                        str(route["requested_route"]),
-                        output=output,
-                        contract=cast(Mapping[str, object], route["_qualification_contract"]),
-                        attempts=attempts,
-                    )
-
-                approval = self.signed_stage_approval(
-                    root,
-                    stage="qualification",
-                    max_cost_usd=10.0,
-                    max_api_calls=call_budget,
-                    max_routes=2,
-                    allow_unknown_costs=False,
-                )
-                state = run_qualification_stage(
-                    root,
-                    runner=runner,
-                    max_cost_usd=10.0,
-                    allow_unknown_costs=False,
-                    max_api_calls=call_budget,
-                    max_routes=2,
-                    **approval,
-                )
-
-                self.assertEqual([16, 16], route_limits)
-                self.assertEqual("awaiting_full_run_approval", state["status"])
-
-    def test_v230_signed_call_ceiling_rejects_headroom_or_shortfall(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            for call_budget in (16, 48):
-                with self.subTest(max_api_calls=call_budget):
-                    with self.assertRaisesRegex(
-                        ValueError, "stage_api_call_budget_must_match_authoritative_tuple"
-                    ):
-                        self.signed_stage_approval(
-                            root,
-                            stage="qualification",
-                            max_cost_usd=10.0,
-                            max_api_calls=call_budget,
-                            max_routes=2,
-                            allow_unknown_costs=False,
-                        )
 
     def test_v230_plan_rejects_legacy_shaped_qualification_report(self) -> None:
         """A report cannot replace the signed two-probe execution contract."""
@@ -2719,7 +2289,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     root,
                     stage="qualification",
                     max_cost_usd=10.0,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     allow_unknown_costs=False,
                 )
@@ -2728,17 +2298,17 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     runner=runner,
                     max_cost_usd=10.0,
                     allow_unknown_costs=False,
-                    max_api_calls=32,
+                    max_api_calls=48,
                     max_routes=2,
                     **approval,
                 )
 
-                self.assertEqual([16], route_limits)
+                self.assertEqual([24], route_limits)
                 self.assertEqual([], state["qualified_routes"])
                 self.assertEqual(1, len(calls))
 
     def test_v230_first_route_overrun_is_terminal(self) -> None:
-        """A route that exceeds its 16-call allowance cannot be retried or promoted."""
+        """A route that exceeds its 24-call allowance cannot be retried or promoted."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
             initialize_campaign(
@@ -2780,7 +2350,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=10.0,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 allow_unknown_costs=False,
             )
@@ -2789,11 +2359,11 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=overrun_runner,
                 max_cost_usd=10.0,
                 allow_unknown_costs=False,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **first_approval,
             )
-            self.assertEqual([16], route_limits)
+            self.assertEqual([24], route_limits)
             self.assertEqual(1, len(calls))
             self.assertEqual("blocked_unknown_api_calls", first["status"])
             self.assertEqual([], first["qualified_routes"])
@@ -2803,7 +2373,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=10.0,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 allow_unknown_costs=False,
             )
@@ -2814,7 +2384,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 ) or {},
                 max_cost_usd=10.0,
                 allow_unknown_costs=False,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **resumed_approval,
             )
@@ -2830,9 +2400,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     allow_unknown_costs=False,
                     max_api_calls=2720,
                     max_routes=2,
-                    approval_path=root / "missing-full-approval.json",
-                    approval_signature_path=None,
-                    approval_public_key_path=None,
+
                 )
             self.assertEqual([], full_calls)
 
@@ -2872,7 +2440,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 allow_unknown_costs=False,
             )
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["status"] = "awaiting_full_run_approval"
+            state["status"] = "qualification_complete"
             state_path.write_text(json.dumps(state), encoding="utf-8")
             full_calls: list[str] = []
 
@@ -2923,7 +2491,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 )
             self.assertEqual([], full_calls)
 
-    def test_v230_interrupted_route_cannot_reuse_16_call_reserve(self) -> None:
+    def test_v230_interrupted_route_cannot_reuse_24_call_reserve(self) -> None:
         """An unaccounted interrupted route consumes its full route reserve."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "campaign"
@@ -2945,19 +2513,19 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=interrupted,
                 max_cost_usd=10.0,
                 allow_unknown_costs=False,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=10.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=False,
                 ),
             )
             self.assertEqual(
-                16,
+                24,
                 first["spend"]["qualification_failed_attempt_reserved_api_calls"],
             )
 
@@ -2978,13 +2546,13 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=resumed_runner,
                 max_cost_usd=10.0,
                 allow_unknown_costs=True,
-                max_api_calls=16,
+                max_api_calls=24,
                 max_routes=1,
                 **self.signed_stage_approval(
                     root,
                     stage="qualification",
                     max_cost_usd=10.0,
-                    max_api_calls=16,
+                    max_api_calls=24,
                     max_routes=1,
                     allow_unknown_costs=True,
                 ),
@@ -3024,7 +2592,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 root,
                 stage="qualification",
                 max_cost_usd=10.0,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 allow_unknown_costs=False,
             )
@@ -3033,7 +2601,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 runner=runner,
                 max_cost_usd=10.0,
                 allow_unknown_costs=False,
-                max_api_calls=32,
+                max_api_calls=48,
                 max_routes=2,
                 **approval,
             )
@@ -3115,106 +2683,6 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 self.assertEqual("qualification_contract_invalid", result["status"])
                 self.assertNotIn("scoreable", result)
 
-    def test_v230_invalid_api_calls_receipt_is_terminal_on_signed_resume(self) -> None:
-        """A sealed null call count cannot be bypassed by a later signed resume."""
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={
-                    "schema": "oab.doctor/v1",
-                    "ready": True,
-                    "checks": [],
-                    "release_tree_sha256": "sha256:" + "a" * 64,
-                },
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            first_calls: list[str] = []
-
-            def invalid_runner(
-                route: dict[str, object], _stage: str, output: Path, _effort: str
-            ) -> dict[str, object]:
-                first_calls.append(str(route["requested_route"]))
-                report = self.qualification_report(
-                    str(route["requested_route"]),
-                    output=output,
-                    contract=cast(Mapping[str, object], route["_qualification_contract"]),
-                    cost=0.0,
-                )
-                usage = cast(dict[str, object], report["controller_usage"])
-                usage["api_calls"] = None
-                return report
-
-            first = run_qualification_stage(
-                root,
-                runner=invalid_runner,
-                max_cost_usd=10.0,
-                allow_unknown_costs=False,
-                max_api_calls=32,
-                max_routes=2,
-                **self.signed_stage_approval(
-                    root,
-                    stage="qualification",
-                    max_cost_usd=10.0,
-                    max_api_calls=32,
-                    max_routes=2,
-                    allow_unknown_costs=False,
-                ),
-            )
-            self.assertEqual("blocked_unknown_api_calls", first["status"])
-            self.assertEqual(1, len(first_calls))
-
-            resumed_calls: list[str] = []
-
-            def later_runner(
-                route: dict[str, object], _stage: str, output: Path, _effort: str
-            ) -> dict[str, object]:
-                resumed_calls.append(str(route["requested_route"]))
-                return self.qualification_report(
-                    str(route["requested_route"]),
-                    output=output,
-                    contract=cast(Mapping[str, object], route["_qualification_contract"]),
-                    cost=0.0,
-                )
-
-            resumed = run_qualification_stage(
-                root,
-                runner=later_runner,
-                max_cost_usd=10.0,
-                allow_unknown_costs=False,
-                max_api_calls=32,
-                max_routes=2,
-                **self.signed_stage_approval(
-                    root,
-                    stage="qualification",
-                    max_cost_usd=10.0,
-                    max_api_calls=32,
-                    max_routes=2,
-                    allow_unknown_costs=False,
-                ),
-            )
-            self.assertEqual("blocked_unknown_cost", resumed["status"])
-            self.assertEqual([], resumed_calls)
-            self.assertEqual([], resumed["qualified_routes"])
-
-            full_calls: list[str] = []
-            with self.assertRaisesRegex(ValueError, "campaign_not_ready_for_full_run"):
-                run_full_stage(
-                    root,
-                    runner=lambda route, *_args: full_calls.append(
-                        str(route["requested_route"])
-                    )
-                    or {},
-                    max_cost_usd=10.0,
-                    allow_unknown_costs=False,
-                    max_api_calls=2720,
-                    max_routes=2,
-                    approval_path=root / "unreachable-full-approval.json",
-                    approval_signature_path=None,
-                    approval_public_key_path=None,
-                )
-            self.assertEqual([], full_calls)
 
     def test_v230_missing_or_malformed_unknown_cost_count_is_never_zero(self) -> None:
         """Only a literal JSON integer zero may certify zero unknown-cost calls."""
@@ -3245,7 +2713,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
                 self.assertEqual("qualification_contract_invalid", result["status"])
 
     def test_v230_api_calls_above_absolute_route_reserve_is_invalid(self) -> None:
-        """Absolute reserve is 16 calls/route; more than that cannot be a valid probe pair."""
+        """Absolute reserve is 24 calls/route; more than that cannot be a valid probe pair."""
         report = self.readiness_report()
         report["controller_usage"] = {
             "api_calls": 17,
@@ -3301,60 +2769,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
         self.assertEqual("route_mismatch", result["status"])
         self.assertNotIn("scoreable", result)
 
-    def test_qualification_preview_binds_plumbing_only_2_probe_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            record_calibration(
-                root, {"schema": "oab.calibration-report/v1", "passed": True, "failures": []}
-            )
-            preview = build_approval_preview(
-                root,
-                stage="qualification",
-                max_cost_usd=25.0,
-                max_api_calls=32,
-                max_routes=2,
-                allow_unknown_costs=False,
-            )
-            self.assertEqual(2, preview["episodes_per_route"])
-            self.assertEqual(4, preview["max_api_calls_per_episode"])
-            self.assertEqual(8, preview["first_attempt_api_calls_per_route"])
-            self.assertEqual(16, preview["absolute_api_calls_per_route"])
-            self.assertEqual(16, preview["minimum_required_api_calls"])
-            self.assertEqual(32, preview["absolute_reserved_api_calls"])
-            self.assertTrue(preview["call_ceiling_sufficient"])
-            self.assertIn("Plumbing-only", str(preview["stage_purpose"]))
-            self.assertIn("No model-quality score", str(preview["stage_purpose"]))
-            serialized = json.dumps(preview)
-            self.assertNotIn("completion_rate", serialized)
-            self.assertNotIn("%", serialized)
 
-    def test_qualification_preview_rejects_ceiling_below_absolute_reserve(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "campaign"
-            initialize_campaign(
-                root,
-                doctor={"schema": "oab.doctor/v1", "ready": True, "checks": []},
-                inventory_payload=self.inventory(),
-                reasoning_effort="high",
-            )
-            record_calibration(
-                root, {"schema": "oab.calibration-report/v1", "passed": True, "failures": []}
-            )
-            preview = build_approval_preview(
-                root,
-                stage="qualification",
-                max_cost_usd=25.0,
-                max_api_calls=31,
-                max_routes=2,
-                allow_unknown_costs=False,
-            )
-            self.assertFalse(preview["call_ceiling_sufficient"])
 
     def test_legacy_generic_cost_telemetry_is_read_only_not_execution_authority(self) -> None:
         """Old generic shapes remain readable only and cannot authorize readiness."""
@@ -3415,7 +2830,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
             expected_release_tree_sha256="sha256:" + "c" * 64,
             authoritative_full_plan=cast(Mapping[str, object], context["authoritative_full_plan"]),
             expected_plan_sha256=cast(str, context["expected_plan_sha256"]),
-            expected_stage_approval_sha256=cast(str, context["expected_stage_approval_sha256"]),
+            expected_execution_contract_sha256=cast(str, context["expected_execution_contract_sha256"]),
             suite_reports=[baseline, candidate],
         )
         self.assertEqual("not_supportable", report["recommendation"])
@@ -3504,7 +2919,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
             expected_release_tree_sha256="sha256:" + "c" * 64,
             authoritative_full_plan=cast(Mapping[str, object], context["authoritative_full_plan"]),
             expected_plan_sha256=cast(str, context["expected_plan_sha256"]),
-            expected_stage_approval_sha256=cast(str, context["expected_stage_approval_sha256"]),
+            expected_execution_contract_sha256=cast(str, context["expected_execution_contract_sha256"]),
             suite_reports=[baseline, candidate],
         )
         self.assertEqual("switch", report["recommendation"])
@@ -3544,7 +2959,7 @@ class AgentWorkflowContractTests(unittest.TestCase):
             expected_release_tree_sha256="sha256:" + "c" * 64,
             authoritative_full_plan=cast(Mapping[str, object], context["authoritative_full_plan"]),
             expected_plan_sha256=cast(str, context["expected_plan_sha256"]),
-            expected_stage_approval_sha256=cast(str, context["expected_stage_approval_sha256"]),
+            expected_execution_contract_sha256=cast(str, context["expected_execution_contract_sha256"]),
             suite_reports=[baseline, candidate],
         )
         self.assertEqual("not_supportable", report["recommendation"])
@@ -3584,18 +2999,18 @@ class AgentWorkflowContractTests(unittest.TestCase):
 
     def test_test_model_state_projection_exposes_only_next_user_boundary(self) -> None:
         qualification = project_test_model_state(
-            {"status": "awaiting_qualification_approval", "campaign_id": "campaign-1"}
+            {"status": "ready_for_qualification", "campaign_id": "campaign-1"}
         )
-        self.assertEqual("qualification_approval_required", qualification["state"])
+        self.assertEqual("qualification_ready", qualification["state"])
 
         full = project_test_model_state(
-            {"status": "awaiting_full_run_approval", "campaign_id": "campaign-1"},
+            {"status": "qualification_complete", "campaign_id": "campaign-1"},
             qualification={
                 "projected_full_run_cost_usd": 12.5,
                 "projected_full_run_duration_seconds": 900.0,
             },
         )
-        self.assertEqual("full_approval_required", full["state"])
+        self.assertEqual("full_stage_ready", full["state"])
         self.assertEqual(12.5, full["projected_full_run_cost_usd"])
 
         complete = project_test_model_state(

@@ -19,20 +19,17 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .campaign_authorization import (
+from .campaign_contract import (
     CAMPAIGN_PLAN_SCHEMA,
     campaign_plan_sha256,
     canonical_bytes as campaign_canonical_bytes,
     canonical_sha256 as campaign_canonical_sha256,
     validate_campaign_plan_document,
-    validate_stage_approval_receipt,
 )
 from .full_stage_contract import (
     AUTHORITATIVE_FULL_PAIR_IDS,
@@ -434,7 +431,6 @@ def _read_json_directory_fd(
 
 
 _CAMPAIGN_INTERNAL_DIRECTORIES = (
-    Path("APPROVALS"),
     Path("qualification"),
     Path("qualification/results"),
     Path("qualification/suites"),
@@ -1101,7 +1097,7 @@ def project_test_model_state(
     qualification: Mapping[str, object] | None = None,
     decision: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Project campaign internals into one protected-host continuation state."""
+    """Project campaign internals into one bounded continuation state."""
 
     status = campaign.get("status")
     base: dict[str, object] = {
@@ -1109,13 +1105,13 @@ def project_test_model_state(
         "campaign_id": campaign.get("campaign_id"),
         "campaign_status": status,
     }
-    if status == "awaiting_qualification_approval":
-        return {**base, "state": "qualification_approval_required"}
-    if status == "awaiting_full_run_approval":
+    if status == "ready_for_qualification":
+        return {**base, "state": "qualification_ready"}
+    if status == "qualification_complete":
         summary = qualification or {}
         return {
             **base,
-            "state": "full_approval_required",
+            "state": "full_stage_ready",
             "projected_full_run_cost_usd": summary.get("projected_full_run_cost_usd"),
             "projected_full_run_duration_seconds": summary.get(
                 "projected_full_run_duration_seconds"
@@ -1152,7 +1148,12 @@ def build_campaign_plan(
     *,
     reasoning_effort: str,
     release_tree_sha256: str,
-    approval_authority_public_key_sha256: str,
+    qualification_known_cost_stop_usd: float = 5.0,
+    qualification_allow_unknown_costs: bool = False,
+    qualification_max_routes: int | None = None,
+    full_known_cost_stop_usd: float = 50.0,
+    full_allow_unknown_costs: bool = False,
+    full_max_routes: int | None = None,
     campaign_id: str | None = None,
     pair_ids: Sequence[str] = AUTHORITATIVE_FULL_PAIR_IDS,
     repetitions: int = FULL_REPETITIONS,
@@ -1173,8 +1174,7 @@ def build_campaign_plan(
         raise ValueError("authoritative_full_contract_invalid")
     if re.fullmatch(r"sha256:[0-9a-f]{64}", release_tree_sha256) is None:
         raise ValueError("release_tree_sha256_invalid")
-    if re.fullmatch(r"sha256:[0-9a-f]{64}", approval_authority_public_key_sha256) is None:
-        raise ValueError("approval_authority_public_key_invalid")
+
     routes: list[dict[str, str]] = []
     seen_route_ids: set[str] = set()
     seen_requested: set[str] = set()
@@ -1198,6 +1198,19 @@ def build_campaign_plan(
         seen_requested.add(requested)
         routes.append({"route_id": route_id, "requested_route": requested})
     route_count = len(routes)
+    qualification_routes = route_count if qualification_max_routes is None else qualification_max_routes
+    full_routes = route_count if full_max_routes is None else full_max_routes
+    if (
+        not isinstance(qualification_routes, int)
+        or isinstance(qualification_routes, bool)
+        or not 1 <= qualification_routes <= route_count
+        or not isinstance(full_routes, int)
+        or isinstance(full_routes, bool)
+        or not 1 <= full_routes <= route_count
+        or not isinstance(qualification_allow_unknown_costs, bool)
+        or not isinstance(full_allow_unknown_costs, bool)
+    ):
+        raise ValueError("campaign_execution_controls_invalid")
     baseline = discovery.get("current_route")
     if not isinstance(baseline, str) or baseline not in seen_requested:
         raise ValueError("campaign_plan_baseline_invalid")
@@ -1212,8 +1225,23 @@ def build_campaign_plan(
         "route_count": route_count,
         "routes": routes,
         "qualification": qualification_contract_for_route_count(route_count),
+        "qualification_execution": {
+            "known_cost_stop_usd": float(qualification_known_cost_stop_usd),
+            "max_api_calls": qualification_routes * ABSOLUTE_API_CALL_CEILING_PER_ROUTE,
+            "max_routes": qualification_routes,
+            "allow_unknown_costs": qualification_allow_unknown_costs,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
+        },
         "full_run": authoritative_full_contract_for_route_count(route_count),
-        "approval_authority_public_key_sha256": approval_authority_public_key_sha256,
+        "full_execution": {
+            "known_cost_stop_usd": float(full_known_cost_stop_usd),
+            "max_api_calls": full_routes * FULL_API_CALL_CEILING_PER_ROUTE,
+            "max_routes": full_routes,
+            "allow_unknown_costs": full_allow_unknown_costs,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
+        },
     }
     plan["plan_sha256"] = _plan_sha256(plan)
     validate_campaign_plan_document(plan)
@@ -1228,67 +1256,6 @@ def verify_campaign_plan(plan: Mapping[str, object]) -> list[str]:
     return []
 
 
-def verify_stage_approval(
-    path: Path,
-    *,
-    expected_plan_sha256: str,
-    expected_calibration_sha256: str,
-    expected_stage: str,
-    expected_route_ids: Sequence[str],
-    expected_max_cost_usd: float,
-    expected_max_api_calls: int,
-    expected_max_routes: int,
-    expected_allow_unknown_costs: bool,
-    public_key_path: Path,
-    signature_path: Path,
-    campaign_root: Path | None = None,
-    expected_plan: Mapping[str, object] | None = None,
-) -> list[str]:
-    """Verify v5 stage proof against the precommitted PLAN signer and context.
-
-    The receipt must carry its own route/output context.  Supplying only a
-    digest and a fresh public key is intentionally insufficient because that
-    would recreate the old signer-substitution boundary.
-    """
-    if campaign_root is None or expected_plan is None:
-        return ["stage_approval_context_required"]
-    try:
-        receipt = _read_regular_json(path)
-        plan = validate_campaign_plan_document(expected_plan)
-        if plan.get("plan_sha256") != expected_plan_sha256:
-            raise ValueError("stage_approval_plan_mismatch")
-        validated = validate_stage_approval_receipt(
-            receipt,
-            plan=plan,
-            root=campaign_root.expanduser().resolve(),
-            calibration_sha256=expected_calibration_sha256,
-        )
-        public_bytes = _read_single_link_regular_bytes(
-            public_key_path, error="stage_approval_public_key_invalid", max_bytes=16 * 1024
-        )
-        signature = _read_single_link_regular_bytes(
-            signature_path, error="stage_approval_signature_invalid", max_bytes=1024
-        )
-        public_key = serialization.load_pem_public_key(public_bytes)
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise ValueError("stage_approval_signature_invalid")
-        if "sha256:" + hashlib.sha256(public_bytes).hexdigest() != plan.get(
-            "approval_authority_public_key_sha256"
-        ):
-            raise ValueError("stage_approval_public_key_mismatch")
-        public_key.verify(signature, campaign_canonical_bytes(receipt))
-    except (OSError, ValueError, TypeError, InvalidSignature):
-        return ["stage_approval_invalid"]
-    if (
-        validated.get("stage") != expected_stage
-        or validated.get("route_ids") != list(expected_route_ids)
-        or float(validated.get("observed_cost_stop_usd", -1.0)) != float(expected_max_cost_usd)
-        or validated.get("max_api_calls") != expected_max_api_calls
-        or validated.get("max_routes") != expected_max_routes
-        or validated.get("allow_unknown_costs") is not expected_allow_unknown_costs
-    ):
-        return ["stage_approval_controls_mismatch"]
-    return []
 
 
 def _reason_codes(report: Mapping[str, object]) -> set[str]:
@@ -1565,7 +1532,7 @@ def classify_qualification(
             base["status"] = "qualification_contract_invalid"
             return base
         # Two probes must each complete a real tool loop (>= 2 calls per probe) and
-        # can never exceed the signed absolute reserve of 16 calls per route.
+        # can never exceed the signed absolute reserve of 24 calls per route.
         if (
             observed_api_calls
             < _QUALIFICATION_V230_PROBES_PER_ROUTE * 2
@@ -1600,7 +1567,12 @@ def initialize_campaign(
     doctor: Mapping[str, object],
     inventory_payload: Mapping[str, object],
     reasoning_effort: str,
-    approval_authority_public_key_path: Path,
+    qualification_known_cost_stop_usd: float = 5.0,
+    qualification_allow_unknown_costs: bool = False,
+    qualification_max_routes: int | None = None,
+    full_known_cost_stop_usd: float = 50.0,
+    full_allow_unknown_costs: bool = False,
+    full_max_routes: int | None = None,
     repository_root: Path | None = None,
 ) -> dict[str, object]:
     root = output_root.expanduser().resolve()
@@ -1615,19 +1587,7 @@ def initialize_campaign(
         or repository.is_relative_to(root)
     ):
         raise ValueError("campaign_and_benchmark_must_be_disjoint")
-    # The key is pinned before any campaign root exists; no later approval may
-    # swap the signer after calibration or route selection.
-    public_bytes = _read_single_link_regular_bytes(
-        approval_authority_public_key_path,
-        error="approval_authority_public_key_invalid",
-        max_bytes=16 * 1024,
-    )
-    try:
-        public_key = serialization.load_pem_public_key(public_bytes)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("approval_authority_public_key_invalid") from exc
-    if not isinstance(public_key, Ed25519PublicKey):
-        raise ValueError("approval_authority_public_key_invalid")
+
     release_tree = doctor.get("release_tree_sha256")
     if not isinstance(release_tree, str):
         raise ValueError("release_tree_sha256_invalid")
@@ -1638,9 +1598,12 @@ def initialize_campaign(
         discovery,
         reasoning_effort=reasoning_effort,
         release_tree_sha256=release_tree,
-        approval_authority_public_key_sha256=(
-            "sha256:" + hashlib.sha256(public_bytes).hexdigest()
-        ),
+        qualification_known_cost_stop_usd=qualification_known_cost_stop_usd,
+        qualification_allow_unknown_costs=qualification_allow_unknown_costs,
+        qualification_max_routes=qualification_max_routes,
+        full_known_cost_stop_usd=full_known_cost_stop_usd,
+        full_allow_unknown_costs=full_allow_unknown_costs,
+        full_max_routes=full_max_routes,
     )
     ready = doctor.get("ready") is True
     status = "awaiting_calibration" if ready else "blocked_environment"
@@ -1658,8 +1621,6 @@ def initialize_campaign(
         "full_run_routes": [],
         **build_evidence_posture([]),
         "spend": {
-            "qualification_approved": False,
-            "full_run_approved": False,
             "observed_cost_usd": 0.0,
             "unknown_cost_encountered": False,
         },
@@ -1699,7 +1660,7 @@ def record_calibration(output_root: Path, report: Mapping[str, object]) -> dict[
     _atomic_json(root / "CALIBRATION.json", receipt)
     state["calibration_passed"] = passed
     state["calibration_sha256"] = calibration_sha256
-    state["status"] = "awaiting_qualification_approval" if passed else "blocked_calibration"
+    state["status"] = "ready_for_qualification" if passed else "blocked_calibration"
     state["updated_at"] = _utc_now()
     _atomic_json(root / "CAMPAIGN.json", state)
     return state
@@ -1894,23 +1855,6 @@ def _attempt_accounting(
         raise ValueError("campaign_attempt_ledger_invalid")
     if require_ledger and results and not events:
         raise ValueError("campaign_attempt_ledger_invalid")
-    approval_digests: set[str] = set()
-    approvals_fd = _open_campaign_directory_fd(root, Path("APPROVALS"), create=False)
-    try:
-        approvals = _read_json_directory_fd(approvals_fd, suffix=".json")
-    finally:
-        os.close(approvals_fd)
-    for _approval_name, approval in approvals:
-        approval_digest = approval.get("receipt_sha256")
-        unsigned_approval = dict(approval)
-        unsigned_approval.pop("receipt_sha256", None)
-        if (
-            approval.get("schema") != "oab.stage-approval/v5"
-            or not isinstance(approval_digest, str)
-            or approval_digest != _canonical_sha256(unsigned_approval)
-        ):
-            raise ValueError("campaign_attempt_approval_invalid")
-        approval_digests.add(approval_digest)
     if set(result_by_attempt) - set(events):
         raise ValueError("campaign_attempt_ledger_invalid")
     failed_reserved_calls = 0
@@ -1925,16 +1869,15 @@ def _attempt_accounting(
             raise ValueError("campaign_attempt_ledger_invalid")
         route_id = reservation.get("route_id")
         reserved_calls = reservation.get("reserved_api_calls")
-        approval_sha256 = reservation.get("approval_sha256")
+        plan_sha256 = reservation.get("plan_sha256")
         if (
             not isinstance(route_id, str)
             or not route_id
             or not isinstance(reserved_calls, int)
             or isinstance(reserved_calls, bool)
             or reserved_calls < 1
-            or not isinstance(approval_sha256, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", approval_sha256) is None
-            or approval_sha256 not in approval_digests
+            or not isinstance(plan_sha256, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", plan_sha256) is None
         ):
             raise ValueError("campaign_attempt_ledger_invalid")
         result = result_by_attempt.get(attempt_id)
@@ -2261,295 +2204,20 @@ def _planned_stage_routes(
             if str(route.get("route_id") or "") in qualified_ids
         ]
     else:
-        raise ValueError("stage_approval_stage_invalid")
+        raise ValueError("campaign_stage_invalid")
     routes = _select_routes(
         route_candidates,
         current_route=baseline_route,
         max_routes=route_cap,
     )
     if not routes or (stage == "full" and len(routes) < 2):
-        raise ValueError("stage_approval_routes_invalid")
+        raise ValueError("campaign_stage_routes_invalid")
     return plan, routes
 
 
-@_campaign_operation
-def build_approval_preview(
-    output_root: Path,
-    *,
-    stage: str,
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-) -> dict[str, object]:
-    """Return a deterministic no-spend preview of the exact stage controls."""
-    root = _trusted_campaign_root(output_root)
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    budget = _validate_budget(max_cost_usd)
-    call_budget = _validate_positive_int(max_api_calls, "stage_api_call_budget_required")
-    route_cap = _validate_positive_int(max_routes, "stage_route_cap_required")
-    plan, routes = _planned_stage_routes(root, state, stage=stage, route_cap=route_cap)
-    _qualification_execution_contract(plan)
-    route_count = int(plan["route_count"])
-    if stage == "qualification":
-        # Every displayed number comes from the validated signed tuple, never a
-        # separate runner default or authorization headroom value.
-        qualification_tuple = validate_qualification_contract(
-            plan.get("qualification"), route_count=route_count
-        )
-        episodes_per_route = int(qualification_tuple["episodes_per_route"])
-        calls_per_episode = int(
-            qualification_tuple["max_api_calls_per_physical_attempt"]
-        )
-        first_attempt_calls_per_route = int(
-            qualification_tuple["first_attempt_api_call_ceiling_per_route"]
-        )
-        absolute_calls_per_route = int(
-            qualification_tuple["absolute_api_call_ceiling_per_route"]
-        )
-        minimum_calls = first_attempt_calls_per_route * len(routes)
-        absolute_calls = absolute_calls_per_route * len(routes)
-        purpose = (
-            "Plumbing-only route readiness: bounded multi-turn tool loops. "
-            "No model-quality score is produced."
-        )
-    else:
-        full_plan = validate_authoritative_full_stage_plan(
-            plan.get("full_run"), route_count=route_count
-        )
-        full_contract = full_plan["authoritative_contract"]
-        assert isinstance(full_contract, Mapping)
-        episodes_per_route = int(full_contract["episodes_per_route"])
-        calls_per_episode = int(full_contract["max_api_calls_per_episode"])
-        first_attempt_calls_per_route = int(full_contract["api_call_ceiling_per_route"])
-        absolute_calls_per_route = first_attempt_calls_per_route
-        minimum_calls = len(routes) * absolute_calls_per_route
-        absolute_calls = minimum_calls
-        purpose = "Full 80-episode quality comparison per route."
-    scheduled_episodes = episodes_per_route * len(routes)
-    return {
-        "schema": "oab.approval-preview/v1",
-        "stage": stage,
-        "plan_sha256": plan.get("plan_sha256"),
-        "calibration_sha256": state.get("calibration_sha256"),
-        "routes": [
-            {
-                "route_id": str(route.get("route_id") or ""),
-                "requested_route": str(route.get("requested_route") or ""),
-            }
-            for route in routes
-        ],
-        "route_count": len(routes),
-        "episodes_per_route": episodes_per_route,
-        "scheduled_episodes": scheduled_episodes,
-        "stage_purpose": purpose,
-        "observed_cost_stop_usd": budget,
-        "cost_control_mode": _COST_CONTROL_MODE,
-        "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
-        "max_api_calls": call_budget,
-        "minimum_required_api_calls": minimum_calls,
-        "absolute_reserved_api_calls": absolute_calls,
-        "first_attempt_api_calls_per_route": first_attempt_calls_per_route,
-        "absolute_api_calls_per_route": absolute_calls_per_route,
-        "max_api_calls_per_episode": calls_per_episode,
-        "call_ceiling_sufficient": call_budget >= absolute_calls,
-        "max_routes": route_cap,
-        "allow_unknown_costs": bool(allow_unknown_costs),
-        "intended_evidence_posture": "exploratory_by_default",
-        "authority_note": (
-            "Spend approval is independent of evidence authority. Authority also requires "
-            "an exact-tree release approval and all identity, coverage, grid, and runtime gates."
-        ),
-        "provider_calls_performed": 0,
-    }
 
 
-@_campaign_operation
-def build_stage_approval_request(
-    output_root: Path,
-    *,
-    stage: str,
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-    approval_public_key_path: Path,
-) -> dict[str, object]:
-    """Build a v5 receipt whose proof binds all future child execution fields."""
-    root = _trusted_campaign_root(output_root)
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    budget = _validate_budget(max_cost_usd)
-    call_budget = _validate_positive_int(max_api_calls, "stage_api_call_budget_required")
-    route_cap = _validate_positive_int(max_routes, "stage_route_cap_required")
-    plan, routes = _planned_stage_routes(root, state, stage=stage, route_cap=route_cap)
-    _qualification_execution_contract(plan)
-    route_count = int(plan["route_count"])
-    route_ids = [str(route.get("route_id") or "") for route in routes]
-    if route_cap != len(route_ids):
-        raise ValueError("stage_route_cap_must_match_selected_routes")
-    if stage == "qualification":
-        stage_contract = validate_qualification_contract(
-            plan.get("qualification"), route_count=route_count
-        )
-        contract_key = "qualification_contract"
-        contract_digest_key = "qualification_contract_sha256"
-        required_calls = len(route_ids) * ABSOLUTE_API_CALL_CEILING_PER_ROUTE
-    elif stage == "full":
-        stage_contract = validate_authoritative_full_stage_plan(
-            plan.get("full_run"), route_count=route_count
-        )
-        contract_key = "full_contract"
-        contract_digest_key = "full_contract_sha256"
-        required_calls = len(route_ids) * FULL_API_CALL_CEILING_PER_ROUTE
-    else:
-        raise ValueError("stage_approval_stage_invalid")
-    if call_budget != required_calls:
-        raise ValueError("stage_api_call_budget_must_match_authoritative_tuple")
-    public_bytes = _read_single_link_regular_bytes(
-        approval_public_key_path,
-        error="stage_approval_public_key_invalid",
-        max_bytes=16 * 1024,
-    )
-    try:
-        public_key = serialization.load_pem_public_key(public_bytes)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("stage_approval_public_key_invalid") from exc
-    if not isinstance(public_key, Ed25519PublicKey):
-        raise ValueError("stage_approval_public_key_invalid")
-    public_digest = "sha256:" + hashlib.sha256(public_bytes).hexdigest()
-    if public_digest != plan.get("approval_authority_public_key_sha256"):
-        raise ValueError("stage_approval_public_key_mismatch")
-    context_routes = [
-        {
-            "route_id": route_id,
-            "requested_route": str(route.get("requested_route") or ""),
-            "output_relative_path": f"{stage}/attempts/{secrets.token_hex(16)}.evidence",
-        }
-        for route_id, route in zip(route_ids, routes)
-    ]
-    receipt: dict[str, object] = {
-        "schema": "oab.stage-approval/v5",
-        "created_at": _utc_now(),
-        "stage": stage,
-        "plan_sha256": str(plan["plan_sha256"]),
-        "calibration_sha256": state["calibration_sha256"],
-        "route_ids": route_ids,
-        "observed_cost_stop_usd": budget,
-        "cost_control_mode": _COST_CONTROL_MODE,
-        "max_cost_overshoot_api_calls": _MAX_COST_OVERSHOOT_API_CALLS,
-        "max_api_calls": call_budget,
-        "max_routes": route_cap,
-        "allow_unknown_costs": bool(allow_unknown_costs),
-        "approval_public_key_sha256": public_digest,
-        contract_key: stage_contract,
-        contract_digest_key: campaign_canonical_sha256(stage_contract),
-        "execution_context": {
-            "schema": "oab.stage-execution-context/v1",
-            "campaign_root_context_sha256": "sha256:"
-            + hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest(),
-            "stage": stage,
-            "routes": context_routes,
-        },
-    }
-    receipt["receipt_sha256"] = campaign_canonical_sha256(receipt)
-    # Structural validation here prevents a malformed request from ever reaching
-    # an external signer; signature verification is deliberately separate.
-    validate_stage_approval_receipt(
-        receipt,
-        plan=validate_campaign_plan_document(plan),
-        root=root,
-        calibration_sha256=str(state["calibration_sha256"]),
-    )
-    return receipt
 
-
-CONVERSATIONAL_STAGE_APPROVAL_SCHEMA = "oab.conversational-stage-approval/v2"
-
-# No host-backed verifier exists for a conversational approval: nothing in this
-# repository or in an installed Hermes can prove that a caller-supplied message
-# reference names a real message whose content approves these exact controls. A
-# caller can therefore forge any such reference, so conversational receipts are
-# refused for every spend-capable path. `approval-preview` stays conversational
-# and no-spend; actual execution requires the externally signed stage approval.
-CONVERSATION_APPROVAL_NOT_HOST_VERIFIED = "conversation_approval_not_host_verified"
-
-
-def stage_approval_signing_payload(receipt: Mapping[str, object]) -> bytes:
-    """Return the exact canonical bytes an external Ed25519 approver signs."""
-    return _canonical_bytes(receipt)
-
-
-def _accept_stage_approval(
-    root: Path,
-    *,
-    approval_path: Path,
-    signature_path: Path | None,
-    public_key_path: Path | None,
-    stage: str,
-    route_ids: Sequence[str],
-    max_cost_usd: float,
-    max_api_calls: int,
-    max_routes: int,
-    allow_unknown_costs: bool,
-) -> dict[str, object]:
-    plan = _read_regular_json(root / "PLAN.json")
-    _qualification_execution_contract(plan)
-    plan_digest = str(plan.get("plan_sha256") or "")
-    state = load_campaign(root)
-    _require_passed_calibration(root, state)
-    calibration_sha256 = str(state.get("calibration_sha256") or "")
-    receipt = _read_regular_json(approval_path)
-    if receipt.get("schema") == CONVERSATIONAL_STAGE_APPROVAL_SCHEMA:
-        # A caller-asserted conversation reference is not host-verified evidence of
-        # approval, so it can never authorize spend. Fail closed before any route runs.
-        raise ValueError(
-            f"{CONVERSATION_APPROVAL_NOT_HOST_VERIFIED}:"
-            "signed_stage_approval_required"
-        )
-    if signature_path is None or public_key_path is None:
-        raise ValueError("stage_approval_signature_and_public_key_required")
-    errors = verify_stage_approval(
-        approval_path,
-        expected_plan_sha256=plan_digest,
-        expected_calibration_sha256=calibration_sha256,
-        expected_stage=stage,
-        expected_route_ids=route_ids,
-        expected_max_cost_usd=max_cost_usd,
-        expected_max_api_calls=max_api_calls,
-        expected_max_routes=max_routes,
-        expected_allow_unknown_costs=allow_unknown_costs,
-        public_key_path=public_key_path,
-        signature_path=signature_path,
-        campaign_root=root,
-        expected_plan=plan,
-    )
-    error_prefix = "stage_approval_invalid:"
-    if errors:
-        raise ValueError(error_prefix + ",".join(sorted(set(errors))))
-    stem = f"{stage}-{str(receipt['receipt_sha256']).removeprefix('sha256:')[:16]}"
-    approvals = root / "APPROVALS"
-    receipt_destination = approvals / f"{stem}.json"
-    _atomic_json(receipt_destination, receipt)
-    assert signature_path is not None
-    assert public_key_path is not None
-    signature = _read_single_link_regular_bytes(
-        signature_path, error="stage_approval_signature_invalid", max_bytes=1024
-    )
-    public_bytes = _read_single_link_regular_bytes(
-        public_key_path, error="stage_approval_public_key_invalid", max_bytes=16 * 1024
-    )
-    signature_destination = approvals / f"{stem}.sig"
-    public_destination = approvals / f"key-{hashlib.sha256(public_bytes).hexdigest()[:16]}.pem"
-    _atomic_bytes(signature_destination, signature)
-    _atomic_bytes(public_destination, public_bytes)
-    return {
-        **receipt,
-        "path": str(receipt_destination),
-        "signature_path": str(signature_destination),
-        "public_key_path": str(public_destination),
-    }
 
 
 def _validate_budget(value: float) -> float:
@@ -2568,9 +2236,6 @@ def run_qualification_stage(
     allow_unknown_costs: bool,
     max_api_calls: int | None = None,
     max_routes: int | None = None,
-    approval_path: Path,
-    approval_signature_path: Path | None,
-    approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
     root = _trusted_campaign_root(output_root)
     _validate_campaign_layout(root, create=True)
@@ -2583,6 +2248,14 @@ def run_qualification_stage(
     plan, routes = _planned_stage_routes(
         root, state, stage="qualification", route_cap=route_cap
     )
+    controls = plan.get("qualification_execution")
+    if not isinstance(controls, Mapping) or (
+        float(max_cost_usd) != float(controls.get("known_cost_stop_usd", -1))
+        or call_budget != controls.get("max_api_calls")
+        or route_cap != controls.get("max_routes")
+        or allow_unknown_costs is not controls.get("allow_unknown_costs")
+    ):
+        raise ValueError("campaign_execution_controls_mismatch")
     qual_contract = _qualification_execution_contract(plan)
     qualification_tuple = validate_qualification_contract(
         plan.get("qualification"), route_count=int(plan["route_count"])
@@ -2659,45 +2332,13 @@ def run_qualification_stage(
         failed_attempts=failed_attempt_count,
     )
     interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
-    approval = _accept_stage_approval(
-        root,
-        approval_path=approval_path,
-        signature_path=approval_signature_path,
-        public_key_path=approval_public_key_path,
-        stage="qualification",
-        route_ids=[str(route.get("route_id") or "") for route in routes],
-        max_cost_usd=budget,
-        max_api_calls=call_budget,
-        max_routes=route_cap,
-        allow_unknown_costs=allow_unknown_costs,
-    )
-    execution_context = approval.get("execution_context")
-    context_rows = execution_context.get("routes") if isinstance(execution_context, Mapping) else None
-    if not isinstance(context_rows, list):
-        raise ValueError("stage_approval_execution_context_invalid")
-    context_by_route_id = {
-        row.get("route_id"): row
-        for row in context_rows
-        if isinstance(row, Mapping) and isinstance(row.get("route_id"), str)
-    }
-    if set(context_by_route_id) != {str(route.get("route_id") or "") for route in routes}:
-        raise ValueError("stage_approval_execution_context_invalid")
     state["status"] = "qualifying"
     spend = state.get("spend")
     spend_state = dict(spend) if isinstance(spend, Mapping) else {}
-    spend_state["qualification_approved"] = True
     spend_state["qualification_max_cost_usd"] = budget
     spend_state["allow_unknown_costs"] = bool(allow_unknown_costs)
     spend_state["qualification_max_api_calls"] = call_budget
     spend_state["qualification_max_routes"] = route_cap
-    spend_state["qualification_approval_sha256"] = approval["receipt_sha256"]
-    spend_state["qualification_approved_route_ids"] = approval["route_ids"]
-    spend_state["qualification_approval_path"] = approval["path"]
-    spend_state["qualification_approval_assurance"] = approval.get(
-        "approval_assurance", "external_signature"
-    )
-    spend_state["qualification_approval_signature_path"] = approval.get("signature_path")
-    spend_state["qualification_approval_public_key_path"] = approval.get("public_key_path")
     spend_state["qualification_failed_attempt_reserved_api_calls"] = failed_reserved_calls
     spend_state["qualification_failed_attempts"] = failed_attempt_count
     if interrupted_unknown_cost:
@@ -2749,25 +2390,9 @@ def run_qualification_stage(
         execution_route["max_api_calls"] = attempt_reserved_calls
         execution_route["_qualification_contract_version"] = qual_contract
         execution_route["_qualification_contract"] = dict(qualification_tuple)
-        context_row = context_by_route_id.get(route_id)
-        if not isinstance(context_row, Mapping):
-            raise ValueError("stage_approval_execution_context_invalid")
-        output_relative_path = context_row.get("output_relative_path")
-        expected_prefix = "qualification/attempts/"
-        if (
-            not isinstance(output_relative_path, str)
-            or not output_relative_path.startswith(expected_prefix)
-            or not output_relative_path.endswith(".evidence")
-        ):
-            raise ValueError("stage_approval_execution_context_invalid")
-        attempt_id = output_relative_path.removeprefix(expected_prefix).removesuffix(".evidence")
-        if re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
-            raise ValueError("stage_approval_execution_context_invalid")
+        attempt_id = secrets.token_hex(16)
         suite_output = _attempt_evidence_path(root, "qualification", attempt_id)
         execution_route["_campaign_root_path"] = str(root)
-        execution_route["_campaign_approval_path"] = approval["path"]
-        execution_route["_campaign_approval_signature_path"] = approval["signature_path"]
-        execution_route["_campaign_approval_public_key_path"] = approval["public_key_path"]
         reservation = _write_attempt_event(
             root,
             "qualification",
@@ -2778,7 +2403,7 @@ def run_qualification_stage(
                 "requested_route": route.get("requested_route"),
                 "reserved_api_calls": attempt_reserved_calls,
                 "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
-                "approval_sha256": approval["receipt_sha256"],
+                "plan_sha256": plan["plan_sha256"],
             },
         )
         try:
@@ -2964,7 +2589,7 @@ def run_qualification_stage(
             state["status"] = "blocked_unknown_api_calls"
             break
     else:
-        state["status"] = "awaiting_full_run_approval"
+        state["status"] = "qualification_complete"
 
     qualified: list[dict[str, object]] = []
     excluded: list[dict[str, object]] = []
@@ -3033,7 +2658,7 @@ def run_qualification_stage(
                 durations_known = False
         else:
             excluded.append(summary)
-    if len(qualified) < 2 and state.get("status") == "awaiting_full_run_approval":
+    if len(qualified) < 2 and state.get("status") == "qualification_complete":
         state["status"] = "comparison_not_supportable"
     state["qualified_routes"] = qualified
     state["excluded_routes"] = excluded
@@ -3060,7 +2685,7 @@ def run_qualification_stage(
     state["spend"] = spend_state
     if any(item.get("readiness") == "INCOMPATIBLE" for item in excluded):
         headline_readiness = "INCOMPATIBLE"
-    elif len(qualified) >= 2 and state.get("status") == "awaiting_full_run_approval":
+    elif len(qualified) >= 2 and state.get("status") == "qualification_complete":
         headline_readiness = "READY"
     else:
         headline_readiness = "NOT READY"
@@ -3117,9 +2742,6 @@ def run_full_stage(
     allow_unknown_costs: bool,
     max_api_calls: int | None = None,
     max_routes: int | None = None,
-    approval_path: Path,
-    approval_signature_path: Path | None,
-    approval_public_key_path: Path | None,
 ) -> dict[str, Any]:
     root = _trusted_campaign_root(output_root)
     _validate_campaign_layout(root, create=True)
@@ -3152,7 +2774,7 @@ def run_full_stage(
     expected_repetitions = FULL_REPETITIONS
     full_calls_per_route = FULL_API_CALL_CEILING_PER_ROUTE
     if state.get("status") not in {
-        "awaiting_full_run_approval",
+        "qualification_complete",
         "running_full",
         "blocked_unknown_full_cost",
         "blocked_unknown_full_api_calls",
@@ -3165,6 +2787,14 @@ def run_full_stage(
     call_budget = _validate_positive_int(max_api_calls, "full_api_call_budget_required")
     route_cap = _validate_positive_int(max_routes, "full_route_cap_required")
     plan, routes = _planned_stage_routes(root, state, stage="full", route_cap=route_cap)
+    controls = plan.get("full_execution")
+    if not isinstance(controls, Mapping) or (
+        float(max_cost_usd) != float(controls.get("known_cost_stop_usd", -1))
+        or call_budget != controls.get("max_api_calls")
+        or route_cap != controls.get("max_routes")
+        or allow_unknown_costs is not controls.get("allow_unknown_costs")
+    ):
+        raise ValueError("campaign_execution_controls_mismatch")
     if len(routes) < 2:
         raise ValueError("campaign_comparison_not_supportable")
     effort = _plan_reasoning_effort(plan, state)
@@ -3219,44 +2849,12 @@ def run_full_stage(
         failed_attempts=failed_attempt_count,
     )
     interrupted_unknown_cost = bool(attempt_accounting["unknown_cost_encountered"])
-    approval = _accept_stage_approval(
-        root,
-        approval_path=approval_path,
-        signature_path=approval_signature_path,
-        public_key_path=approval_public_key_path,
-        stage="full",
-        route_ids=[str(route.get("route_id") or "") for route in routes],
-        max_cost_usd=budget,
-        max_api_calls=call_budget,
-        max_routes=route_cap,
-        allow_unknown_costs=allow_unknown_costs,
-    )
-    execution_context = approval.get("execution_context")
-    context_rows = execution_context.get("routes") if isinstance(execution_context, Mapping) else None
-    if not isinstance(context_rows, list):
-        raise ValueError("stage_approval_execution_context_invalid")
-    context_by_route_id = {
-        row.get("route_id"): row
-        for row in context_rows
-        if isinstance(row, Mapping) and isinstance(row.get("route_id"), str)
-    }
-    if set(context_by_route_id) != {str(route.get("route_id") or "") for route in routes}:
-        raise ValueError("stage_approval_execution_context_invalid")
     spend = state.get("spend")
     spend_state = dict(spend) if isinstance(spend, Mapping) else {}
-    spend_state["full_run_approved"] = True
     spend_state["full_run_max_cost_usd"] = budget
     spend_state["allow_unknown_full_costs"] = bool(allow_unknown_costs)
     spend_state["full_run_max_api_calls"] = call_budget
     spend_state["full_run_max_routes"] = route_cap
-    spend_state["full_run_approval_sha256"] = approval["receipt_sha256"]
-    spend_state["full_run_approved_route_ids"] = approval["route_ids"]
-    spend_state["full_run_approval_path"] = approval["path"]
-    spend_state["full_run_approval_assurance"] = approval.get(
-        "approval_assurance", "external_signature"
-    )
-    spend_state["full_run_approval_signature_path"] = approval.get("signature_path")
-    spend_state["full_run_approval_public_key_path"] = approval.get("public_key_path")
     spend_state["full_failed_attempt_reserved_api_calls"] = failed_reserved_calls
     spend_state["full_failed_attempts"] = failed_attempt_count
     if interrupted_unknown_cost:
@@ -3299,25 +2897,9 @@ def run_full_stage(
         execution_route["allow_unknown_costs"] = bool(allow_unknown_costs)
         attempt_reserved_calls = full_calls_per_route
         execution_route["max_api_calls"] = attempt_reserved_calls
-        context_row = context_by_route_id.get(route_id)
-        if not isinstance(context_row, Mapping):
-            raise ValueError("stage_approval_execution_context_invalid")
-        output_relative_path = context_row.get("output_relative_path")
-        expected_prefix = "full/attempts/"
-        if (
-            not isinstance(output_relative_path, str)
-            or not output_relative_path.startswith(expected_prefix)
-            or not output_relative_path.endswith(".evidence")
-        ):
-            raise ValueError("stage_approval_execution_context_invalid")
-        attempt_id = output_relative_path.removeprefix(expected_prefix).removesuffix(".evidence")
-        if re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
-            raise ValueError("stage_approval_execution_context_invalid")
+        attempt_id = secrets.token_hex(16)
         suite_output = _attempt_evidence_path(root, "full", attempt_id)
         execution_route["_campaign_root_path"] = str(root)
-        execution_route["_campaign_approval_path"] = approval["path"]
-        execution_route["_campaign_approval_signature_path"] = approval["signature_path"]
-        execution_route["_campaign_approval_public_key_path"] = approval["public_key_path"]
         reservation = _write_attempt_event(
             root,
             "full",
@@ -3328,7 +2910,7 @@ def run_full_stage(
                 "requested_route": route.get("requested_route"),
                 "reserved_api_calls": attempt_reserved_calls,
                 "max_observed_cost_usd": execution_route["max_observed_cost_usd"],
-                "approval_sha256": approval["receipt_sha256"],
+                "plan_sha256": plan["plan_sha256"],
             },
         )
         try:
@@ -3447,7 +3029,7 @@ def run_full_stage(
         suite_reports=reports,
         authoritative_full_plan=full_plan,
         expected_plan_sha256=str(plan["plan_sha256"]),
-        expected_stage_approval_sha256=str(approval["receipt_sha256"]),
+        expected_execution_contract_sha256=str(plan["plan_sha256"]),
     )
     _atomic_json(root / "DECISION_REPORT.json", decision)
     state.update(build_evidence_posture(reports, decision=decision))
@@ -3568,14 +3150,14 @@ def _comparable_authoritative_reports(
     *,
     authoritative_full_plan: Mapping[str, object] | None,
     expected_plan_sha256: str | None,
-    expected_stage_approval_sha256: str | None,
+    expected_execution_contract_sha256: str | None,
     expected_release_tree_sha256: str,
 ) -> list[Mapping[str, object]]:
     """Select reports only when their signed full-stage binding is identical."""
     if (
         authoritative_full_plan is None
         or not isinstance(expected_plan_sha256, str)
-        or not isinstance(expected_stage_approval_sha256, str)
+        or not isinstance(expected_execution_contract_sha256, str)
         or not isinstance(expected_release_tree_sha256, str)
     ):
         return []
@@ -3602,7 +3184,7 @@ def _comparable_authoritative_reports(
             binding = validate_authoritative_stage_binding(
                 report.get("authoritative_stage"),
                 plan_sha256=expected_plan_sha256,
-                stage_approval_sha256=expected_stage_approval_sha256,
+                execution_contract_sha256=expected_execution_contract_sha256,
             )
         except ValueError:
             continue
@@ -3658,7 +3240,7 @@ def build_decision_report(
     suite_reports: Sequence[Mapping[str, object]],
     authoritative_full_plan: Mapping[str, object] | None = None,
     expected_plan_sha256: str | None = None,
-    expected_stage_approval_sha256: str | None = None,
+    expected_execution_contract_sha256: str | None = None,
     # Kept only as ignored compatibility inputs. They cannot authorize a switch.
     expected_pair_ids: Sequence[str] | None = None,
     expected_repetitions: int | None = None,
@@ -3683,7 +3265,7 @@ def build_decision_report(
         suite_reports,
         authoritative_full_plan=authoritative_full_plan if full_valid else None,
         expected_plan_sha256=expected_plan_sha256,
-        expected_stage_approval_sha256=expected_stage_approval_sha256,
+        expected_execution_contract_sha256=expected_execution_contract_sha256,
         expected_release_tree_sha256=expected_release_tree_sha256,
     )
     base: dict[str, object] = {
@@ -3695,7 +3277,7 @@ def build_decision_report(
         "expected_release_tree_sha256": expected_release_tree_sha256,
         "authoritative_full_contract": dict(full_contract) if full_contract is not None else None,
         "authoritative_plan_sha256": expected_plan_sha256,
-        "authoritative_stage_approval_sha256": expected_stage_approval_sha256,
+        "authoritative_execution_contract_sha256": expected_execution_contract_sha256,
         "recommendation": "not_supportable",
         "recommended_route": None,
         "reasons": [],

@@ -1,0 +1,33 @@
+# Default PEP 517 sdist must include every frozen-release-tree input so a
+# subsequent wheel build can copy the tree into oab_release_data/tree.
+include .gitignore
+include AGENTS.md
+include BENCHMARK_CARD.md
+include CHANGELOG.md
+include CITATION.cff
+include CONTRIBUTING.md
+include LICENSE
+include LIMITATIONS.md
+include README.md
+include RELEASE_MANIFEST.json
+include cases.json
+include pyproject.toml
+include setup.py
+graft oab
+graft oab_release_data
+graft tools
+graft tests
+graft tasks
+graft fixtures
+graft .github
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude .DS_Store
+global-exclude BUILD_PROMPT.md
+global-exclude RESULT.md
+prune build
+prune dist
+prune .hermes
+prune .pytest_cache
+prune __pycache__
+recursive-exclude * *.egg-info

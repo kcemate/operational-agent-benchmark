@@ -37,7 +37,7 @@ class AuthoritativeFullStageContractTests(unittest.TestCase):
         ):
             binding = build_authoritative_stage_binding(
                 plan_sha256="sha256:" + "1" * 64,
-                stage_approval_sha256="sha256:" + "2" * 64,
+                execution_contract_sha256="sha256:" + "2" * 64,
                 route_id=route_id,
                 output_relative_path=f"full/attempts/{output_name}.evidence",
                 full_plan=full_plan,
@@ -68,7 +68,7 @@ class AuthoritativeFullStageContractTests(unittest.TestCase):
             suite_reports=reports,
             authoritative_full_plan=full_plan,
             expected_plan_sha256="sha256:" + "1" * 64,
-            expected_stage_approval_sha256="sha256:" + "2" * 64,
+            expected_execution_contract_sha256="sha256:" + "2" * 64,
         )
         self.assertEqual("not_supportable", decision["recommendation"])
         self.assertEqual(["fewer_than_two_authoritative_routes"], decision["reasons"])

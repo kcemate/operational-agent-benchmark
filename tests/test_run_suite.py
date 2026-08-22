@@ -222,14 +222,13 @@ class QualificationReadinessModeTests(unittest.TestCase):
             "--qualification-readiness-v1",
             "--campaign-root-path", str(root),
             "--campaign-root-fd", str(root_fd),
-            "--campaign-authorization-fd", str(transport_fd),
-            "--max-api-calls", "16",
+            "--max-api-calls", "24",
             "--max-observed-cost-usd", "1.0",
         ]
         if allow_unknown_costs:
             command.append("--allow-unknown-costs")
         try:
-            with patch("tools.run_suite.verify_campaign_child_authorization", return_value=authorization):
+            with patch("tools.run_suite.verify_campaign_child_contract", return_value=authorization):
                 yield command
         finally:
             os.close(transport_fd)
@@ -481,7 +480,7 @@ class QualificationReadinessModeTests(unittest.TestCase):
                     self.assertEqual(0, run_suite.main())
 
                 self.assertEqual(expected, invocations)
-                self.assertEqual([4] * len(expected), controller_budgets)
+                self.assertEqual([6] * len(expected), controller_budgets)
                 report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
                 self.assertEqual("NOT_READY", report["readiness"])
                 self.assertEqual(len(expected), len(report["attempts"]))
@@ -563,12 +562,12 @@ class QualificationReadinessModeTests(unittest.TestCase):
             self.assertEqual(
                 [("oab2-data-rollup-a", 1), ("oab2-data-rollup-p", 1)], invocations
             )
-            self.assertEqual([4, 4], controller_budgets)
+            self.assertEqual([6, 6], controller_budgets)
             report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
             self.assertEqual("READY", report["readiness"])
             self.assertEqual(2, len(report["attempts"]))
             self.assertEqual(8, report["controller_usage"]["api_calls"])
-            self.assertLessEqual(report["controller_usage"]["api_calls"], 8)
+            self.assertLessEqual(report["controller_usage"]["api_calls"], 12)
             for attempt in report["attempts"]:
                 evidence = output / str(attempt["evidence_dir"])
                 self.assertTrue(verify_sealed_evidence(evidence)["valid"])
@@ -659,7 +658,7 @@ class QualificationReadinessModeTests(unittest.TestCase):
                 ],
                 invocations,
             )
-            self.assertEqual([4, 4, 4], controller_budgets)
+            self.assertEqual([6, 6, 6], controller_budgets)
             report = json.loads((output / "suite-report.json").read_text(encoding="utf-8"))
             self.assertEqual("READY", report["readiness"])
             self.assertEqual(3, len(report["attempts"]))
@@ -711,7 +710,7 @@ class QualificationReadinessModeTests(unittest.TestCase):
                 **_kwargs: object,
             ) -> StrictEpisodeResult:
                 self.assertEqual("qualification_readiness", artifact_profile)
-                self.assertEqual(4, tool_policy.max_steps)
+                self.assertEqual(6, tool_policy.max_steps)
                 return self._write_probe_evidence(
                     evidence_dir,
                     case_id=str(getattr(spec, "case_id")),
@@ -802,7 +801,7 @@ class QualificationReadinessModeTests(unittest.TestCase):
                 self.assertNotIn(forbidden, headline.lower())
             self.assertNotIn("%", headline)
             self.assertNotIn("/", headline.split("route=", 1)[0])
-            self.assertEqual([4, 4], created_controller_budgets)
+            self.assertEqual([6, 6], created_controller_budgets)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ _AUTHORITY_BINDING_FIELDS = frozenset(
         "plan_sha256",
         "full_contract",
         "full_contract_sha256",
-        "stage_approval_sha256",
+        "execution_contract_sha256",
         "route_id",
         "output_relative_path",
     }
@@ -136,7 +136,7 @@ def validate_authoritative_full_stage_plan(
 def build_authoritative_stage_binding(
     *,
     plan_sha256: str,
-    stage_approval_sha256: str,
+    execution_contract_sha256: str,
     route_id: str,
     output_relative_path: str,
     full_plan: Mapping[str, object],
@@ -147,8 +147,8 @@ def build_authoritative_stage_binding(
     if (
         not isinstance(plan_sha256, str)
         or _DIGEST_RE.fullmatch(plan_sha256) is None
-        or not isinstance(stage_approval_sha256, str)
-        or _DIGEST_RE.fullmatch(stage_approval_sha256) is None
+        or not isinstance(execution_contract_sha256, str)
+        or _DIGEST_RE.fullmatch(execution_contract_sha256) is None
         or not isinstance(route_id, str)
         or not route_id
         or not isinstance(output_relative_path, str)
@@ -161,7 +161,7 @@ def build_authoritative_stage_binding(
         "plan_sha256": plan_sha256,
         "full_contract": contract,
         "full_contract_sha256": full_stage_contract_sha256(contract),
-        "stage_approval_sha256": stage_approval_sha256,
+        "execution_contract_sha256": execution_contract_sha256,
         "route_id": route_id,
         "output_relative_path": output_relative_path,
     }
@@ -171,7 +171,7 @@ def validate_authoritative_stage_binding(
     value: object,
     *,
     plan_sha256: str | None = None,
-    stage_approval_sha256: str | None = None,
+    execution_contract_sha256: str | None = None,
     route_id: str | None = None,
     output_relative_path: str | None = None,
 ) -> dict[str, object]:
@@ -184,14 +184,14 @@ def validate_authoritative_stage_binding(
         (value.get("stage"), "full"),
         (value.get("full_contract_sha256"), full_stage_contract_sha256(contract)),
         (value.get("plan_sha256"), plan_sha256),
-        (value.get("stage_approval_sha256"), stage_approval_sha256),
+        (value.get("execution_contract_sha256"), execution_contract_sha256),
         (value.get("route_id"), route_id),
         (value.get("output_relative_path"), output_relative_path),
     )
     for actual, expected in checks:
         if expected is not None and actual != expected:
             raise ValueError("authoritative_full_contract_invalid")
-    for field in ("plan_sha256", "stage_approval_sha256"):
+    for field in ("plan_sha256", "execution_contract_sha256"):
         candidate = value.get(field)
         if not isinstance(candidate, str) or _DIGEST_RE.fullmatch(candidate) is None:
             raise ValueError("authoritative_full_contract_invalid")

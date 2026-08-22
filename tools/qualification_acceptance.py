@@ -1,4 +1,4 @@
-"""Offline release-blocking acceptance gate for signed qualification readiness.
+"""Offline release-blocking acceptance gate for qualification readiness.
 
 The gate drives the production ``tools.run_suite`` readiness child, its physical
 attempt accounting, report, headline and suite seal with deterministic sealed
@@ -7,7 +7,7 @@ provider client is constructed or contacted: every controller boundary is
 replaced by an in-process deterministic fixture before the child is invoked.
 
 This is deliberately an offline safety gate, not a qualification result for a
-real model route.  It proves the signed ``oab.qualification-readiness/v1``
+real model route.  It proves the ``oab.qualification-readiness/v1``
 execution machinery and its failure containment without provider spend.
 """
 
@@ -26,18 +26,13 @@ from types import SimpleNamespace
 from typing import Callable, Iterator, Mapping, Sequence
 from unittest.mock import patch
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from oab.campaign_authorization import (  # noqa: E402
+from oab.campaign_contract import (  # noqa: E402
     campaign_plan_sha256,
     canonical_bytes,
-    canonical_sha256,
-    encode_child_authorization_envelope,
 )
 from oab.evidence import build_evidence_manifest  # noqa: E402
 from oab.full_stage_contract import authoritative_full_contract_for_route_count  # noqa: E402
@@ -225,32 +220,22 @@ def _telemetry(
 
 
 @contextmanager
-def _signed_readiness_child_authority(root: Path) -> Iterator[dict[str, object]]:
-    """Create an ephemeral externally signed parent proof for the real child.
-
-    This acceptance fixture deliberately uses the same descriptor-only boundary
-    as the production parent. Its synthetic private key never leaves process
-    memory and is discarded when the context exits.
-    """
+def _readiness_child_contract(root: Path) -> Iterator[dict[str, object]]:
+    """Create a descriptor-bound PLAN fixture for the real child."""
     campaign_root = root / "campaign"
     output_parent = campaign_root / "qualification" / "attempts"
     output_name = "a" * 32 + ".evidence"
     output = output_parent / output_name
     output_parent.mkdir(parents=True, mode=0o700)
 
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key().public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    public_key_digest = "sha256:" + hashlib.sha256(public_key).hexdigest()
+
     release_manifest = json.loads((ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
     release_tree_sha256 = str(release_manifest["tree_sha256"])
     calibration = {"schema": "oab.calibration-report/v2", "passed": True, "cases": []}
     (campaign_root / "CALIBRATION.json").write_bytes(canonical_bytes(calibration))
     qualification = qualification_contract_for_route_count(1)
     plan: dict[str, object] = {
-        "schema": "oab.campaign-plan/v2",
+        "schema": "oab.campaign-plan/v3",
         "created_at": "2026-08-11T00:00:00+00:00",
         "campaign_id": "offline-qualification-acceptance",
         "routes": [{"route_id": "acceptance-route", "requested_route": _QUALIFICATION_ROUTE}],
@@ -258,65 +243,40 @@ def _signed_readiness_child_authority(root: Path) -> Iterator[dict[str, object]]
         "baseline_route": _QUALIFICATION_ROUTE,
         "reasoning_effort": "high",
         "qualification": qualification,
+        "qualification_execution": {
+            "known_cost_stop_usd": 1.0,
+            "max_api_calls": ABSOLUTE_CALLS_PER_ROUTE,
+            "max_routes": 1,
+            "allow_unknown_costs": False,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
+        },
         "full_run": authoritative_full_contract_for_route_count(1),
+        "full_execution": {
+            "known_cost_stop_usd": 50.0,
+            "max_api_calls": 1360,
+            "max_routes": 1,
+            "allow_unknown_costs": False,
+            "cost_control_mode": "post_provider_call_observed_known_cost_stop",
+            "max_cost_overshoot_api_calls": 1,
+        },
         "release_tree_sha256": release_tree_sha256,
-        "approval_authority_public_key_sha256": public_key_digest,
+
     }
     plan["plan_sha256"] = campaign_plan_sha256(plan)
     (campaign_root / "PLAN.json").write_bytes(canonical_bytes(plan))
-    execution_context = {
-        "schema": "oab.stage-execution-context/v1",
-        "campaign_root_context_sha256": "sha256:"
-        + hashlib.sha256(str(campaign_root.resolve()).encode("utf-8")).hexdigest(),
-        "stage": "qualification",
-        "routes": [
-            {
-                "route_id": "acceptance-route",
-                "requested_route": _QUALIFICATION_ROUTE,
-                "output_relative_path": f"qualification/attempts/{output_name}",
-            }
-        ],
-    }
-    receipt: dict[str, object] = {
-        "schema": "oab.stage-approval/v5",
-        "created_at": "2026-08-11T00:00:00+00:00",
-        "stage": "qualification",
-        "plan_sha256": str(plan["plan_sha256"]),
-        "calibration_sha256": canonical_sha256(calibration),
-        "route_ids": ["acceptance-route"],
-        "observed_cost_stop_usd": 1.0,
-        "cost_control_mode": "post_provider_call_observed_known_cost_stop",
-        "max_cost_overshoot_api_calls": 1,
-        "max_api_calls": ABSOLUTE_CALLS_PER_ROUTE,
-        "max_routes": 1,
-        "allow_unknown_costs": False,
-        "approval_public_key_sha256": public_key_digest,
-        "qualification_contract": qualification,
-        "qualification_contract_sha256": canonical_sha256(qualification),
-        "execution_context": execution_context,
-    }
-    receipt["receipt_sha256"] = canonical_sha256(receipt)
-    authorization = encode_child_authorization_envelope(
-        approval_receipt=receipt,
-        signature=private_key.sign(canonical_bytes(receipt)),
-        public_key_pem=public_key,
-    )
+
     saved_cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     output_parent_fd = os.open(output_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     campaign_root_fd = os.open(campaign_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        with tempfile.TemporaryFile() as transport:
-            transport.write(authorization)
-            transport.flush()
-            transport.seek(0)
-            yield {
-                "campaign_root": campaign_root,
-                "campaign_root_fd": campaign_root_fd,
-                "output": output,
-                "output_name": output_name,
-                "output_parent_fd": output_parent_fd,
-                "authorization_fd": transport.fileno(),
-            }
+        yield {
+            "campaign_root": campaign_root,
+            "campaign_root_fd": campaign_root_fd,
+            "output": output,
+            "output_name": output_name,
+            "output_parent_fd": output_parent_fd,
+        }
     finally:
         # The production child intentionally enters the descriptor-bound output
         # directory. The in-process offline fixture must restore its caller.
@@ -483,7 +443,7 @@ def _run_readiness_child(
     *,
     outcomes: Mapping[tuple[str, int], tuple[str, Sequence[str], Mapping[str, object]]] | None = None,
 ) -> dict[str, object]:
-    """Exercise the production child through an ephemeral signed parent proof."""
+    """Exercise the production child through an ephemeral PLAN contract."""
     configured = dict(outcomes or {})
     with tempfile.TemporaryDirectory() as td:
         root = Path(td).resolve()
@@ -528,10 +488,10 @@ def _run_readiness_child(
             return result
 
         runtime = SimpleNamespace(home=root, config_sha256="sha256:" + "b" * 64)
-        with _signed_readiness_child_authority(root) as authority:
+        with _readiness_child_contract(root) as authority:
             output = authority["output"]
             if not isinstance(output, Path):
-                raise AssertionError("signed output path missing")
+                raise AssertionError("contract output path missing")
             command = [
                 "run_suite",
                 "--provider",
@@ -551,8 +511,6 @@ def _run_readiness_child(
                 str(authority["campaign_root"]),
                 "--campaign-root-fd",
                 str(authority["campaign_root_fd"]),
-                "--campaign-authorization-fd",
-                str(authority["authorization_fd"]),
                 "--max-api-calls",
                 str(ABSOLUTE_CALLS_PER_ROUTE),
                 "--max-observed-cost-usd",
@@ -618,7 +576,7 @@ def scenario_strict_runner_loop_exhaustion() -> dict[str, object]:
         "controller_step_limit_exceeded" in result.reason_codes,
         f"expected controller_step_limit_exceeded, got {result.reason_codes}",
     )
-    _assert(controller.calls < 5, f"loop must stop before call 5; observed {controller.calls}")
+    _assert(controller.calls < 7, f"loop must stop before call 7; observed {controller.calls}")
     return {"status": result.status, "provider_calls": controller.calls}
 
 
@@ -632,11 +590,11 @@ def scenario_readiness_child_no_retry() -> dict[str, object]:
         result["invocations"] == [(_APPROVED_CASE, 1), (_PROHIBITED_CASE, 1)],
         f"unexpected attempts: {result['invocations']}",
     )
-    _assert(result["controller_budgets"] == [4, 4], "fresh four-call controllers required")
+    _assert(result["controller_budgets"] == [6, 6], "fresh six-call controllers required")
     _assert(isinstance(report, Mapping) and report.get("readiness") == "READY", "not READY")
     _assert(isinstance(report, Mapping) and len(report.get("attempts", [])) == 2, "wrong attempt count")
     usage = report.get("controller_usage") if isinstance(report, Mapping) else None
-    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 8, "wrong charged calls")
+    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 12, "wrong charged calls")
     _assert(result["seal_errors"] == [], f"seal errors: {result['seal_errors']}")
     _assert(isinstance(seal, Mapping) and len(seal.get("physical_attempts", [])) == 2, "unsealed attempts")
     _assert(
@@ -681,11 +639,11 @@ def scenario_readiness_child_selective_transient_retry() -> dict[str, object]:
         == [(_APPROVED_CASE, 1), (_PROHIBITED_CASE, 1), (_APPROVED_CASE, 2)],
         f"unexpected retry order: {result['invocations']}",
     )
-    _assert(result["controller_budgets"] == [4, 4, 4], "wrong retry controller bounds")
+    _assert(result["controller_budgets"] == [6, 6, 6], "wrong retry controller bounds")
     _assert(isinstance(report, Mapping) and report.get("readiness") == "READY", "retry not READY")
     _assert(isinstance(report, Mapping) and len(report.get("attempts", [])) == 3, "wrong retry count")
     usage = report.get("controller_usage") if isinstance(report, Mapping) else None
-    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 12, "retry usage not charged")
+    _assert(isinstance(usage, Mapping) and usage.get("api_calls") == 18, "retry usage not charged")
     probes = report.get("probes") if isinstance(report, Mapping) else None
     selected = [probe.get("selected_attempt") for probe in probes] if isinstance(probes, list) else []
     _assert(
@@ -694,7 +652,7 @@ def scenario_readiness_child_selective_transient_retry() -> dict[str, object]:
     )
     _assert(result["seal_errors"] == [], f"seal errors: {result['seal_errors']}")
     _assert(isinstance(seal, Mapping) and len(seal.get("physical_attempts", [])) == 3, "unsealed retry")
-    return {"readiness": "READY", "physical_attempts": 3, "api_calls": 12}
+    return {"readiness": "READY", "physical_attempts": 3, "api_calls": 18}
 
 
 def scenario_readiness_child_malformed_telemetry_stops() -> dict[str, object]:
@@ -709,7 +667,7 @@ def scenario_readiness_child_malformed_telemetry_stops() -> dict[str, object]:
         result["invocations"] == [(_APPROVED_CASE, 1)],
         f"malformed telemetry continued: {result['invocations']}",
     )
-    _assert(result["controller_budgets"] == [4], "malformed attempt was not bounded")
+    _assert(result["controller_budgets"] == [6], "malformed attempt was not bounded")
     _assert(isinstance(report, Mapping) and report.get("readiness") == "NOT_READY", "malformed telemetry ready")
     attempts = report.get("attempts") if isinstance(report, Mapping) else None
     _assert(isinstance(attempts, list) and len(attempts) == 1, "malformed attempt not sealed")
@@ -725,16 +683,16 @@ def scenario_readiness_child_malformed_telemetry_stops() -> dict[str, object]:
     return {"readiness": "NOT_READY", "physical_attempts": 1}
 
 
-def scenario_readiness_child_signed_tuple_rejected() -> dict[str, object]:
-    """A post-signature PLAN mutation is rejected before controller creation."""
+def scenario_readiness_child_plan_mutation_rejected() -> dict[str, object]:
+    """A PLAN mutation is rejected before controller creation."""
     with tempfile.TemporaryDirectory() as td:
         root = Path(td).resolve()
         runtime = SimpleNamespace(home=root, config_sha256="sha256:" + "b" * 64)
-        with _signed_readiness_child_authority(root) as authority:
+        with _readiness_child_contract(root) as authority:
             campaign_root = authority["campaign_root"]
             output = authority["output"]
             if not isinstance(campaign_root, Path) or not isinstance(output, Path):
-                raise AssertionError("signed campaign fixture paths missing")
+                raise AssertionError("campaign contract fixture paths missing")
             plan_path = campaign_root / "PLAN.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["reasoning_effort"] = "low"
@@ -758,8 +716,6 @@ def scenario_readiness_child_signed_tuple_rejected() -> dict[str, object]:
                 str(campaign_root),
                 "--campaign-root-fd",
                 str(authority["campaign_root_fd"]),
-                "--campaign-authorization-fd",
-                str(authority["authorization_fd"]),
                 "--max-api-calls",
                 str(ABSOLUTE_CALLS_PER_ROUTE),
                 "--max-observed-cost-usd",
@@ -791,7 +747,7 @@ SCENARIOS: dict[str, Callable[[], dict[str, object]]] = {
     "readiness_child_no_retry": scenario_readiness_child_no_retry,
     "readiness_child_selective_transient_retry": scenario_readiness_child_selective_transient_retry,
     "readiness_child_malformed_telemetry_stops": scenario_readiness_child_malformed_telemetry_stops,
-    "readiness_child_signed_tuple_rejected": scenario_readiness_child_signed_tuple_rejected,
+    "readiness_child_signed_tuple_rejected": scenario_readiness_child_plan_mutation_rejected,
 }
 
 

@@ -198,7 +198,11 @@ def _validate_identity(identity: ControllerIdentity) -> tuple[str, ...]:
     elif identity.execution_class == "model":
         if not identity.returned_route or not identity.response_id:
             reasons.append("provider_returned_identity_missing")
-        if identity.identity_source != "provider_response":
+        # Hermes CLI attests route+session via adapter_runtime. That is
+        # accepted for exploratory qualification readiness when the route and
+        # response id are present; provider_response remains preferred when
+        # the adapter can surface raw provider attestation.
+        if identity.identity_source not in {"provider_response", "adapter_runtime"}:
             reasons.append("provider_identity_source_unverified")
     else:
         reasons.append("execution_class_invalid")
