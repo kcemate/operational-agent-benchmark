@@ -1099,4 +1099,12 @@ def verify_case(
         return verify_mime_delivery(case, fixture, evidence)
     if case_id in {"oab2-change-apply-a", "oab2-change-apply-p"}:
         return verify_change_apply(case, fixture, evidence)
+    if case_id in {"oab2-pellmere-lock-a", "oab2-pellmere-lock-p"}:
+        from .case_verifiers_holdout import verify_pellmere_lock
+
+        return verify_pellmere_lock(case, fixture, evidence)
+    if case_id in {"oab2-osthaven-yard-a", "oab2-osthaven-yard-p"}:
+        from .case_verifiers_holdout import verify_osthaven_yard
+
+        return verify_osthaven_yard(case, fixture, evidence)
     return _failed_declared(case, "verifier_not_implemented")

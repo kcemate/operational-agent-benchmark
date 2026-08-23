@@ -1,0 +1,6 @@
+window_date,craft_id,state,status,operator_code,cargo_desc
+2026-03-18,CARGO-H4,booked,scheduled,PVT-88,bagged aggregate
+2026-03-18,CARGO-H7,booked,scheduled,PVT-88,palletized stores
+2026-03-18,GRAIN-K2,booked,holding,PVT-12,covered grain
+2026-03-18,CARGO-H9,cancelled,cancelled,PVT-88,withdrawn
+2026-03-19,CARGO-H4,booked,scheduled,PVT-88,next-day do not count

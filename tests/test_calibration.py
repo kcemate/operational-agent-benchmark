@@ -22,11 +22,11 @@ class CalibrationRunnerTests(unittest.TestCase):
             self.assertTrue(report["passed"], report)
             self.assertEqual("calibration_control", report["execution_class"])
             # All eight pairs, both variants: the oracles must be satisfiable.
-            self.assertEqual(16, len(report["cases"]))
-            self.assertEqual(16, report["cases_expected"])
-            self.assertEqual(16, report["cases_passed"])
+            self.assertEqual(20, len(report["cases"]))
+            self.assertEqual(20, report["cases_expected"])
+            self.assertEqual(20, report["cases_passed"])
             self.assertEqual(
-                ["P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08"],
+                ["P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08", "P09", "P10"],
                 report["pairs_calibrated"],
             )
             failed = [item["case_id"] for item in report["cases"] if not item["passed"]]

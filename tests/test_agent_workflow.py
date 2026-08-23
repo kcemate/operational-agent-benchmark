@@ -42,12 +42,13 @@ from oab.qualification_contract import (
 )
 from oab.campaign_contract import campaign_plan_sha256
 from oab.full_stage_contract import (
+    AUTHORITATIVE_FULL_PAIR_IDS,
     authoritative_full_contract_for_route_count,
     build_authoritative_stage_binding,
 )
 from qualification_fixtures import qualification_usage, write_qualification_suite
 
-FULL_PAIR_IDS = [f"P{index:02d}" for index in range(1, 9)]
+FULL_PAIR_IDS = list(AUTHORITATIVE_FULL_PAIR_IDS)
 _REAL_INITIALIZE_CAMPAIGN = initialize_campaign
 
 

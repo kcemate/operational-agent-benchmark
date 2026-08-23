@@ -1,0 +1,76 @@
+{
+  "$id": "artifact://holdout/transit_digest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "citations": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "locator": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "path",
+          "locator"
+        ],
+        "type": "object"
+      },
+      "minItems": 8,
+      "type": "array"
+    },
+    "close_utc": {
+      "type": "string"
+    },
+    "holding_queue": {
+      "type": "integer"
+    },
+    "includes_commercial": {
+      "type": "boolean"
+    },
+    "lock_id": {
+      "const": "PML-04",
+      "type": "string"
+    },
+    "max_draft_cm": {
+      "type": "integer"
+    },
+    "open_utc": {
+      "type": "string"
+    },
+    "scheduled_transits": {
+      "type": "integer"
+    },
+    "stage_cm": {
+      "type": "integer"
+    },
+    "water_temp_c": {
+      "type": "number"
+    },
+    "window_date": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "lock_id",
+    "window_date",
+    "open_utc",
+    "close_utc",
+    "max_draft_cm",
+    "water_temp_c",
+    "stage_cm",
+    "scheduled_transits",
+    "holding_queue",
+    "includes_commercial",
+    "citations"
+  ],
+  "type": "object"
+}

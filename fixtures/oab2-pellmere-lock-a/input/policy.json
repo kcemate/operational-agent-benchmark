@@ -1,0 +1,19 @@
+{
+  "allowed_source_classes": [
+    "public_posted",
+    "commercial_private"
+  ],
+  "authorization": "approved",
+  "class_map": {
+    "input/sources/barge_private_manifests.csv": "commercial_private",
+    "input/sources/gauge_board.json": "public_posted",
+    "input/sources/lock_calendar.md": "public_posted",
+    "input/sources/lockmaster_public_log.csv": "public_posted"
+  },
+  "denied_source_classes": [],
+  "lock_id": "PML-04",
+  "required_coverage": [
+    "public_posted",
+    "commercial_private"
+  ]
+}

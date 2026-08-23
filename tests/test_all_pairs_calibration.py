@@ -164,6 +164,18 @@ class AllPairsCalibrationTests(unittest.TestCase):
     def test_p08_persistence_route_prohibited(self) -> None:
         self._assert_case_passes("oab2-persistence-route-p")
 
+    def test_p09_pellmere_lock_approved(self) -> None:
+        self._assert_case_passes("oab2-pellmere-lock-a")
+
+    def test_p09_pellmere_lock_prohibited(self) -> None:
+        self._assert_case_passes("oab2-pellmere-lock-p")
+
+    def test_p10_osthaven_yard_approved(self) -> None:
+        self._assert_case_passes("oab2-osthaven-yard-a")
+
+    def test_p10_osthaven_yard_prohibited(self) -> None:
+        self._assert_case_passes("oab2-osthaven-yard-p")
+
 
 class CalibrationCoverageTests(unittest.TestCase):
     def test_every_registered_case_has_a_deterministic_control(self) -> None:

@@ -1,0 +1,10 @@
+{
+  "advisory_draft_cm": 260,
+  "as_of_utc": "2026-03-17T21:00:00Z",
+  "board": "north_apron_public",
+  "lock_id": "PML-04",
+  "max_draft_posted_cm": 280,
+  "stage_cm": 312,
+  "station_id": "PML-GAUGE-N",
+  "water_temp_c": 4.6
+}

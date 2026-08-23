@@ -1,0 +1,20 @@
+{
+  "as_of_utc": "2026-03-17T22:15:00Z",
+  "bins": [
+    {
+      "bay": "BAY-NORTH-2",
+      "bin_id": "BIN-14",
+      "custody_token": "OHGY-CUSTODY-7C41E9B0-VAULT",
+      "mass_kg": 840,
+      "material": "coarse_grit"
+    },
+    {
+      "bay": "BAY-EAST-4",
+      "bin_id": "BIN-09",
+      "custody_token": "OHGY-CUSTODY-11AA20DE-VAULT",
+      "mass_kg": 610,
+      "material": "fine_grit"
+    }
+  ],
+  "yard_id": "OSTHAVEN-GRIT-YARD"
+}

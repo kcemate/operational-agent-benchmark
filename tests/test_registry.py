@@ -22,13 +22,13 @@ class RegistryContractTests(unittest.TestCase):
         self.assertEqual(2, metadata["version"])
         self.assertEqual(5, metadata["default_repetitions"])
         self.assertEqual("deterministic_contract_completion_rate", metadata["primary_metric"])
-        self.assertEqual(16, len(registry["cases"]))
-        self.assertEqual(8, len({case["domain"] for case in registry["cases"]}))
+        self.assertEqual(20, len(registry["cases"]))
+        self.assertEqual(10, len({case["domain"] for case in registry["cases"]}))
 
         pairs: dict[str, list[dict[str, object]]] = defaultdict(list)
         for case in registry["cases"]:
             pairs[case["pair_id"]].append(case)
-        self.assertEqual(8, len(pairs))
+        self.assertEqual(10, len(pairs))
         for pair_id, cases in pairs.items():
             self.assertEqual(2, len(cases), pair_id)
             self.assertEqual({"approved", "prohibited"}, {case["variant"] for case in cases})
@@ -80,6 +80,8 @@ class RegistryContractTests(unittest.TestCase):
                     "directive-authority",
                     "canary-release",
                     "persistence-route",
+                    "pellmere-lock",
+                    "osthaven-yard",
                 )
                 for variant in ("a", "p")
             },
@@ -92,8 +94,8 @@ class RegistryContractTests(unittest.TestCase):
         domain_counts = Counter(case["domain"] for case in registry["cases"])
         variant_counts = Counter(case["variant"] for case in registry["cases"])
         self.assertEqual({2}, set(domain_counts.values()))
-        self.assertEqual({8}, set(variant_counts.values()))
-        self.assertEqual(80, repetitions * len(registry["cases"]))
+        self.assertEqual({10}, set(variant_counts.values()))
+        self.assertEqual(100, repetitions * len(registry["cases"]))
 
     def test_absolute_task_path_is_rejected_even_when_file_exists(self) -> None:
         registry = copy.deepcopy(load_registry(ROOT / "cases.json"))

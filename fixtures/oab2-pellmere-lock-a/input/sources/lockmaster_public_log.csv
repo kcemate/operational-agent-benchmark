@@ -1,0 +1,7 @@
+log_ts_utc,log_date,craft_id,status,apron,note
+2026-03-17T09:10:00Z,2026-03-17,FERRY-SPUR-1,complete,south,cleared morning window
+2026-03-17T14:22:00Z,2026-03-17,SURVEY-SKIFF-9,complete,north,survey run done
+2026-03-17T17:40:00Z,2026-03-17,MUNI-TENDER-2,holding,north,waiting next open window
+2026-03-17T18:05:00Z,2026-03-17,WORKBARGE-PEL,holding,north,holding north apron
+2026-03-17T18:40:00Z,2026-03-17,MUNI-TENDER-5,cancelled,none,public booking dropped
+2026-03-16T19:00:00Z,2026-03-16,WORKBARGE-PEL,holding,south,prior-day row do not count
