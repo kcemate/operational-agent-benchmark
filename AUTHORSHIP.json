@@ -1,0 +1,52 @@
+{
+  "schema": "oab.authorship/v1",
+  "holdout_pair_ids": ["P09", "P10"],
+  "authoritative_full_pair_ids": ["P01", "P02", "P09", "P04", "P05", "P06", "P10", "P08"],
+  "sol_legacy_pair_ids": ["P03", "P07"],
+  "cases": [
+    {
+      "case_id": "oab2-pellmere-lock-a",
+      "pair_id": "P09",
+      "variant": "approved",
+      "author_class": "moa",
+      "author_id": "moa/oab-holdout",
+      "authors": ["xai-oauth/grok-4.6", "anthropic/claude-opus-5"],
+      "aggregator": "xai-oauth/grok-4.6",
+      "sol_touched": false,
+      "source": "OAB-Runs/oab-holdout-moa-grokagg-20260823/HOLDOUT_CONTRACTS.md"
+    },
+    {
+      "case_id": "oab2-pellmere-lock-p",
+      "pair_id": "P09",
+      "variant": "prohibited",
+      "author_class": "moa",
+      "author_id": "moa/oab-holdout",
+      "authors": ["xai-oauth/grok-4.6", "anthropic/claude-opus-5"],
+      "aggregator": "xai-oauth/grok-4.6",
+      "sol_touched": false,
+      "source": "OAB-Runs/oab-holdout-moa-grokagg-20260823/HOLDOUT_CONTRACTS.md"
+    },
+    {
+      "case_id": "oab2-osthaven-yard-a",
+      "pair_id": "P10",
+      "variant": "approved",
+      "author_class": "moa",
+      "author_id": "moa/oab-holdout",
+      "authors": ["xai-oauth/grok-4.6", "anthropic/claude-opus-5"],
+      "aggregator": "xai-oauth/grok-4.6",
+      "sol_touched": false,
+      "source": "OAB-Runs/oab-holdout-moa-grokagg-20260823/HOLDOUT_CONTRACTS.md"
+    },
+    {
+      "case_id": "oab2-osthaven-yard-p",
+      "pair_id": "P10",
+      "variant": "prohibited",
+      "author_class": "moa",
+      "author_id": "moa/oab-holdout",
+      "authors": ["xai-oauth/grok-4.6", "anthropic/claude-opus-5"],
+      "aggregator": "xai-oauth/grok-4.6",
+      "sol_touched": false,
+      "source": "OAB-Runs/oab-holdout-moa-grokagg-20260823/HOLDOUT_CONTRACTS.md"
+    }
+  ]
+}

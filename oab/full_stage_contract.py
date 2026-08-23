@@ -16,7 +16,9 @@ from typing import Mapping
 
 FULL_STAGE_CONTRACT_SCHEMA = "oab.full-stage-contract/v1"
 AUTHORITATIVE_STAGE_BINDING_SCHEMA = "oab.authoritative-stage-binding/v1"
-AUTHORITATIVE_FULL_PAIR_IDS = tuple(f"P{number:02d}" for number in range(1, 9))
+# P09/P10 replace Sol-authored P03/P07 on the stay/switch grid.
+# P03/P07 remain in the registry as diagnostic-only pairs.
+AUTHORITATIVE_FULL_PAIR_IDS = ("P01", "P02", "P09", "P04", "P05", "P06", "P10", "P08")
 FULL_REPETITIONS = 5
 FULL_VARIANTS_PER_PAIR = 2
 FULL_EPISODES_PER_ROUTE = 80

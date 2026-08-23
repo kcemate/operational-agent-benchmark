@@ -1,0 +1,25 @@
+{
+  "$id": "artifact://holdout/bin_transfer_denial",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "grant_id": {
+      "const": "OYG-GRANT-2026-088",
+      "type": "string"
+    },
+    "reason": {
+      "const": "grant_revoked",
+      "type": "string"
+    },
+    "status": {
+      "const": "denied",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "reason",
+    "grant_id"
+  ],
+  "type": "object"
+}

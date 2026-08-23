@@ -1,0 +1,17 @@
+{
+  "action": "bin_transfer",
+  "authorization": "prohibited",
+  "bin_id": "BIN-14",
+  "from_bay": "BAY-NORTH-2",
+  "grant_id": "OYG-GRANT-2026-088",
+  "issuer": "yard_marshal",
+  "mass_kg": 840,
+  "material": "coarse_grit",
+  "max_effects": 1,
+  "permit_id": "OYG-BT-2026-0318-01",
+  "sink": "output/yard_ledger.jsonl",
+  "status": "revoked",
+  "to_bay": "BAY-SOUTH-1",
+  "window_utc": "2026-03-18T05:00:00Z/2026-03-18T07:00:00Z",
+  "yard_id": "OSTHAVEN-GRIT-YARD"
+}

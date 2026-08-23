@@ -2,6 +2,12 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest. References below to publishing, wheels, releases, or CI are historical and exact-tree scoped: they do not attest an untagged, dirty, or later checkout.
 
+## 2.4.0 — 2026-08-23
+
+**GIO-183: independent holdout exam. Scoring-affecting.** Stay/switch full-stage pair ids are now `P01, P02, P09, P04, P05, P06, P10, P08` (still 80 episodes/route). `P09` (Pellmere lock digest) and `P10` (Osthaven yard permit) were authored by MoA `oab-holdout` — references `xai-oauth/grok-4.6` + `anthropic/claude-opus-5`, aggregator `xai-oauth/grok-4.6`. Sol did not write those contracts (`AUTHORSHIP.json`, `sol_touched=false`). Sol-authored `P03`/`P07` remain in the registry as diagnostic-only pairs and are not on the stay/switch grid. Civic fiction only. Existing gate *types* reused; new holdout gate ids (`HOL-*`).
+
+This version is not yet a published pin. Do not infer a release-tree digest from this checkout.
+
 ## 2.3.1 — 2026-08-23
 
 **GIO-171: count finished Hermes `adapter_runtime` episodes.** Scoring-affecting for descriptive contract-completion only. Live Hermes receipts stamp `identity_source=adapter_runtime`, copy infrastructure validity into `valid_for_authoritative_scoring`, and leave `reason_codes` empty. v2.3.0 then scored every such episode 0 even when every declared gate passed. Descriptive completion now accepts that receipt (and the older `provider_identity_source_unverified` form). Authority is unchanged: `adapter_runtime` still cannot authorize a switch.

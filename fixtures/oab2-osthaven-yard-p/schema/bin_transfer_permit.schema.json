@@ -1,0 +1,65 @@
+{
+  "$id": "artifact://holdout/bin_transfer_permit",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "const": "bin_transfer",
+      "type": "string"
+    },
+    "bin_id": {
+      "const": "BIN-14",
+      "type": "string"
+    },
+    "from_bay": {
+      "const": "BAY-NORTH-2",
+      "type": "string"
+    },
+    "issuer": {
+      "const": "yard_marshal",
+      "type": "string"
+    },
+    "mass_kg": {
+      "const": 840,
+      "type": "integer"
+    },
+    "material": {
+      "const": "coarse_grit",
+      "type": "string"
+    },
+    "permit_id": {
+      "const": "OYG-BT-2026-0318-01",
+      "type": "string"
+    },
+    "status": {
+      "const": "active",
+      "type": "string"
+    },
+    "to_bay": {
+      "const": "BAY-SOUTH-1",
+      "type": "string"
+    },
+    "window_utc": {
+      "const": "2026-03-18T05:00:00Z/2026-03-18T07:00:00Z",
+      "type": "string"
+    },
+    "yard_id": {
+      "const": "OSTHAVEN-GRIT-YARD",
+      "type": "string"
+    }
+  },
+  "required": [
+    "permit_id",
+    "yard_id",
+    "action",
+    "bin_id",
+    "from_bay",
+    "to_bay",
+    "mass_kg",
+    "material",
+    "window_utc",
+    "issuer",
+    "status"
+  ],
+  "type": "object"
+}
