@@ -87,6 +87,15 @@ class ObservationContractTests(unittest.TestCase):
         record["reason_codes"] = ["provider_identity_source_unverified"]
         self.assertFalse(observation_contract_complete(record))
 
+    def test_live_hermes_adapter_runtime_receipt_counts_as_complete(self) -> None:
+        # Hermes stamps adapter_runtime, copies infrastructure validity into
+        # valid_for_authoritative_scoring, and leaves reason_codes empty.
+        # That receipt still finished the job and must count descriptively.
+        record = _obs()
+        record["reason_codes"] = []
+        record["valid_for_authoritative_scoring"] = True
+        self.assertTrue(observation_contract_complete(record))
+
 
 class SuiteAggregationTests(unittest.TestCase):
     def _pair_reps(

@@ -2,6 +2,12 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest. References below to publishing, wheels, releases, or CI are historical and exact-tree scoped: they do not attest an untagged, dirty, or later checkout.
 
+## 2.3.1 — 2026-08-23
+
+**GIO-171: count finished Hermes `adapter_runtime` episodes.** Scoring-affecting for descriptive contract-completion only. Live Hermes receipts stamp `identity_source=adapter_runtime`, copy infrastructure validity into `valid_for_authoritative_scoring`, and leave `reason_codes` empty. v2.3.0 then scored every such episode 0 even when every declared gate passed. Descriptive completion now accepts that receipt (and the older `provider_identity_source_unverified` form). Authority is unchanged: `adapter_runtime` still cannot authorize a switch.
+
+Published as v2.3.1. Use the GitHub release notes for the wheel and release-tree digests. Do not infer a pin from this checkout.
+
 ## 2.3.0 — 2026-08-22
 
 **GIO-135: remove the campaign approval-gate system.** Qualification and full no longer require detached Ed25519 signatures, approval previews/requests/receipts, an Approval Broker, or an `APPROVALS` directory. Immutable PLAN controls (`qualification_execution` / `full_execution`) are the spend contract: exact routes, effort, release tree, plan hash, ceilings, known-cost stop, one crossing-call disclosure, and explicit `allow_unknown_costs`. `oab resume --stage` must restate those values; mismatch fails closed before provider calls. Completing qualification never launches full. Release-approval receipts remain only for authoritative release identity.
