@@ -6,7 +6,7 @@ All benchmark-affecting changes require a new version. Historical results remain
 
 **GIO-183: independent holdout exam. Scoring-affecting.** Stay/switch full-stage pair ids are now `P01, P02, P09, P04, P05, P06, P10, P08` (still 80 episodes/route). `P09` (Pellmere lock digest) and `P10` (Osthaven yard permit) were authored by MoA `oab-holdout` — references `xai-oauth/grok-4.6` + `anthropic/claude-opus-5`, aggregator `xai-oauth/grok-4.6`. Sol did not write those contracts (`AUTHORSHIP.json`, `sol_touched=false`). Sol-authored `P03`/`P07` remain in the registry as diagnostic-only pairs and are not on the stay/switch grid. Civic fiction only. Existing gate *types* reused; new holdout gate ids (`HOL-*`).
 
-This version is not yet a published pin. Do not infer a release-tree digest from this checkout.
+Published as v2.4.0. Use the GitHub release notes for the wheel and release-tree digests. Do not infer a pin from an untagged or later checkout.
 
 ## 2.3.1 — 2026-08-23
 
