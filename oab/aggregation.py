@@ -87,9 +87,14 @@ def observation_contract_complete(record: Mapping[str, object]) -> bool:
         return False
     authoritative = record.get("valid_for_authoritative_scoring") is True
     if identity_source == "adapter_runtime":
-        if authoritative:
+        # Hermes attests route+session via adapter_runtime. That is provisional
+        # descriptive credit only: never treat it as authoritative identity.
+        # Live receipts copy infrastructure validity into
+        # valid_for_authoritative_scoring and often leave reason_codes empty.
+        # Those still finished the job and must count.
+        if reasons not in ([], ["provider_identity_source_unverified"]):
             return False
-        return reasons == ["provider_identity_source_unverified"]
+        return True
     if identity_source == "provider_response":
         return authoritative and reasons == []
     # deterministic_control is calibration-only and never authoritative model credit
