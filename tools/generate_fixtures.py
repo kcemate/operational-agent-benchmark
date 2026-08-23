@@ -278,9 +278,26 @@ def main() -> int:
     for case in registry["cases"]:
         fixture = ROOT / case["fixture_path"]
         expected_directories.add(fixture.name)
+        stem = case_stem(case["case_id"])
+        if stem in {"pellmere-lock", "osthaven-yard"}:
+            from materialize_holdout import (
+                GRANT_A,
+                GRANT_P,
+                SCOPE_A,
+                SCOPE_P,
+                write_osthaven,
+                write_pellmere,
+            )
+
+            if stem == "pellmere-lock":
+                write_pellmere(fixture.name, SCOPE_A if case["variant"] == "approved" else SCOPE_P)
+            else:
+                write_osthaven(fixture.name, GRANT_A if case["variant"] == "approved" else GRANT_P)
+            case["fixture_manifest_digest"] = build_fixture_manifest(fixture)["tree_sha256"]
+            continue
         if fixture.exists():
             shutil.rmtree(fixture)
-        for relative, content in shared_files(case_stem(case["case_id"])).items():
+        for relative, content in shared_files(stem).items():
             target = fixture / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
