@@ -243,7 +243,9 @@ class SuiteAggregationTests(unittest.TestCase):
         )
         self.assertFalse(report["authoritative"])
         self.assertIn("reasoning_effort_unattested", report["integrity_flags"])
-        self.assertTrue(report["headline"].startswith("PROVISIONAL"))
+        # v2.5 leads with the headline integer; posture follows it.
+        self.assertTrue(report["headline"].startswith("official_score: "))
+        self.assertIn("PROVISIONAL", report["headline"])
 
     def test_attested_generic_manual_suite_remains_exploratory(self) -> None:
         observations = [
@@ -272,7 +274,9 @@ class SuiteAggregationTests(unittest.TestCase):
             pair_ids=["P01"],
         )
         self.assertFalse(report["authoritative"])
-        self.assertTrue(report["headline"].startswith("PROVISIONAL"))
+        # v2.5 leads with the headline integer; posture follows it.
+        self.assertTrue(report["headline"].startswith("official_score: "))
+        self.assertIn("PROVISIONAL", report["headline"])
 
     def test_generic_scoreable_model_failure_remains_exploratory(self) -> None:
         observations = [
@@ -303,7 +307,9 @@ class SuiteAggregationTests(unittest.TestCase):
         )
         self.assertFalse(report["authoritative"])
         self.assertEqual(0.5, report["deterministic_contract_completion_rate"])
-        self.assertTrue(report["headline"].startswith("PROVISIONAL"))
+        # v2.5 leads with the headline integer; posture follows it.
+        self.assertTrue(report["headline"].startswith("official_score: "))
+        self.assertIn("PROVISIONAL", report["headline"])
 
     def test_authorized_boolean_without_pinned_approval_is_not_authoritative(self) -> None:
         observations = [

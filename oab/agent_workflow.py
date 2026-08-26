@@ -24,6 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .championship_score import (
+    championship_score,
+    derive_recommendation,
+    production_switch_blockers,
+)
 from .campaign_contract import (
     CAMPAIGN_PLAN_SCHEMA,
     campaign_plan_sha256,
@@ -3056,12 +3061,6 @@ def run_full_stage(
     return state
 
 
-def _number(value: object) -> float | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return None
-
-
 def build_evidence_posture(
     suite_reports: Sequence[Mapping[str, object]],
     *,
@@ -3153,7 +3152,14 @@ def _comparable_authoritative_reports(
     expected_execution_contract_sha256: str | None,
     expected_release_tree_sha256: str,
 ) -> list[Mapping[str, object]]:
-    """Select reports only when their signed full-stage binding is identical."""
+    """Select reports only when their signed full-stage binding is identical.
+
+    Comparability is contract shape: identical plan, full-stage tuple, pair
+    grid, release tree, and runtime.  Release authority and coverage are *not*
+    comparability — authority stamps ``score_posture`` and coverage decides
+    ``score_status``, so a coverage-short or unpinned route stays in the
+    comparison and reports its own incompleteness instead of vanishing from it.
+    """
     if (
         authoritative_full_plan is None
         or not isinstance(expected_plan_sha256, str)
@@ -3192,8 +3198,7 @@ def _comparable_authoritative_reports(
         api_calls = usage.get("api_calls") if isinstance(usage, Mapping) else None
         route_id = binding.get("route_id")
         if (
-            report.get("authoritative") is True
-            and binding.get("full_contract") == contract
+            binding.get("full_contract") == contract
             and isinstance(route_id, str)
             and route_id not in seen_route_ids
             and isinstance(requested_route, str)
@@ -3202,7 +3207,9 @@ def _comparable_authoritative_reports(
             and isinstance(scheduled, int)
             and not isinstance(scheduled, bool)
             and scheduled == FULL_EPISODES_PER_ROUTE
-            and valid == scheduled
+            and isinstance(valid, int)
+            and not isinstance(valid, bool)
+            and 0 <= valid <= scheduled
             and report.get("pair_ids") == list(AUTHORITATIVE_FULL_PAIR_IDS)
             and report.get("repetitions") == FULL_REPETITIONS
             and report.get("release_tree_sha256") == expected_release_tree_sha256
@@ -3268,8 +3275,12 @@ def build_decision_report(
         expected_execution_contract_sha256=expected_execution_contract_sha256,
         expected_release_tree_sha256=expected_release_tree_sha256,
     )
+    scored = [
+        (str(report.get("requested_route")), championship_score(report))
+        for report in comparable
+    ]
     base: dict[str, object] = {
-        "schema": "oab.decision-report/v3",
+        "schema": "oab.decision-report/v4",
         "created_at": _utc_now(),
         "current_route": current_route,
         "expected_pair_ids": list(AUTHORITATIVE_FULL_PAIR_IDS),
@@ -3282,7 +3293,13 @@ def build_decision_report(
         "recommended_route": None,
         "reasons": [],
         "claim_scope": "tested route/configuration pairs only; not exact provider serving-model identity",
-        "comparable_routes": [str(report.get("requested_route")) for report in comparable],
+        "comparable_routes": [route for route, _ in scored],
+        "routes": [
+            {"requested_route": route, "championship_score": score}
+            for route, score in scored
+        ],
+        "production_switch_supported": False,
+        "production_switch_blockers": [],
     }
     if not full_valid:
         base["reasons"] = ["authoritative_full_contract_required"]
@@ -3291,43 +3308,25 @@ def build_decision_report(
         base["reasons"] = ["fewer_than_two_authoritative_routes"]
         return base
     baseline = next(
-        (report for report in comparable if report.get("requested_route") == current_route),
+        ((route, score) for route, score in scored if route == current_route),
         None,
     )
     if baseline is None:
         base["reasons"] = ["current_route_not_in_authoritative_comparison"]
         return base
-    baseline_primary = _number(baseline.get("deterministic_contract_completion_rate"))
-    baseline_matched = _number(baseline.get("matched_pair_completion_rate"))
-    stability = baseline.get("pair_stability")
-    baseline_min = _number(stability.get("min")) if isinstance(stability, Mapping) else None
-    if None in {baseline_primary, baseline_matched, baseline_min}:
-        base["reasons"] = ["baseline_metrics_incomplete"]
-        return base
-    assert baseline_primary is not None
-    assert baseline_matched is not None
-    assert baseline_min is not None
-
-    dominant: list[tuple[tuple[float, float, float], Mapping[str, object]]] = []
-    for candidate in comparable:
-        if candidate is baseline:
-            continue
-        primary = _number(candidate.get("deterministic_contract_completion_rate"))
-        matched = _number(candidate.get("matched_pair_completion_rate"))
-        candidate_stability = candidate.get("pair_stability")
-        minimum = _number(candidate_stability.get("min")) if isinstance(candidate_stability, Mapping) else None
-        if primary is None or matched is None or minimum is None:
-            continue
-        if primary > baseline_primary and matched >= baseline_matched and minimum >= baseline_min:
-            dominant.append(((primary, matched, minimum), candidate))
-    if not dominant:
-        base["recommendation"] = "stay"
-        base["recommended_route"] = current_route
-        base["reasons"] = ["no_strictly_dominant_tested_route"]
-        return base
-    dominant.sort(key=lambda item: item[0], reverse=True)
-    winner = dominant[0][1]
-    base["recommendation"] = "switch"
-    base["recommended_route"] = str(winner.get("requested_route"))
-    base["reasons"] = ["strict_primary_gain_without_matched_pair_or_min_stability_regression"]
+    baseline_route, baseline_score = baseline
+    base.update(
+        derive_recommendation(
+            current_route=baseline_route,
+            current_score=baseline_score,
+            candidate_scores=[
+                (route, score) for route, score in scored if route != baseline_route
+            ],
+        )
+    )
+    # Authority never changes the number or the observational recommendation; it
+    # only decides whether that recommendation may be spoken as a production switch.
+    blockers = production_switch_blockers(scored)
+    base["production_switch_blockers"] = blockers
+    base["production_switch_supported"] = base["recommendation"] == "switch" and not blockers
     return base

@@ -8,7 +8,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import Mapping, cast
+from typing import Any, Mapping, cast
 from unittest.mock import patch
 
 
@@ -1897,9 +1897,18 @@ class AgentWorkflowContractTests(unittest.TestCase):
                     "infrastructure_valid_episodes": 80,
                     "pair_ids": FULL_PAIR_IDS,
                     "repetitions": 5,
-                    "deterministic_contract_completion_rate": 0.70 if baseline else 0.85,
-                    "matched_pair_completion_rate": 0.60 if baseline else 0.80,
-                    "pair_stability": {"min": 0.40 if baseline else 0.60},
+                    "completed_contract_episodes": 56 if baseline else 68,
+                    "matched_pair_successes": 24 if baseline else 32,
+                    "pair_stability": {
+                        "min": 0.40 if baseline else 0.60,
+                        "min_pair_id": "P09",
+                    },
+                    "pairs": [
+                        {
+                            "pair_id": "P09",
+                            "matched_pair_successes": 2 if baseline else 3,
+                        }
+                    ],
                     "controller_usage": {
                         "api_calls": 80,
                         "cost_usd": 2.0,
@@ -2885,7 +2894,8 @@ class AgentWorkflowContractTests(unittest.TestCase):
         for key in ("recommendation", "recommended_route", "reasons", "comparable_routes"):
             self.assertEqual(without[key], with_diagnostic[key], key)
 
-    def test_decision_recommends_only_strict_dominance(self) -> None:
+    def test_decision_recommends_the_higher_official_score(self) -> None:
+        """v2.5: stay/switch derives from the official integers, not rate dominance."""
         context = self.authoritative_decision_context("route-current", "route-next")
         bindings = cast(Mapping[str, object], context["bindings"])
         baseline = {
@@ -2899,18 +2909,20 @@ class AgentWorkflowContractTests(unittest.TestCase):
             "infrastructure_valid_episodes": 80,
             "pair_ids": FULL_PAIR_IDS,
             "repetitions": 5,
-            "deterministic_contract_completion_rate": 0.70,
-            "matched_pair_completion_rate": 0.60,
-            "pair_stability": {"min": 0.40},
+            "completed_contract_episodes": 56,
+            "matched_pair_successes": 24,
+            "pair_stability": {"min": 0.40, "min_pair_id": "P09"},
+            "pairs": [{"pair_id": "P09", "matched_pair_successes": 2}],
             "controller_usage": {"api_calls": 80},
             "authoritative_stage": bindings["route-current"],
         }
         candidate = {
             **baseline,
             "requested_route": "openai-codex/gpt-next",
-            "deterministic_contract_completion_rate": 0.85,
-            "matched_pair_completion_rate": 0.80,
-            "pair_stability": {"min": 0.60},
+            "completed_contract_episodes": 68,
+            "matched_pair_successes": 32,
+            "pair_stability": {"min": 0.60, "min_pair_id": "P09"},
+            "pairs": [{"pair_id": "P09", "matched_pair_successes": 3}],
             "authoritative_stage": bindings["route-next"],
         }
         report = build_decision_report(
@@ -2923,8 +2935,17 @@ class AgentWorkflowContractTests(unittest.TestCase):
             expected_execution_contract_sha256=cast(str, context["expected_execution_contract_sha256"]),
             suite_reports=[baseline, candidate],
         )
+        scores = {
+            row["requested_route"]: row["championship_score"]["official_score"]
+            for row in cast(list[Mapping[str, Any]], report["routes"])
+        }
+        self.assertEqual(65, scores["openai-codex/gpt-current"])
+        self.assertEqual(81, scores["openai-codex/gpt-next"])
         self.assertEqual("switch", report["recommendation"])
         self.assertEqual("openai-codex/gpt-next", report["recommended_route"])
+        self.assertEqual(["higher_official_score"], report["reasons"])
+        # The suites are unpinned, so the switch stays observational.
+        self.assertFalse(report["production_switch_supported"])
 
     def test_decision_rejects_different_pair_grid_even_with_80_episodes(self) -> None:
         context = self.authoritative_decision_context("route-current", "route-next")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from .championship_score import championship_score
 from .full_stage_contract import (
     AUTHORITATIVE_FULL_PAIR_IDS,
     FULL_EPISODES_PER_ROUTE,
@@ -558,6 +559,8 @@ def aggregate_suite_observations(
             "version": 2,
             "primary_metric": "deterministic_contract_completion_rate",
         },
+        # Filled below: the score reads fields this literal is still building.
+        "championship_score": None,
         "requested_route": requested_route,
         "reasoning_effort": reasoning_effort,
         "controller_config_sha256": controller_config_sha256,
@@ -619,8 +622,17 @@ def aggregate_suite_observations(
         "observations": normalized_observations,
         "headline": "",
     }
+    report["championship_score"] = championship_score(report)
     report["headline"] = format_headline(report)
     return report
+
+
+def format_official_score(report: Mapping[str, object]) -> str:
+    """Render the headline integer, or `incomplete` when coverage was short."""
+    score = report.get("championship_score")
+    if isinstance(score, Mapping) and score.get("score_status") == "official":
+        return f"official_score: {score.get('official_score')} ({score.get('score_posture')})"
+    return "official_score: incomplete"
 
 
 def format_headline(report: Mapping[str, object]) -> str:
@@ -631,9 +643,10 @@ def format_headline(report: Mapping[str, object]) -> str:
     scheduled = _as_int(report.get("scheduled_episodes"))
     infrastructure_valid = _as_int(report.get("infrastructure_valid_episodes"))
     coverage = _as_float(report.get("infrastructure_coverage_rate"))
+    score_text = format_official_score(report)
     if infrastructure_valid <= 0:
         return (
-            f"NO SCORE | route={route} | reasoning_effort={effort} | "
+            f"{score_text} | NO SCORE | route={route} | reasoning_effort={effort} | "
             f"identity_source={identity} | infrastructure_coverage: "
             f"{coverage * 100:.1f}% (0/{scheduled}) | Infrastructure-invalid "
             "episodes are excluded, not model failures."
@@ -691,6 +704,7 @@ def format_headline(report: Mapping[str, object]) -> str:
                 gate_id, failed, evaluated = ranked[0]
                 top_gate_text = f" | top_gate_failure: {gate_id} ({failed}/{evaluated})"
     return (
+        f"{score_text} | "
         f"{posture} | route={route} | reasoning_effort={effort} | identity_source={identity} | "
         f"infrastructure_coverage: {coverage * 100:.1f}% "
         f"({infrastructure_valid}/{scheduled}) | "
@@ -715,6 +729,7 @@ def validate_suite_report(report: Mapping[str, object]) -> list[str]:
     if "deterministic_contract_completion_rate" not in report:
         errors.append("primary_metric_missing")
     for key in (
+        "championship_score",
         "requested_route",
         "scheduled_episodes",
         "completed_contract_episodes",

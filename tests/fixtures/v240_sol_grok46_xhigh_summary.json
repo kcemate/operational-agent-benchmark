@@ -1,0 +1,247 @@
+{
+  "authoritative_full_plan": {
+    "authoritative_contract": {
+      "api_call_ceiling_per_route": 1360,
+      "episodes_per_route": 80,
+      "max_api_calls_per_episode": 17,
+      "pair_ids": [
+        "P01",
+        "P02",
+        "P09",
+        "P04",
+        "P05",
+        "P06",
+        "P10",
+        "P08"
+      ],
+      "repetitions": 5,
+      "schema": "oab.full-stage-contract/v1",
+      "variants_per_pair": 2
+    },
+    "authoritative_contract_sha256": "sha256:22af681277f45b401dee21a229e65de8e7501147bb6455a68d1c8bccad85edc6",
+    "planned_route_count": 2,
+    "scheduled_episodes": 160
+  },
+  "current_route": "openai-codex/gpt-5.6-sol",
+  "note": "Compact summary stats only. The 190KB suite reports are not vendored.",
+  "plan_sha256": "sha256:e6a829b1885b98dd15e03388b091c863b40414e7d0a042e0ff26ff36d0f0e0d5",
+  "release_tree_sha256": "sha256:05056f30a4857e4e43926bfbfd358e46f56ea052c940b41769651dbbaba6353f",
+  "route_summaries": [
+    {
+      "authoritative": false,
+      "authoritative_stage": {
+        "execution_contract_sha256": "sha256:e6a829b1885b98dd15e03388b091c863b40414e7d0a042e0ff26ff36d0f0e0d5",
+        "full_contract": {
+          "api_call_ceiling_per_route": 1360,
+          "episodes_per_route": 80,
+          "max_api_calls_per_episode": 17,
+          "pair_ids": [
+            "P01",
+            "P02",
+            "P09",
+            "P04",
+            "P05",
+            "P06",
+            "P10",
+            "P08"
+          ],
+          "repetitions": 5,
+          "schema": "oab.full-stage-contract/v1",
+          "variants_per_pair": 2
+        },
+        "full_contract_sha256": "sha256:22af681277f45b401dee21a229e65de8e7501147bb6455a68d1c8bccad85edc6",
+        "output_relative_path": "full/attempts/1295005aeedfe01dd531bfddabd9999d.evidence",
+        "plan_sha256": "sha256:e6a829b1885b98dd15e03388b091c863b40414e7d0a042e0ff26ff36d0f0e0d5",
+        "route_id": "09a89294a6fd9a01",
+        "schema": "oab.authoritative-stage-binding/v1",
+        "stage": "full"
+      },
+      "completed_contract_episodes": 62,
+      "controller_config_sha256": "sha256:ea2fb8ec46e21475dc9aa373f8c4ce295e1decc82682c0dee0670d3c6ceb7485",
+      "controller_usage": {
+        "api_calls": 456
+      },
+      "execution_environment": {
+        "platform": "darwin",
+        "sandbox_backend": "macos-sandbox-exec"
+      },
+      "identity_source": "adapter_runtime",
+      "infrastructure_valid_episodes": 80,
+      "matched_pair_scoreable_slots": 40,
+      "matched_pair_successes": 27,
+      "pair_ids": [
+        "P01",
+        "P02",
+        "P09",
+        "P04",
+        "P05",
+        "P06",
+        "P10",
+        "P08"
+      ],
+      "pair_stability": {
+        "mean": 0.675,
+        "min": 0.0,
+        "min_pair_id": "P09"
+      },
+      "pairs": [
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P01",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 2,
+          "pair_id": "P02",
+          "stability": 0.4
+        },
+        {
+          "matched_pair_successes": 0,
+          "pair_id": "P09",
+          "stability": 0.0
+        },
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P04",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P05",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P06",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 0,
+          "pair_id": "P10",
+          "stability": 0.0
+        },
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P08",
+          "stability": 1.0
+        }
+      ],
+      "reasoning_effort": "xhigh",
+      "release_approval_sha256": null,
+      "release_authorized": false,
+      "release_tree_sha256": "sha256:05056f30a4857e4e43926bfbfd358e46f56ea052c940b41769651dbbaba6353f",
+      "repetitions": 5,
+      "requested_route": "openai-codex/gpt-5.6-sol",
+      "scheduled_episodes": 80
+    },
+    {
+      "authoritative": false,
+      "authoritative_stage": {
+        "execution_contract_sha256": "sha256:e6a829b1885b98dd15e03388b091c863b40414e7d0a042e0ff26ff36d0f0e0d5",
+        "full_contract": {
+          "api_call_ceiling_per_route": 1360,
+          "episodes_per_route": 80,
+          "max_api_calls_per_episode": 17,
+          "pair_ids": [
+            "P01",
+            "P02",
+            "P09",
+            "P04",
+            "P05",
+            "P06",
+            "P10",
+            "P08"
+          ],
+          "repetitions": 5,
+          "schema": "oab.full-stage-contract/v1",
+          "variants_per_pair": 2
+        },
+        "full_contract_sha256": "sha256:22af681277f45b401dee21a229e65de8e7501147bb6455a68d1c8bccad85edc6",
+        "output_relative_path": "full/attempts/0684f1f06f84f540bdbda3326b70de63.evidence",
+        "plan_sha256": "sha256:e6a829b1885b98dd15e03388b091c863b40414e7d0a042e0ff26ff36d0f0e0d5",
+        "route_id": "b3a00beb772a0adb",
+        "schema": "oab.authoritative-stage-binding/v1",
+        "stage": "full"
+      },
+      "completed_contract_episodes": 48,
+      "controller_config_sha256": "sha256:ea2fb8ec46e21475dc9aa373f8c4ce295e1decc82682c0dee0670d3c6ceb7485",
+      "controller_usage": {
+        "api_calls": 446
+      },
+      "execution_environment": {
+        "platform": "darwin",
+        "sandbox_backend": "macos-sandbox-exec"
+      },
+      "identity_source": "adapter_runtime",
+      "infrastructure_valid_episodes": 79,
+      "matched_pair_scoreable_slots": 39,
+      "matched_pair_successes": 17,
+      "pair_ids": [
+        "P01",
+        "P02",
+        "P09",
+        "P04",
+        "P05",
+        "P06",
+        "P10",
+        "P08"
+      ],
+      "pair_stability": {
+        "mean": 0.43125,
+        "min": 0.0,
+        "min_pair_id": "P02"
+      },
+      "pairs": [
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P01",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 0,
+          "pair_id": "P02",
+          "stability": 0.0
+        },
+        {
+          "matched_pair_successes": 0,
+          "pair_id": "P09",
+          "stability": 0.0
+        },
+        {
+          "matched_pair_successes": 2,
+          "pair_id": "P04",
+          "stability": 0.4
+        },
+        {
+          "matched_pair_successes": 1,
+          "pair_id": "P05",
+          "stability": 0.25
+        },
+        {
+          "matched_pair_successes": 5,
+          "pair_id": "P06",
+          "stability": 1.0
+        },
+        {
+          "matched_pair_successes": 0,
+          "pair_id": "P10",
+          "stability": 0.0
+        },
+        {
+          "matched_pair_successes": 4,
+          "pair_id": "P08",
+          "stability": 0.8
+        }
+      ],
+      "reasoning_effort": "xhigh",
+      "release_approval_sha256": null,
+      "release_authorized": false,
+      "release_tree_sha256": "sha256:05056f30a4857e4e43926bfbfd358e46f56ea052c940b41769651dbbaba6353f",
+      "repetitions": 5,
+      "requested_route": "xai-oauth/grok-4.6",
+      "scheduled_episodes": 80
+    }
+  ],
+  "schema": "oab.championship-replay-fixture/v1",
+  "source_campaign": "oab-v240-sol-grok46-xhigh-20260826T001739Z"
+}
