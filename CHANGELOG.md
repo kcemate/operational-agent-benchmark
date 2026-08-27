@@ -2,6 +2,12 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest. References below to publishing, wheels, releases, or CI are historical and exact-tree scoped: they do not attest an untagged, dirty, or later checkout.
 
+## 2.5.0 — 2026-08-27
+
+**GIO-202: uncapped championship score. Scoring-affecting.** The product headline is an integer `official_score` = `floor(70×C/80 + 20×M/40 + 10×S/5)`. Stay/switch is derived from that integer. There is no cap: a dead pair contributes 0 to its own bucket and does not clamp the rest. Incomplete infrastructure coverage (≠ 80/80) publishes no number. Unpinned/unauthorized runs still print the number with `score_posture=exploratory` and cannot authorize a production switch. Decision report schema is `oab.decision-report/v4`. Locked replay of the v2.4.0 sol vs grok-4.6 xhigh campaign: Sol **67** exploratory, Grok incomplete (79/80), recommendation `not_supportable`.
+
+Published as v2.5.0. Use the GitHub release notes for the wheel and release-tree digests. Do not infer a pin from an untagged or later checkout.
+
 ## 2.4.0 — 2026-08-23
 
 **GIO-183: independent holdout exam. Scoring-affecting.** Stay/switch full-stage pair ids are now `P01, P02, P09, P04, P05, P06, P10, P08` (still 80 episodes/route). `P09` (Pellmere lock digest) and `P10` (Osthaven yard permit) were authored by MoA `oab-holdout` — references `xai-oauth/grok-4.6` + `anthropic/claude-opus-5`, aggregator `xai-oauth/grok-4.6`. Sol did not write those contracts (`AUTHORSHIP.json`, `sol_touched=false`). Sol-authored `P03`/`P07` remain in the registry as diagnostic-only pairs and are not on the stay/switch grid. Civic fiction only. Existing gate *types* reused; new holdout gate ids (`HOL-*`).

@@ -509,6 +509,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _official_scores(decision: Mapping[str, object]) -> dict[str, object]:
+    """Route -> headline integer, or `incomplete` where coverage was short."""
+    rows = decision.get("routes")
+    if not isinstance(rows, list):
+        return {}
+    scores: dict[str, object] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        score = row.get("championship_score")
+        if not isinstance(score, Mapping):
+            continue
+        value = score.get("official_score")
+        scores[str(row.get("requested_route"))] = (
+            value if value is not None else "incomplete"
+        )
+    return scores
+
+
 def _decision_semantics(report: Mapping[str, object]) -> dict[str, object]:
     comparable = report.get("comparable_routes")
     routes = sorted(str(route) for route in comparable) if isinstance(comparable, list) else []
@@ -523,6 +542,11 @@ def _decision_semantics(report: Mapping[str, object]) -> dict[str, object]:
         "reasons": report.get("reasons"),
         "claim_scope": report.get("claim_scope"),
         "comparable_routes": routes,
+        # The headline integer is the product claim, so it is recomputed too:
+        # an edited official_score in a stored DECISION_REPORT must fail verify.
+        "routes": report.get("routes"),
+        "production_switch_supported": report.get("production_switch_supported"),
+        "production_switch_blockers": report.get("production_switch_blockers"),
     }
 
 
@@ -1050,8 +1074,13 @@ def main(
             if decision_path.is_file():
                 final_decision = _load_json_object(decision_path)
                 payload["decision"] = final_decision
+                # The integer leads; the rates stay on the suite reports as diagnostics.
+                payload["official_scores"] = _official_scores(final_decision)
                 payload["recommendation"] = final_decision.get("recommendation")
                 payload["recommended_route"] = final_decision.get("recommended_route")
+                payload["production_switch_supported"] = final_decision.get(
+                    "production_switch_supported"
+                )
             _json_print(payload)
             return 0
 

@@ -28,7 +28,11 @@ _EXCLUDED_PARTS = {
     "dist",
 }
 _EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
-_EXCLUDED_NAMES = {".DS_Store", "RELEASE_MANIFEST.json"}
+_EXCLUDED_NAMES = {
+    ".DS_Store",
+    "RELEASE_MANIFEST.json",
+    "BUILD_PROMPT.md",  # local build instructions: untracked, never release content
+}
 
 
 def _canonical_bytes(value: object) -> bytes:

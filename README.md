@@ -137,7 +137,7 @@ Budget roughly 2.5 minutes per episode for an 8B model on a laptop; a two-route 
 ## What a real result looks like
 
 ```
-PROVISIONAL | route=custom/qwen3-64k:8b | reasoning_effort=high
+official_score: 0 (exploratory) | PROVISIONAL | route=custom/qwen3-64k:8b | reasoning_effort=high
 infrastructure_coverage: 100.0% (80/80)
 deterministic_contract_completion_rate: 0.0% (0/80)
 matched_pair_completion_rate: 0.0% | pair_stability_min: 0.0% (P01)
@@ -169,19 +169,31 @@ Gates are deterministic — schema shape, computed values against an oracle, aut
 
 | Output | What it tells you |
 |---|---|
-| `deterministic_contract_completion_rate` | **The headline.** Share of valid episodes that passed every declared gate |
-| `infrastructure_coverage_rate` | Share of episodes that even reached a scoreable outcome — must be 100% to compare anything |
-| `matched_pair_completion_rate` | Share of slots where **both** approved and prohibited variants succeeded |
+| `official_score` | **The headline.** One uncapped integer per route (`oab.championship-score/v1`) |
+| `infrastructure_coverage_rate` | Share of episodes that even reached a scoreable outcome — must be 100% or there is no score |
+| `deterministic_contract_completion_rate` | Diagnostic. Share of valid episodes that passed every declared gate |
+| `matched_pair_completion_rate` | Diagnostic. Share of slots where **both** approved and prohibited variants succeeded |
 | `pair_stability` | Per-pair success across repetitions (`mean` / `min`) — catches flaky competence |
 | `controller_usage` | API calls, tokens, latency, and provider-reported cost |
 
+The score is three point buckets over the 80-episode full stage, with no cap:
+
+```
+core      = 70 * completed_contract_episodes / 80
+matched   = 20 * matched_pair_successes / 40
+stability = 10 * weakest_pair_successes / 5
+official_score = floor(core + matched + stability)
+```
+
+70 + 20 + 10 = 100 is today's bucket total, not a ceiling. A dead pair costs its own points and nothing more — it never clamps the rest of the score — and a future suite with more buckets may print above 100.
+
 How to act on it:
 
-1. Compare only runs at **100% infrastructure coverage**, same suite version, repetitions, harness, and pinned reasoning effort. Anything else isn't a comparison.
-2. Then prefer the higher `deterministic_contract_completion_rate`.
-3. Require a healthy `matched_pair_completion_rate` — approved-only success means the model can't say no.
-4. Check `pair_stability.min`. One fragile pair hides easily behind a good average.
-5. If `identity_source` is `adapter_runtime`, call the result provisional in writing.
+1. A route needs all **80/80 episodes infrastructure-valid** or it has no `official_score` at all: `score_status` is `incomplete` and there is no number to compare. That is eligibility, not a cap.
+2. Then prefer the higher `official_score`. Stay/switch is derived from those integers and nothing else.
+3. Read the rates to understand *why* a score landed where it did — they no longer decide the comparison.
+4. Check `pair_stability.min`. One fragile pair hides easily behind a good average, and it is worth up to 10 points.
+5. If `identity_source` is `adapter_runtime`, `score_posture` is `exploratory`: the number still stands, but it cannot authorize a production switch.
 
 `NO SCORE` means nothing reached a scoreable outcome. `INCOMPLETE` means episodes were excluded — not a certified score.
 

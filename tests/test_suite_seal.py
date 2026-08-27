@@ -507,6 +507,32 @@ class SuiteSealTests(unittest.TestCase):
             created.unlink()
             shutil.rmtree(held)
 
+    def test_sealed_official_score_is_recomputed_not_trusted(self) -> None:
+        """The headline integer rides on the suite seal like every other claim.
+
+        `championship_score` is derived inside `aggregate_suite_observations`,
+        so seal verification regenerates it: an inflated score in a sealed
+        suite-report.json cannot survive re-verification.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            output = self._suite(Path(td))
+            report_path = output / "suite-report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "oab.championship-score/v1", report["championship_score"]["schema"]
+            )
+            _path, digest = write_suite_seal(output)
+            self.assertEqual([], verify_suite_seal(output, expected_seal_sha256=digest))
+
+            report["championship_score"]["official_score"] = 100
+            report["championship_score"]["raw"] = 100.0
+            report_path.write_bytes(_canonical_bytes(report) + b"\n")
+
+            self.assertIn(
+                "suite_report_recomputation_mismatch:championship_score",
+                verify_suite_seal(output),
+            )
+
     def test_retained_report_and_seal_byte_tamper_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             output = self._suite(Path(td))

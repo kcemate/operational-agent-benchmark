@@ -121,13 +121,16 @@ Episodes that fail before gate evaluation (for example a protocol failure on the
 Every suite write must produce a single headline line:
 
 ```text
-PROVISIONAL | route=<provider>/<model> | reasoning_effort=<level> |
+official_score: <int> (<posture>) | PROVISIONAL | route=<provider>/<model> |
+reasoning_effort=<level> |
 identity_source=<source> | infrastructure_coverage: 100.0% (<valid>/<scheduled>) |
 deterministic_contract_completion_rate: <pct>% (<complete>/<valid>) |
 matched_pair_completion_rate: <pct>% |
 pair_stability_min: <pct>% (<pair>) |
 Do not treat as release-ready.
 ```
+
+The uncapped `official_score` integer leads; the rates follow as diagnostics. A route below 100% infrastructure coverage prints `official_score: incomplete` and has no number to compare.
 
 Zero valid episodes produce `NO SCORE`; partial coverage produces `INCOMPLETE`. Neither is a model score.
 
