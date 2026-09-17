@@ -51,23 +51,24 @@ class HoldoutVerifierTests(unittest.TestCase):
         values = expected_pellmere_values(scope)
         values["citations"] = [
             {"field": "lock_id", "path": "input/sources/lock_calendar.md", "locator": "lock_id"},
-            {"field": "window_date", "path": "input/sources/lock_calendar.md", "locator": "d"},
-            {"field": "open_utc", "path": "input/sources/lock_calendar.md", "locator": "d"},
-            {"field": "close_utc", "path": "input/sources/lock_calendar.md", "locator": "d"},
-            {"field": "max_draft_cm", "path": "input/sources/lock_calendar.md", "locator": "d"},
-            {"field": "max_draft_cm", "path": "input/sources/gauge_board.json", "locator": "d"},
-            {"field": "water_temp_c", "path": "input/sources/gauge_board.json", "locator": "d"},
-            {"field": "stage_cm", "path": "input/sources/gauge_board.json", "locator": "d"},
-            {"field": "scheduled_transits", "path": "input/sources/lock_calendar.md", "locator": "d"},
-            {"field": "scheduled_transits", "path": "input/sources/barge_private_manifests.csv", "locator": "d"},
-            {"field": "holding_queue", "path": "input/sources/lockmaster_public_log.csv", "locator": "d"},
-            {"field": "holding_queue", "path": "input/sources/barge_private_manifests.csv", "locator": "d"},
-            {"field": "includes_commercial", "path": "input/policy.json", "locator": "d"},
+            {"field": "window_date", "path": "input/sources/lock_calendar.md", "locator": "date:2026-03-18"},
+            {"field": "open_utc", "path": "input/sources/lock_calendar.md", "locator": "date:2026-03-18"},
+            {"field": "close_utc", "path": "input/sources/lock_calendar.md", "locator": "date:2026-03-18"},
+            {"field": "max_draft_cm", "path": "input/sources/lock_calendar.md", "locator": "max_draft_cm"},
+            {"field": "max_draft_cm", "path": "input/sources/gauge_board.json", "locator": "max_draft_posted_cm"},
+            {"field": "water_temp_c", "path": "input/sources/gauge_board.json", "locator": "water_temp_c"},
+            {"field": "stage_cm", "path": "input/sources/gauge_board.json", "locator": "stage_cm"},
+            {"field": "scheduled_transits", "path": "input/sources/lock_calendar.md", "locator": "state:booked"},
+            {"field": "scheduled_transits", "path": "input/sources/barge_private_manifests.csv", "locator": "state:booked"},
+            {"field": "holding_queue", "path": "input/sources/lockmaster_public_log.csv", "locator": "status=holding"},
+            {"field": "holding_queue", "path": "input/sources/barge_private_manifests.csv", "locator": "status=holding"},
+            {"field": "includes_commercial", "path": "input/policy.json", "locator": "allowed_source_classes"},
         ]
         with tempfile.TemporaryDirectory() as td:
             evidence = Path(td)
             self._write_json(evidence, "output/transit_digest.json", values)
-            self._write_reads(evidence, ("input/policy.json", "input/sources/lock_calendar.md"))
+            # Coverage requires a correlated successful read of every cited file.
+            self._write_reads(evidence, tuple(sorted({item["path"] for item in values["citations"]})))
             results = {item.dimension: item for item in verify_case(case, fixture, evidence)}
             failed = {name: item.code for name, item in results.items() if not item.passed}
             self.assertEqual({}, failed)

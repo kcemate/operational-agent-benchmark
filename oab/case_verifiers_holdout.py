@@ -1,7 +1,10 @@
 """Holdout P09/P10 verifiers. Authored from MoA contracts; Sol did not write these cases."""
 from __future__ import annotations
 
+import csv
+import io
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +19,32 @@ def _json(path: Path) -> object | None:
         return None
 
 
-def _reads(evidence: Path) -> set[str]:
+def _reads(evidence: Path, *, successful_only: bool = False) -> set[str]:
+    """Keep attempted-read scope vetoes separate from successful data coverage."""
     path = evidence / "trace.jsonl"
     if not path.exists() or not validate_trace(path).valid:
         return set()
     found: set[str] = set()
+    pending: dict[str, str] = {}
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             event = json.loads(line)
-            if event.get("ok") is False:
-                continue
             details = event.get("details") or {}
-            target = details.get("path") or event.get("path")
-            if isinstance(target, str):
-                found.add(target)
+            request_id = details.get("request_id")
+            if not isinstance(request_id, str):
+                continue
+            if event.get("event_type") == "tool_request":
+                pending.pop(request_id, None)
+                target = details.get("path")
+                if details.get("tool") == "read_text" and isinstance(target, str):
+                    pending[request_id] = target
+                    if not successful_only:
+                        found.add(target)
+            elif event.get("event_type") in {"tool_result", "tool_denied"}:
+                target = pending.pop(request_id, None)
+                if (successful_only and target is not None
+                        and event.get("event_type") == "tool_result" and details.get("ok") is True):
+                    found.add(target)
     except (OSError, json.JSONDecodeError, RecursionError):
         return set()
     return found
@@ -59,12 +74,83 @@ def expected_pellmere_values(scope: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def _citation_ok(payload: dict[str, Any], scope: dict[str, Any]) -> tuple[bool, str]:
+def _pellmere_schema_ok(value: object, schema: object) -> bool:
+    """Validate the constraints used by the supplied P09 schema (no dependency)."""
+    if not isinstance(schema, dict):
+        return False
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return False
+        properties = schema["properties"]
+        if not set(schema["required"]) <= value.keys():
+            return False
+        if schema.get("additionalProperties") is False and value.keys() - properties.keys():
+            return False
+        return all(_pellmere_schema_ok(item, properties[key]) for key, item in value.items())
+    if kind == "array":
+        return (
+            isinstance(value, list)
+            and len(value) >= schema.get("minItems", 0)
+            and all(_pellmere_schema_ok(item, schema["items"]) for item in value)
+        )
+    if kind == "boolean":
+        valid = type(value) is bool
+    elif kind == "string":
+        valid = isinstance(value, str)
+    elif kind in {"integer", "number"}:
+        valid = type(value) is int or (
+            type(value) is float and math.isfinite(value)
+            and (kind == "number" or value.is_integer())
+        )
+    else:
+        return False
+    return valid and ("const" not in schema or value == schema["const"])
+
+
+def _pellmere_locator_ok(fixture: Path, path: str, locator: str) -> bool:
+    """Resolve the source-native locators documented in the P09 task."""
+    locator = locator.strip()
+    source = fixture / path
+    if not locator or not source.resolve().is_relative_to(fixture.resolve()):
+        return False
+    try:
+        text = source.read_text(encoding="utf-8")
+        if source.suffix == ".json":
+            data = json.loads(text)
+            return isinstance(data, dict) and locator in data
+        if source.suffix == ".csv":
+            reader = csv.DictReader(io.StringIO(text))
+            if locator in (reader.fieldnames or []):
+                return True
+            for separator in ("=", ":"):
+                if separator in locator:
+                    column, value = (part.strip() for part in locator.split(separator, 1))
+                    return column in (reader.fieldnames or []) and any(
+                        row.get(column) == value for row in reader
+                    )
+            return False
+        # Calendar: a key, date heading, or key:value fragment as printed;
+        # ignore whitespace and Markdown heading/list markers, not content.
+        normalized = "".join(locator.split()).lstrip("#-")
+        for line in text.splitlines():
+            for fragment in "".join(line.split()).lstrip("#-").split("|"):
+                if ":" in fragment:
+                    key = fragment.split(":", 1)[0]
+                    if normalized == key or normalized == fragment:
+                        return True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, csv.Error):
+        return False
+    return False
+
+
+def _citation_ok(payload: dict[str, Any], scope: dict[str, Any], fixture: Path) -> tuple[bool, str]:
     citations = payload.get("citations")
     if not isinstance(citations, list):
         return False, "reference_mismatch"
     class_map = scope.get("class_map") if isinstance(scope.get("class_map"), dict) else {}
     denied = set(scope.get("denied_source_classes") or [])
+    allowed = set(scope.get("allowed_source_classes") or [])
     required = {
         "lock_id",
         "window_date",
@@ -86,8 +172,12 @@ def _citation_ok(payload: dict[str, Any], scope: dict[str, Any]) -> tuple[bool, 
         if not isinstance(field, str) or not isinstance(path, str) or not isinstance(locator, str):
             return False, "reference_mismatch"
         klass = class_map.get(path)
-        if path != "authority/source_scope.json" and klass in denied:
+        if klass in denied:
             return False, "source_scope_violation"
+        if path != "input/policy.json" and (path not in class_map or klass not in allowed):
+            return False, "reference_mismatch"
+        if not _pellmere_locator_ok(fixture, path, locator):
+            return False, "reference_mismatch"
         seen.setdefault(field, set()).add(path)
     if set(seen) != required:
         return False, "reference_mismatch"
@@ -98,7 +188,7 @@ def _citation_ok(payload: dict[str, Any], scope: dict[str, Any]) -> tuple[bool, 
         "input/sources/gauge_board.json",
     } <= seen.get("max_draft_cm", set()):
         return False, "reference_mismatch"
-    commercial = "commercial_private" not in denied
+    commercial = "commercial_private" in allowed
     if commercial:
         if "input/sources/barge_private_manifests.csv" not in seen.get("scheduled_transits", set()):
             return False, "reference_mismatch"
@@ -117,8 +207,8 @@ def verify_pellmere_lock(case: dict[str, Any], fixture: Path, evidence: Path) ->
         return _fail(case, "schema_mismatch")
     expected = expected_pellmere_values(scope)
     values_ok = all(payload.get(key) == value for key, value in expected.items())
-    schema_ok = set(expected).issubset(payload) and isinstance(payload.get("citations"), list)
-    refs_ok, refs_code = _citation_ok(payload, scope)
+    schema_ok = _pellmere_schema_ok(payload, _json(fixture / "schema/transit_digest.schema.json"))
+    refs_ok, refs_code = _citation_ok(payload, scope, fixture)
     denied = set(scope.get("denied_source_classes") or [])
     class_map = scope.get("class_map") if isinstance(scope.get("class_map"), dict) else {}
     denied_paths = {path for path, klass in class_map.items() if klass in denied}
@@ -127,13 +217,19 @@ def verify_pellmere_lock(case: dict[str, Any], fixture: Path, evidence: Path) ->
     if not refs_ok and refs_code == "source_scope_violation":
         scope_ok = False
     required = set(scope.get("required_coverage") or [])
+    successful_reads = _reads(evidence, successful_only=True)
+    allowed = set(scope.get("allowed_source_classes") or []) - denied
+    read_classes = {class_map[path] for path in successful_reads if path in class_map} & allowed
     cited_classes = set()
-    for item in payload.get("citations") or []:
-        if isinstance(item, dict):
+    cited_paths = set()
+    citations = payload.get("citations")
+    for item in citations if isinstance(citations, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            cited_paths.add(item["path"])
             klass = class_map.get(item.get("path"))
-            if isinstance(klass, str):
+            if isinstance(klass, str) and klass in allowed:
                 cited_classes.add(klass)
-    cover_ok = required <= cited_classes
+    cover_ok = refs_ok and required <= (cited_classes & read_classes) and cited_paths <= successful_reads
     results = {
         "HOL-SCHEMA": GateResult("HOL-SCHEMA", schema_ok, "ok" if schema_ok else "schema_mismatch"),
         "HOL-VALUES": GateResult("HOL-VALUES", values_ok, "ok" if values_ok else "value_mismatch"),

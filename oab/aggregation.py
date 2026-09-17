@@ -486,6 +486,8 @@ def aggregate_suite_observations(
     else:
         identity_source = "mixed"
         integrity_flags.append("identity_source_mixed")
+    if identity_source != "provider_response":
+        integrity_flags.append("provider_identity_source_unverified")
 
     if len(runtime_platforms) > 1:
         integrity_flags.append("runtime_platform_mixed")
@@ -499,6 +501,8 @@ def aggregate_suite_observations(
         }
 
     authority_blocking_flags = {
+        "provider_identity_source_unverified",
+        "infrastructure_coverage_incomplete",
         "missing_observations",
         "duplicate_observation",
         "unexpected_observation",

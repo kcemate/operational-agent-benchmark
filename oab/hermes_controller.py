@@ -132,6 +132,44 @@ def _classify_provider_failure(stderr: str) -> str:
     return "controller_infrastructure_invalid"
 
 
+def _receipt_cost_usd(usage: Mapping[str, Any]) -> float | None:
+    """Read a budgeting amount, not a verified bill or subscription price."""
+    status = usage.get("cost_status")
+    if status not in (None, "actual", "estimated", "included", "unknown", "unavailable"):
+        raise ValueError("cost_status_invalid")
+    amounts: dict[str, float] = {}
+    for field in ("actual_cost_usd", "estimated_cost_usd", "cost_usd"):
+        value = usage.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("cost_amount_invalid")
+        try:
+            amount = float(value)
+        except OverflowError:
+            raise ValueError("cost_amount_invalid") from None
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError("cost_amount_invalid")
+        amounts[field] = amount
+    if status in ("unknown", "unavailable"):
+        # Session accumulators may default to zero (or a partial subtotal).
+        # Explicitly unpriced usage must never become a known amount.
+        return None
+    if not amounts:
+        if status is not None:
+            raise ValueError("cost_status_amount_missing")
+        return None
+    field = next(iter(amounts))  # Preserve actual > estimated > generic precedence.
+    if (
+        (status == "actual" and field == "estimated_cost_usd")
+        or (status == "estimated" and field == "actual_cost_usd")
+        or (status == "included" and any(amount != 0 for amount in amounts.values()))
+    ):
+        raise ValueError("cost_status_amount_mismatch")
+    # Included zero means marginal per-call accounting, never free inference.
+    return amounts[field]
+
+
 class HermesCliController:
     """Tool-free Hermes CLI adapter for the trusted outer controller.
 
@@ -399,19 +437,16 @@ class HermesCliController:
         self.total_api_calls += raw_api_calls
         self.total_input_tokens += self._safe_nonnegative_int(usage.get("input_tokens"))
         self.total_output_tokens += self._safe_nonnegative_int(usage.get("output_tokens"))
-        raw_cost = usage.get("actual_cost_usd")
-        if not isinstance(raw_cost, (int, float)) or isinstance(raw_cost, bool):
-            raw_cost = usage.get("estimated_cost_usd")
-        if not isinstance(raw_cost, (int, float)) or isinstance(raw_cost, bool):
-            raw_cost = usage.get("cost_usd")
-        cost_known = (
-            isinstance(raw_cost, (int, float))
-            and not isinstance(raw_cost, bool)
-            and math.isfinite(float(raw_cost))
-            and float(raw_cost) >= 0
-        )
-        if cost_known:
-            numeric_cost = float(raw_cost)
+        try:
+            numeric_cost = _receipt_cost_usd(usage)
+        except ValueError:
+            # Keep calls accounted for even when contradictory telemetry fails
+            # closed. Unknown-cost opt-in cannot authorize malformed receipts.
+            self.unknown_cost_api_calls += raw_api_calls
+            self.total_cost_usd = None
+            raise ControllerInfrastructureError("controller_usage_invalid") from None
+        cost_known = numeric_cost is not None
+        if numeric_cost is not None:
             self.total_known_cost_usd += numeric_cost
             if self.total_cost_usd is not None:
                 self.total_cost_usd += numeric_cost

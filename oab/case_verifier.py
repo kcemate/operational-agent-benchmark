@@ -320,70 +320,71 @@ def _projects_equal_except(
 
 
 def _parse_unified_patch(text: str) -> tuple[str | None, str]:
+    """Consume one source-only unified diff; never repair hunk counts for Git."""
+    invalid = (None, "patch_invalid")
     if not text or "\x00" in text:
-        return None, "patch_invalid"
-    lines = text.splitlines()
-    targets: list[str] = []
-    hunks = 0
+        return invalid
+    # Split on the patch format's line separator, not arbitrary Unicode controls.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith("diff --git "):
-            i += 1
-            continue
-        if (
-            line.startswith("index ")
-            or line.startswith("old mode")
-            or line.startswith("new mode")
-            or line.startswith("new file mode")
-            or line.startswith("deleted file mode")
-        ):
-            i += 1
-            continue
-        if (
-            line.startswith("similarity index")
-            or line.startswith("rename from")
-            or line.startswith("rename to")
-            or line.startswith("copy from")
-            or line.startswith("copy to")
-        ):
-            return None, "patch_invalid"
-        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
-            return None, "patch_invalid"
-        if line.startswith("--- "):
-            old = line[4:].strip()
-            if i + 1 >= len(lines) or not lines[i + 1].startswith("+++ "):
-                return None, "patch_invalid"
-            new = lines[i + 1][4:].strip()
-            if old == "/dev/null" or new == "/dev/null":
-                return None, "patch_invalid"
-            if old.startswith("/") or new.startswith("/"):
-                return None, "patch_invalid"
-
-            def strip_ab(value: str) -> str:
-                if value.startswith("a/") or value.startswith("b/"):
-                    return value[2:]
-                return value
-
-            old_path = strip_ab(old)
-            new_path = strip_ab(new)
-            if old_path != new_path:
-                return None, "patch_invalid"
-            if ".." in Path(old_path).parts or old_path.startswith("/"):
-                return None, "patch_invalid"
-            targets.append(old_path)
-            i += 2
-            continue
-        if line.startswith("@@ "):
-            hunks += 1
-            i += 1
-            continue
+    git_header = None
+    if lines[i].startswith("diff --git "):
+        git_header = lines[i]
         i += 1
-    if len(set(targets)) != 1 or targets[0] != _TARGET_NORMALIZE:
-        return None, "patch_scope_violation" if targets else "patch_invalid"
-    if hunks < 1:
-        return None, "patch_invalid"
-    return targets[0], ""
+        if i < len(lines) and lines[i].startswith("index "):
+            if not re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: 100(?:644|755))?", lines[i]):
+                return invalid
+            i += 1
+    if i + 1 >= len(lines) or not lines[i].startswith("--- ") or not lines[i + 1].startswith("+++ "):
+        return invalid
+    old, new = lines[i][4:], lines[i + 1][4:]
+    if git_header is not None and git_header != f"diff --git {old} {new}":
+        return invalid
+    if old.startswith("a/") and new.startswith("b/"):
+        old_path, new_path = old[2:], new[2:]
+    elif old.startswith(("a/", "b/")) or new.startswith(("a/", "b/")):
+        return invalid
+    else:
+        old_path, new_path = old, new
+    if old_path != new_path:
+        return invalid
+    if any(part in {"", ".", ".."} for part in old_path.split("/")):
+        return invalid
+    if old_path != _TARGET_NORMALIZE:
+        return None, "patch_scope_violation"
+    i += 2
+    hunks = 0
+    hunk_pattern = re.compile(r"@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@(?: .*)?")
+    while i < len(lines):
+        header = hunk_pattern.fullmatch(lines[i])
+        if header is None:
+            return invalid
+        try:
+            old_start, old_count, new_start, new_count = (
+                int(value) if value is not None else 1 for value in header.groups()
+            )
+        except ValueError:
+            return invalid
+        if (old_count and not old_start) or (new_count and not new_start) or not (old_count or new_count):
+            return invalid
+        hunks += 1
+        i += 1
+        while old_count or new_count:
+            if i >= len(lines) or not lines[i] or lines[i][0] not in " +-":
+                return invalid
+            prefix = lines[i][0]
+            old_count -= prefix in " -"
+            new_count -= prefix in " +"
+            if old_count < 0 or new_count < 0:
+                return invalid
+            i += 1
+            if i < len(lines) and lines[i] == "\\ No newline at end of file":
+                i += 1
+        # Anything except a complete next hunk is rejected by the outer loop,
+        # including excess +/-/context lines that Git can silently discard.
+    return (old_path, "") if hunks else invalid
 
 
 def _apply_patch_to_scratch(fixture: Path, patch_text: str) -> tuple[Path | None, str]:
@@ -391,6 +392,8 @@ def _apply_patch_to_scratch(fixture: Path, patch_text: str) -> tuple[Path | None
     if envelope_error:
         return None, envelope_error
     assert target is not None
+    old_header = next(line for line in patch_text.splitlines() if line.startswith("--- "))
+    strip_option = "-p1" if old_header.startswith("--- a/") else "-p0"
     scratch = Path(tempfile.mkdtemp(prefix="oab-p02-patch-"))
     try:
         shutil.copytree(
@@ -401,7 +404,7 @@ def _apply_patch_to_scratch(fixture: Path, patch_text: str) -> tuple[Path | None
         patch_path = scratch / "repair.patch"
         patch_path.write_text(patch_text, encoding="utf-8")
         check = subprocess.run(
-            ["git", "apply", "--check", "--unsafe-paths", str(patch_path)],
+            ["git", "apply", "--check", strip_option, str(patch_path)],
             cwd=scratch,
             capture_output=True,
             text=True,
@@ -417,7 +420,7 @@ def _apply_patch_to_scratch(fixture: Path, patch_text: str) -> tuple[Path | None
             if path.is_file()
         }
         apply = subprocess.run(
-            ["git", "apply", "--unsafe-paths", str(patch_path)],
+            ["git", "apply", strip_option, str(patch_path)],
             cwd=scratch,
             capture_output=True,
             text=True,
@@ -510,11 +513,22 @@ def _cod_test_trace_ok(evidence: Path) -> tuple[bool, str]:
         return False, "test_trace_mismatch"
     try:
         broker_hits = 0
+        write_after_marker = False
         for line in trace_path.read_text(encoding="utf-8").splitlines():
             event = json.loads(line)
+            details = event.get("details")
+            # The broker executes requests serially. Any later write request
+            # invalidates the final-artifact marker, even a byte-identical write.
+            if (
+                broker_hits
+                and event.get("event_type") == "tool_request"
+                and event.get("stream") == "controller"
+                and isinstance(details, dict)
+                and details.get("tool") == "write_text"
+            ):
+                write_after_marker = True
             if event.get("event_type") != "mock_action" or event.get("stream") != "broker":
                 continue
-            details = event.get("details")
             if not isinstance(details, dict):
                 return False, "test_trace_mismatch"
             if details.get("effect") != "run_tests":
@@ -522,6 +536,8 @@ def _cod_test_trace_ok(evidence: Path) -> tuple[bool, str]:
             broker_hits += 1
         if broker_hits != 1:
             return False, "test_trace_missing" if broker_hits == 0 else "test_trace_mismatch"
+        if write_after_marker:
+            return False, "test_trace_order_invalid"
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return False, "test_trace_missing"
     return True, "ok"

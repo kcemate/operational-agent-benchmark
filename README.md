@@ -1,5 +1,21 @@
 # Operational Agent Benchmark v2
 
+<!-- OAB:CONTRACT:START -->
+### Current execution contract (generated)
+
+Source: `oab/full_stage_contract.py`, `oab/qualification_contract.py`, and `cases.json`.
+Regenerate with `python3 tools/sync_contract_docs.py`; verify with `--check`.
+
+- Decision grid (ordered): `P01`, `P02`, `P09`, `P04`, `P05`, `P06`, `P10`, `P08`.
+- Full stage: 8 pairs, 16 approved/prohibited cases, 5 repetitions, 80 episodes per route.
+- Full API-call ceiling: 17 per episode, 1,360 per route, 2,720 across two routes.
+- Registry/calibration: 10 pairs, 20 cases; diagnostic-only pairs: `P03`, `P07`.
+- Qualification: 2 probes per route, 6 API calls per physical attempt, 12 first-attempt calls per route, 1 infrastructure-only retry per probe.
+- Qualification absolute ceiling: 24 calls per route, 48 across two routes.
+- Planning performs no model inference. Qualification measures plumbing, not model quality; full execution requires a separate explicit PLAN-bound resume.
+<!-- OAB:CONTRACT:END -->
+
+
 **A benchmark that measures whether a model can *finish a job*, not whether it sounds smart.**
 
 OAB gives a model a real operational task inside a network-denied OS sandbox — read these files, compute these totals, write this exact schema, and call the export tool *only* if the authority record permits it. Then it checks the result deterministically: right values, right shape, right authorization decision. No LLM judge, no partial credit.
@@ -40,12 +56,14 @@ implied by asking the question, and completing qualification never launches full
 
 Two honest caveats, stated before you spend anything:
 
-- **A winner is not guaranteed.** `stay` and "no supportable comparison" are ordinary results. The candidate has to strictly beat your current route on contract completion *without* regressing matched pairs or the weakest pair.
-- **Exploratory evidence cannot authorize a switch.** Authoritative status additionally requires an exact-tree release approval with two distinct reviewers. Without one your campaign is explicitly `exploratory`, and the report will decline to recommend a switch regardless of the numbers.
+- **A winner is not guaranteed.** `stay` and "no supportable comparison" are ordinary results. The current decision rule compares the composite `official_score` integers, not a separate no-regression rule for matched pairs or the weakest pair. Inspect the component metrics before interpreting an observational winner.
+- **Exploratory evidence cannot authorize a production switch.** It may report an observational `switch` when a candidate's score is higher. The stock `HermesCliController` emits `identity_source=adapter_runtime`, so release approval alone cannot make it authoritative. A reviewed provider-identity integration, exact-tree approval with two distinct reviewers, and all other gates are required. Repeated stock runs cannot repair that identity limitation.
 
 You restate the disclosed call and cost limits on `resume`. Those values must
 match the immutable PLAN exactly; a mismatch fails closed before any provider
 call. `AGENTS.md` is the runbook.
+
+Cost receipts are operational telemetry, not necessarily invoices. Estimates, subscription-included marginal usage and verified billing are different; the current receipt schema does not retain those distinctions end-to-end. An archived `$0` without billing provenance is a recorded zero, not proof of free inference. Do not use it to rank dollar efficiency.
 
 ### PLAN-bound child boundary
 
@@ -56,9 +74,9 @@ A public qualification or full child refuses mutable `--qualification-contract-j
 input or a route, effort, PLAN, cost-policy, or output-path mismatch **before**
 it constructs a controller.
 
-The full stage has a second immutable boundary. Only P01–P08 × approved/
-prohibited × five repetitions — 80 episodes per route, at most 17 calls each,
-and 1,360 calls per route — can carry full-stage authority. A partial or custom
+The full stage has a second immutable boundary. Only the ordered decision grid
+and ceilings in the generated execution contract above can carry full-stage
+authority. A partial or custom
 plan may be useful exploratory work, but it cannot become an authoritative
 comparison or a switch decision.
 
@@ -151,7 +169,7 @@ A leaderboard would record that as "0%, model is bad." OAB tells you it was one 
 
 ## What it actually tests
 
-Eight matched pairs (`P01`–`P08`), each with an **approved** and a **prohibited** variant — 16 cases, 5 repetitions, 80 episodes per route.
+The generated execution contract above distinguishes the decision grid from the larger registry/calibration set. Holdouts replace diagnostic-only pairs on the decision grid; registered does not mean selected for the full-stage score.
 
 Every pair puts the same task in front of the model twice, changing only what the authority record permits. A model that blindly performs the action passes the approved case and fails the prohibited one. **You only get credit when both halves are right**, which is what separates competence from compliance theater.
 
@@ -305,10 +323,9 @@ That last point is stated plainly on purpose. This tool is designed to be hard t
 
 ## Suite layout
 
-- **8 matched pairs** (`P01`–`P08`) × approved/prohibited → **16 cases**
-- **5 repetitions** → 80 episodes per route
-- **Primary metric:** `deterministic_contract_completion_rate`
-- **Calibration:** non-scoring deterministic controls for **all 8 pairs (16 cases)** that must pass the real sandbox, broker, verifier, and sealing paths before any model is scored — this is the standing proof that every gate is satisfiable
+- **Grid and call ceilings:** generated from the execution contracts above.
+- **Decision headline:** `official_score`; contract completion, matched-pair completion, and weakest-pair stability remain visible components.
+- **Calibration:** non-scoring deterministic controls for all registered cases must pass the real sandbox, broker, verifier, and sealing paths. This demonstrates satisfiability, not model-facing instruction sufficiency or generalization.
 
 ```bash
 oab-calibrate --output-root "$HOME/OAB-Runs/calibration-$(date -u +%Y%m%dT%H%M%SZ)"

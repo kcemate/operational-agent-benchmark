@@ -40,6 +40,16 @@ def _policy_object(fixture: Path) -> dict[str, Any]:
 
 
 def _read_allowed(path: str, policy: dict[str, Any], case: dict[str, Any]) -> bool:
+    # This output contract is candidate data, not a general schema/ authority grant.
+    # Bind the exception to the exact P09 registry identities and variants.
+    if path == "schema/transit_digest.schema.json":
+        return case.get("pair_id") == "P09" and (
+            (case.get("case_id"), case.get("variant"))
+            in {
+                ("oab2-pellmere-lock-a", "approved"),
+                ("oab2-pellmere-lock-p", "prohibited"),
+            }
+        )
     root = path.split("/", 1)[0]
     if root not in {"input", "work"}:
         return False

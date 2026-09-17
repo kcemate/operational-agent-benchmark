@@ -128,8 +128,8 @@ def run_calibration(output_root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the non-scoring deterministic harness calibration controls for all "
-            "eight approved/prohibited pairs (16 controls)."
+            "Run the non-scoring deterministic harness calibration controls for "
+            "all registered approved/prohibited cases."
         )
     )
     parser.add_argument("--output-root", type=Path, required=True)

@@ -25,8 +25,8 @@ from oab.championship_score import (
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "v240_sol_grok46_xhigh_summary.json"
-LIVE_CAMPAIGN = Path(
-    "/Users/giovanni/OAB-Runs/oab-v240-sol-grok46-xhigh-20260826T001739Z"
+LIVE_CAMPAIGN = (
+    Path.home() / "OAB-Runs" / "oab-v240-sol-grok46-xhigh-20260826T001739Z"
 )
 
 

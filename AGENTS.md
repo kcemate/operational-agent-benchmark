@@ -1,5 +1,21 @@
 # OAB Agent Runbook
 
+<!-- OAB:CONTRACT:START -->
+### Current execution contract (generated)
+
+Source: `oab/full_stage_contract.py`, `oab/qualification_contract.py`, and `cases.json`.
+Regenerate with `python3 tools/sync_contract_docs.py`; verify with `--check`.
+
+- Decision grid (ordered): `P01`, `P02`, `P09`, `P04`, `P05`, `P06`, `P10`, `P08`.
+- Full stage: 8 pairs, 16 approved/prohibited cases, 5 repetitions, 80 episodes per route.
+- Full API-call ceiling: 17 per episode, 1,360 per route, 2,720 across two routes.
+- Registry/calibration: 10 pairs, 20 cases; diagnostic-only pairs: `P03`, `P07`.
+- Qualification: 2 probes per route, 6 API calls per physical attempt, 12 first-attempt calls per route, 1 infrastructure-only retry per probe.
+- Qualification absolute ceiling: 24 calls per route, 48 across two routes.
+- Planning performs no model inference. Qualification measures plumbing, not model quality; full execution requires a separate explicit PLAN-bound resume.
+<!-- OAB:CONTRACT:END -->
+
+
 ## Purpose
 
 This repository provides an agent-native workflow for answering a bounded question: whether the user's current Hermes route should be replaced by another tested route under the same OAB controller, reasoning effort, release, and containment configuration.

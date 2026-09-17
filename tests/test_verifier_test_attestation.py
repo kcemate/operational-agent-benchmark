@@ -113,6 +113,8 @@ class AttestationEvaluationTests(unittest.TestCase):
             "failures": 0,
             "errors": 0,
             "skipped": 0,
+            "expected_failures": 0,
+            "unexpected_successes": 0,
             "load_errors": 0,
         }
         payload.update(overrides)

@@ -150,6 +150,9 @@ class HermesCliControllerTests(unittest.TestCase):
                 FAKE_HERMES.replace(
                     '    "estimated_cost_usd": 0.25,',
                     '    **({"estimated_cost_usd": 0.25} if \'"history":[]\' in prompt else {}),',
+                ).replace(
+                    '    "cost_status": "estimated",',
+                    '    "cost_status": "estimated" if \'"history":[]\' in prompt else "unknown",',
                 )
             )
             executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
@@ -172,7 +175,11 @@ class HermesCliControllerTests(unittest.TestCase):
     def test_unknown_cost_posture_stops_after_first_unpriced_call(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             executable = self.make_executable(Path(td))
-            executable.write_text(FAKE_HERMES.replace('    "estimated_cost_usd": 0.25,\n', ""))
+            executable.write_text(
+                FAKE_HERMES.replace('    "estimated_cost_usd": 0.25,\n', "").replace(
+                    '"cost_status": "estimated"', '"cost_status": "unknown"'
+                )
+            )
             executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             controller = HermesCliController(
                 model="test-model",

@@ -3076,8 +3076,17 @@ def build_evidence_posture(
         if not release_authorized:
             reasons.append("release_not_authorized")
         if not authoritative:
+            # Older sealed reports can omit these diagnostics. Project the
+            # blockers without rewriting their evidence or changing authority.
+            if report.get("identity_source") != "provider_response":
+                reasons.append("provider_identity_source_unverified")
+            if report.get("infrastructure_valid_episodes") != report.get("scheduled_episodes"):
+                reasons.append("infrastructure_coverage_incomplete")
             reason = report.get("non_authoritative_reason")
-            if isinstance(reason, str) and reason:
+            if (
+                isinstance(reason, str)
+                and reason.removeprefix("suite is not authoritative:").strip()
+            ):
                 reasons.append(reason)
             else:
                 flags = report.get("integrity_flags")
@@ -3137,8 +3146,14 @@ def build_evidence_posture(
             None
             if authoritative_comparable
             else (
-                "Provide and pin an exact-tree release approval, then rerun every full suite "
-                "until identity, coverage, grid, runtime, and suite-seal authority gates pass."
+                "The stock Hermes CLI supplies adapter_runtime, not provider_response; "
+                "rerunning it or supplying approval alone cannot establish provider identity. "
+                "Before an authority-oriented rerun, demonstrate a reviewed provider-attesting "
+                "integration in a newly pinned release and independently pin its exact-tree "
+                "release approval. Repair infrastructure exclusions to obtain 80/80 valid "
+                "episodes per route; preserve existing evidence and use a new campaign when "
+                "the release or configuration changes. Grid, runtime, and suite-seal gates "
+                "must also pass; until then, report observations as exploratory only."
             )
         ),
     }

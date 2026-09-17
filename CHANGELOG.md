@@ -2,6 +2,12 @@
 
 All benchmark-affecting changes require a new version. Historical results remain bound to their recorded release-tree digest. References below to publishing, wheels, releases, or CI are historical and exact-tree scoped: they do not attest an untagged, dirty, or later checkout.
 
+## 2.6.0.dev0 — 2026-09-17 (development prerelease)
+
+Measurement-validity hardening under GIO-244. Candidate-visible P09/P02 contract and verifier changes are benchmark-affecting; the 70/20/10 championship formula is unchanged. Documentation derives the decision grid and call ceilings from the execution contracts and distinguishes a computed score from authority, billing provenance from numeric cost, and observational ranking from deployment approval. Obtain this prerelease's wheel and release-tree digests from its published GitHub release notes; verify exact-commit CI rather than inheriting earlier release results. Publication is not external production-release approval. Historical evidence must be verified with its original pinned release, not rewritten or regraded in place. Fresh model runs remain separately spend-gated.
+
+Known limitations remain: P02's same-interpreter test-forgery boundary is not resolved; P10 needs a separate validity audit; sealed billing provenance and a stock provider-attesting adapter are not implemented. The composite has no harm-severity veto. This prerelease supports exploratory evaluation, not a claim of adversarially reliable grading or production safety certification.
+
 ## 2.5.0 — 2026-08-27
 
 **GIO-202: uncapped championship score. Scoring-affecting.** The product headline is an integer `official_score` = `floor(70×C/80 + 20×M/40 + 10×S/5)`. Stay/switch is derived from that integer. There is no cap: a dead pair contributes 0 to its own bucket and does not clamp the rest. Incomplete infrastructure coverage (≠ 80/80) publishes no number. Unpinned/unauthorized runs still print the number with `score_posture=exploratory` and cannot authorize a production switch. Decision report schema is `oab.decision-report/v4`. Locked replay of the v2.4.0 sol vs grok-4.6 xhigh campaign: Sol **67** exploratory, Grok incomplete (79/80), recommendation `not_supportable`.

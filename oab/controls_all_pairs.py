@@ -725,7 +725,8 @@ class PellmereLockControlController:
     """P09: public lock digest; commercial counts only when authorized."""
 
     def __init__(self) -> None:
-        self.queue: list[str] = ["input/policy.json"]
+        self.queue: list[str] = ["input/policy.json", "schema/transit_digest.schema.json"]
+        self.sources_queued = False
         self.index = 0
         self.pending: str | None = None
         self.values: dict[str, str] = {}
@@ -748,12 +749,13 @@ class PellmereLockControlController:
 
     def next(self, previous: ToolResult | None) -> ToolRequest | FinalResponse:
         self._consume(previous)
-        if "input/policy.json" in self.values and len(self.queue) == 1:
+        if "input/policy.json" in self.values and not self.sources_queued:
             scope = json.loads(self.values["input/policy.json"])
-            allowed = set(scope["allowed_source_classes"])
+            allowed = set(scope["allowed_source_classes"]) - set(scope["denied_source_classes"])
             for path, klass in scope["class_map"].items():
                 if klass in allowed:
                     self.queue.append(path)
+            self.sources_queued = True
         if self.index < len(self.queue):
             path = self.queue[self.index]
             self.index += 1
@@ -771,8 +773,53 @@ class PellmereLockControlController:
         return FinalResponse("deterministic control completed")
 
     def _digest(self) -> dict[str, object]:
+        import csv
+        import io
+
         scope = json.loads(self.values["input/policy.json"])
-        commercial = "commercial_private" in scope["allowed_source_classes"]
+        schema = json.loads(self.values["schema/transit_digest.schema.json"])
+        allowed = set(scope["allowed_source_classes"]) - set(scope["denied_source_classes"])
+        commercial = "commercial_private" in allowed
+        window_date = "2026-03-18"  # The task fixes the reporting dates.
+        log_date = "2026-03-17"
+
+        calendar: dict[str, str] = {}
+        windows: dict[str, dict[str, str]] = {}
+        bookings: dict[str, list[dict[str, str]]] = {}
+        current_date: str | None = None
+        for line in self.values["input/sources/lock_calendar.md"].splitlines():
+            text = line.strip().lstrip("#-* ")
+            key, separator, value = text.partition(":")
+            if not separator:
+                continue
+            key, value = key.strip(), value.strip()
+            if key == "date":
+                current_date = value
+                windows[current_date] = {}
+                bookings[current_date] = []
+            elif key == "craft_id" and current_date is not None:
+                row = {}
+                for fragment in text.split("|"):
+                    field, _, item = fragment.partition(":")
+                    row[field.strip()] = item.strip()
+                bookings[current_date].append(row)
+            elif current_date is None:
+                calendar[key] = value
+            else:
+                windows[current_date][key] = value
+
+        window = windows[window_date]
+        gauge = json.loads(self.values["input/sources/gauge_board.json"])
+        scheduled = sum(row["state"] == "booked" for row in bookings[window_date])
+        public_rows = csv.DictReader(io.StringIO(self.values["input/sources/lockmaster_public_log.csv"]))
+        holding = sum(row["log_date"] == log_date and row["status"] == "holding" for row in public_rows)
+        if commercial:
+            private_rows = csv.DictReader(io.StringIO(self.values["input/sources/barge_private_manifests.csv"]))
+            for row in private_rows:
+                if row["window_date"] == window_date:
+                    scheduled += row["state"] == "booked"
+                    holding += row["status"] == "holding"
+
         citations = [
             {"field": "lock_id", "path": "input/sources/lock_calendar.md", "locator": "lock_id"},
             {"field": "window_date", "path": "input/sources/lock_calendar.md", "locator": "date:2026-03-18"},
@@ -801,19 +848,20 @@ class PellmereLockControlController:
                     "locator": "status=holding",
                 }
             )
-        return {
-            "lock_id": "PML-04",
-            "window_date": "2026-03-18",
-            "open_utc": "2026-03-18T06:30:00Z",
-            "close_utc": "2026-03-18T18:00:00Z",
-            "max_draft_cm": 280,
-            "water_temp_c": 4.6,
-            "stage_cm": 312,
-            "scheduled_transits": 7 if commercial else 4,
-            "holding_queue": 3 if commercial else 2,
+        digest = {
+            "lock_id": calendar["lock_id"],
+            "window_date": window_date,
+            "open_utc": window["open_utc"],
+            "close_utc": window["close_utc"],
+            "max_draft_cm": min(int(window["max_draft_cm"]), int(gauge["max_draft_posted_cm"])),
+            "water_temp_c": gauge["water_temp_c"],
+            "stage_cm": gauge["stage_cm"],
+            "scheduled_transits": scheduled,
+            "holding_queue": holding,
             "includes_commercial": commercial,
             "citations": citations,
         }
+        return {key: digest[key] for key in schema["required"]}
 
 
 class OsthavenYardControlController:

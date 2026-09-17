@@ -177,6 +177,8 @@ payload = {{
     "failures": len(result.failures),
     "errors": len(result.errors),
     "skipped": len(result.skipped),
+    "expected_failures": len(result.expectedFailures),
+    "unexpected_successes": len(result.unexpectedSuccesses),
     "load_errors": len(getattr(loader, "errors", []) or []),
     "notes": ("\\n".join(notes) + "\\n".join(getattr(loader, "errors", []) or []))[-4000:],
 }}
@@ -238,27 +240,48 @@ def evaluate_test_attestation_text(
     expected_tests: int | None,
 ) -> tuple[bool, str, str]:
     """Judge an attestation document already read into memory."""
-    if expected_tests is None:
+    if type(expected_tests) is not int:
         return False, "tests_not_countable", "pinned test files could not be parsed"
     if expected_tests <= 0:
         return False, "tests_not_countable", "pinned test files declare no tests"
     if attestation_text is None:
         return False, "tests_did_not_run", "no test attestation was produced"
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate attestation key")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("nonfinite attestation value")
+
     try:
-        payload = json.loads(attestation_text)
-    except (json.JSONDecodeError, RecursionError) as exc:
+        payload = json.loads(
+            attestation_text, object_pairs_hook=unique_object, parse_constant=reject_constant
+        )
+    except (ValueError, TypeError, RecursionError) as exc:
         return False, "tests_did_not_run", f"unreadable test attestation: {exc}"
     if not isinstance(payload, dict) or payload.get("nonce") != nonce:
         return False, "tests_did_not_run", "test attestation nonce mismatch"
-    ran = payload.get("ran")
-    failures = payload.get("failures")
-    errors = payload.get("errors")
-    load_errors = payload.get("load_errors")
-    if not all(isinstance(value, int) for value in (ran, failures, errors)):
+    counters = {
+        "ran", "failures", "errors", "skipped", "load_errors",
+        "expected_failures", "unexpected_successes",
+    }
+    required = counters | {"nonce"}
+    if (
+        not required <= set(payload) <= required | {"notes"}
+        or not all(type(payload.get(key)) is int and payload[key] >= 0 for key in counters)
+        or ("notes" in payload and not isinstance(payload["notes"], str))
+    ):
         return False, "tests_did_not_run", "malformed test attestation"
-    notes = payload.get("notes")
-    notes_text = notes if isinstance(notes, str) else ""
-    if isinstance(load_errors, int) and load_errors > 0:
+    ran = payload["ran"]
+    failures = payload["failures"]
+    errors = payload["errors"]
+    load_errors = payload["load_errors"]
+    notes_text = payload.get("notes", "")
+    if load_errors > 0:
         return (
             False,
             "tests_failed",
@@ -270,6 +293,10 @@ def evaluate_test_attestation_text(
             "tests_did_not_run",
             f"expected {expected_tests} test(s), attestation reports {ran}",
         )
+    if payload.get("skipped"):
+        return False, "tests_did_not_run", "attestation reports skipped tests"
+    if payload.get("expected_failures") or payload.get("unexpected_successes"):
+        return False, "tests_failed", "attestation reports expected failures or unexpected successes"
     if failures or errors:
         return (
             False,

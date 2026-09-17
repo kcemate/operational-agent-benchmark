@@ -147,8 +147,9 @@ class PackagingContractTests(unittest.TestCase):
 
         self.assertEqual(0, completed.returncode, completed.stdout)
         self.assertNotIn("P01 approved/prohibited", completed.stdout)
-        self.assertIn("eight", completed.stdout)
-        self.assertIn("16 controls", completed.stdout)
+        # Calibration covers the registry, not the smaller decision grid.
+        self.assertIn("all registered", " ".join(completed.stdout.split()))
+        self.assertNotIn("16 controls", completed.stdout)
 
 
 if __name__ == "__main__":
